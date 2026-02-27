@@ -7,20 +7,20 @@ const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 // Agent registry: name → gateway hook URL + token
 const AGENTS = {
   neo: {
-    url: `http://neo.agents.svc.cluster.local:18789/hooks/agent`,
-    token: process.env.NEO_GATEWAY_TOKEN,
+    url: process.env.NEO_HOOKS_URL || `http://neo.agents.svc.cluster.local:18789/hooks/agent`,
+    token: process.env.NEO_HOOKS_TOKEN,
   },
   mu: {
-    url: `http://mu.agents.svc.cluster.local:18789/hooks/agent`,
-    token: process.env.MU_GATEWAY_TOKEN,
+    url: process.env.MU_HOOKS_URL || `http://mu.agents.svc.cluster.local:18789/hooks/agent`,
+    token: process.env.MU_HOOKS_TOKEN,
   },
   beta: {
-    url: `http://beta.agents.svc.cluster.local:18789/hooks/agent`,
-    token: process.env.BETA_GATEWAY_TOKEN,
+    url: process.env.BETA_HOOKS_URL || `http://beta.agents.svc.cluster.local:18789/hooks/agent`,
+    token: process.env.BETA_HOOKS_TOKEN,
   },
   flow: {
-    url: `http://flow.agents.svc.cluster.local:18789/hooks/agent`,
-    token: process.env.FLOW_GATEWAY_TOKEN,
+    url: process.env.FLOW_HOOKS_URL || `http://flow.agents.svc.cluster.local:18789/hooks/agent`,
+    token: process.env.FLOW_HOOKS_TOKEN,
   },
 };
 
