@@ -35,6 +35,11 @@ const AGENTS = {
     token: process.env.FLOW_HOOKS_TOKEN,
     gatewayToken: process.env.FLOW_GATEWAY_TOKEN,
   },
+  ifra: {
+    url: process.env.IFRA_HOOKS_URL || `http://ifra.agents.svc.cluster.local:18789/hooks/agent`,
+    token: process.env.IFRA_HOOKS_TOKEN,
+    gatewayToken: process.env.IFRA_GATEWAY_TOKEN,
+  },
 };
 
 // Only fetch online agents — disabled agents are never auto-assigned or dispatched to
