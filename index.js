@@ -37,7 +37,7 @@ const AGENTS = {
   },
 };
 
-// Dynamic agent capability cards from Supabase
+// Only fetch online agents — disabled agents are never auto-assigned or dispatched to
 async function getAgentCards() {
   const { data, error } = await supabase
     .from('agent_cards')
@@ -309,6 +309,19 @@ function broadcast(eventType, data, taskId) {
 
 // --- Dispatch task to agent via /hooks/agent ---
 async function dispatchToAgent(task) {
+  // Never dispatch to disabled agents
+  if (task.assigned_agent) {
+    const { data: agentCard } = await supabase
+      .from('agent_cards')
+      .select('status')
+      .ilike('name', task.assigned_agent)
+      .single();
+    if (agentCard?.status === 'disabled') {
+      console.log(`[SKIP] Agent ${task.assigned_agent} is disabled, skipping task ${task.id}`);
+      return;
+    }
+  }
+
   // Route coding tasks through the Dante ID factory pipeline
   if (task.type === "coding") {
     const handled = await dispatchViaFactory(task);
@@ -1034,6 +1047,15 @@ async function scheduler() {
 
     if (available.length === 0) return;
 
+    // Belt-and-suspenders: fetch disabled agents and exclude them
+    const { data: disabledAgents } = await supabase
+      .from('agent_cards')
+      .select('name')
+      .eq('status', 'disabled');
+    const disabledNames = new Set((disabledAgents || []).map(a => a.name.toLowerCase()));
+    const availableFiltered = available.filter(a => !disabledNames.has(a.name));
+    if (availableFiltered.length === 0) return;
+
     const { data: todoTasks, error: todoErr } = await supabase
       .from("agent_tasks")
       .select("*")
@@ -1055,7 +1077,7 @@ async function scheduler() {
       // Respect assigned_agent hint
       if (task.assigned_agent) {
         const hintAgent = task.assigned_agent.toLowerCase();
-        const agentSlot = available.find(a => a.name === hintAgent && a.remaining > 0);
+        const agentSlot = availableFiltered.find(a => a.name === hintAgent && a.remaining > 0);
         if (agentSlot) {
           console.log(`[SCHEDULER] Assigning task ${task.id} ("${task.title}") \u2192 ${hintAgent} (hint)`);
           await supabase
@@ -1072,7 +1094,7 @@ async function scheduler() {
       const taskType = task.type || "general";
 
       // Score agents: must have capability, then rank by capacity + priority affinity
-      const candidates = available
+      const candidates = availableFiltered
         .filter(a => a.remaining > 0 && a.capabilities.includes(taskType))
         .map(a => {
           let score = a.remaining;
