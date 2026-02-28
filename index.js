@@ -308,87 +308,100 @@ function broadcast(eventType, data, taskId) {
 }
 
 // --- Context Manager: build institutional memory block ---
+// --- Context Manager: inject institutional memory into agent sessions ---
 async function buildContextBlock(task) {
   const sections = [];
 
-  // 1. Previous task results for same repo
-  if (task.repo) {
+  try {
+    // 1. Previous task results for same repo/project
+    if (task.repo || task.project_id) {
+      try {
+        let query = supabase.from('agent_tasks')
+          .select('title, status, result, assigned_agent, completed_at')
+          .in('status', ['done', 'completed'])
+          .order('completed_at', { ascending: false })
+          .limit(5);
+        if (task.repo) query = query.eq('repo', task.repo);
+        else if (task.project_id) query = query.eq('project_id', task.project_id);
+        const { data } = await query;
+        if (data?.length) {
+          sections.push('### Previous Task Results');
+          for (const t of data) {
+            const summary = t.result?.output || t.result?.summary || (t.result ? JSON.stringify(t.result).slice(0, 200) : '(no result)');
+            sections.push(`- **${t.title}** (${t.status}, by ${t.assigned_agent}): ${summary}`);
+          }
+        }
+      } catch (e) { console.error('[CONTEXT] Previous results query failed:', e.message); }
+    }
+
+    // 2. Related failed tasks
     try {
-      const { data } = await supabase
-        .from('agent_tasks')
-        .select('title, status, result, error')
-        .eq('repo', task.repo)
-        .in('status', ['done', 'completed', 'failed'])
+      let query = supabase.from('agent_tasks')
+        .select('title, error, type, repo, completed_at')
+        .eq('status', 'failed')
         .order('completed_at', { ascending: false })
-        .limit(5);
+        .limit(3);
+      if (task.repo) query = query.eq('repo', task.repo);
+      else if (task.type) query = query.eq('type', task.type);
+      const { data } = await query;
       if (data?.length) {
-        const lines = data.map(t => {
-          const detail = t.status === 'failed'
-            ? (t.error || '').slice(0, 200)
-            : (typeof t.result === 'string' ? t.result : JSON.stringify(t.result || '')).slice(0, 200);
-          return `- **${t.title}** → \`${t.status}\` — ${detail || '(no detail)'}`;
-        });
-        sections.push(`### 📋 Recent Tasks (${task.repo})\n${lines.join('\n')}`);
+        sections.push('### ⚠️ Previously Failed Tasks (avoid repeating these mistakes)');
+        for (const t of data) {
+          const errorMsg = typeof t.error === 'string' ? t.error : (t.error ? JSON.stringify(t.error).slice(0, 300) : '(unknown error)');
+          sections.push(`- **${t.title}**: ${errorMsg}`);
+        }
       }
-    } catch (e) {
-      console.error('[CONTEXT] Error fetching previous tasks:', e.message);
-    }
-  }
+    } catch (e) { console.error('[CONTEXT] Failed tasks query failed:', e.message); }
 
-  // 2. Related failed tasks (same repo or type)
-  try {
-    let query = supabase
-      .from('agent_tasks')
-      .select('title, error, repo, type')
-      .eq('status', 'failed')
-      .order('completed_at', { ascending: false })
-      .limit(3);
-    if (task.repo) {
-      query = query.or(`repo.eq.${task.repo},type.eq.${task.type || 'general'}`);
-    } else if (task.type) {
-      query = query.eq('type', task.type);
-    }
-    const { data } = await query;
-    if (data?.length) {
-      const lines = data.map(t => `- **${t.title}** — ${(t.error || '').slice(0, 200) || '(no error detail)'}`);
-      sections.push(`### ⚠️ Recent Failures\n${lines.join('\n')}`);
-    }
-  } catch (e) {
-    console.error('[CONTEXT] Error fetching failed tasks:', e.message);
-  }
-
-  // 3. Active agents
-  try {
-    const { data } = await supabase
-      .from('agent_cards')
-      .select('name, status')
-      .eq('status', 'online');
-    if (data?.length) {
-      const lines = data.map(a => `- **${a.name}** — ${a.status}`);
-      sections.push(`### 🤖 Active Agents\n${lines.join('\n')}`);
-    }
-  } catch (e) {
-    console.error('[CONTEXT] Error fetching active agents:', e.message);
-  }
-
-  // 4. Project context
-  if (task.project_id) {
+    // 3. Currently active work
     try {
-      const { data } = await supabase
-        .from('projects')
-        .select('name, status, description')
-        .eq('id', task.project_id)
-        .single();
-      if (data) {
-        sections.push(`### 🏗️ Project: ${data.name}\n**Status:** ${data.status}\n${data.description || ''}`);
+      const { data } = await supabase.from('agent_tasks')
+        .select('title, assigned_agent, status')
+        .in('status', ['assigned', 'in_progress'])
+        .limit(10);
+      if (data?.length) {
+        sections.push('### Active Work (other agents)');
+        for (const t of data) {
+          sections.push(`- ${t.assigned_agent}: ${t.title} (${t.status})`);
+        }
       }
-    } catch (e) {
-      console.error('[CONTEXT] Error fetching project:', e.message);
+    } catch (e) { console.error('[CONTEXT] Active work query failed:', e.message); }
+
+    // 4. Project context
+    if (task.project_id) {
+      try {
+        const { data: project } = await supabase.from('projects')
+          .select('name, idea, description, status, type')
+          .eq('id', task.project_id)
+          .single();
+        if (project) {
+          sections.push('### Project Context');
+          sections.push(`- **${project.name}** (${project.status}): ${project.idea || project.description || '(no description)'}`);
+        }
+      } catch (e) { console.error('[CONTEXT] Project context query failed:', e.message); }
     }
+  } catch (e) {
+    console.error('[CONTEXT] Unexpected error building context:', e.message);
   }
 
   if (!sections.length) return '';
-  return `## 🧠 Institutional Memory\n\n${sections.join('\n\n')}\n\n`;
+  console.log(`[CONTEXT] Built context for task ${task.id}: ${sections.length} sections`);
+  return '\n## Context (Institutional Memory)\n\n' + sections.join('\n') + '\n';
+}
+
+async function buildContextBlockWithTimeout(task) {
+  try {
+    return await Promise.race([
+      buildContextBlock(task),
+      new Promise(resolve => setTimeout(() => {
+        console.log(`[CONTEXT] Timeout building context for task ${task.id}`);
+        resolve('');
+      }, 5000)),
+    ]);
+  } catch (e) {
+    console.error('[CONTEXT] Error:', e.message);
+    return '';
+  }
 }
 
 // --- Dispatch task to agent via /hooks/agent ---
@@ -441,13 +454,13 @@ async function dispatchToAgent(task) {
     context: task.context,
   }, null, 2);
 
-  const contextBlock = await buildContextBlock(task);
+  const contextBlock = await buildContextBlockWithTimeout(task);
 
   const message = `\`\`\`json
 ${taskPayload}
 \`\`\`
 
-## Task Assigned: ${task.title}
+${contextBlock}## Task Assigned: ${task.title}
 
 ${task.description || ""}
 ${task.prompt ? `**Prompt:** ${task.prompt}` : ""}
@@ -695,7 +708,8 @@ async function assignQueuedQATasks() {
 
       const workerUrl = `http://${worker}.agents.svc.cluster.local:18789/hooks/agent`;
       try {
-        const qaMessage = `## QA Review: ${task.title}\n\n**Task ID:** ${task.id}\nReview this task and update status when done.`;
+        const qaContextBlock = await buildContextBlockWithTimeout(task);
+        const qaMessage = `${qaContextBlock}## QA Review: ${task.title}\n\n**Task ID:** ${task.id}\nReview this task and update status when done.`;
         await fetch(workerUrl, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -793,11 +807,12 @@ function subscribe() {
               context: task.context,
             }, null, 2);
 
+            const qaContextBlock = await buildContextBlockWithTimeout(task);
             const qaMessage = `\`\`\`json
 ${qaPayload}
 \`\`\`
 
-## QA Review: ${task.title}
+${qaContextBlock}## QA Review: ${task.title}
 
 **Task ID:** ${task.id}
 **Type:** ${task.type}
