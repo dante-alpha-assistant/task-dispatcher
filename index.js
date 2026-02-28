@@ -1,4 +1,13 @@
 import { createClient } from "@supabase/supabase-js";
+import k8s from "@kubernetes/client-node";
+
+// K8s client setup
+const kc = new k8s.KubeConfig();
+kc.loadFromCluster();
+const batchApi = kc.makeApiClient(k8s.BatchV1Api);
+const coreApi = kc.makeApiClient(k8s.CoreV1Api);
+const MAX_QA_WORKERS = 3;
+
 
 // --- Config ---
 const SUPABASE_URL = process.env.SUPABASE_URL;
@@ -317,6 +326,199 @@ Do NOT skip this step. The task board at tasks.dante.id must reflect your work.`
   }
 }
 
+
+// --- QA Auto-Scaler ---
+async function qaAutoScaler() {
+  try {
+    const { data: qaTasks, error } = await supabase
+      .from("agent_tasks")
+      .select("id")
+      .eq("status", "qa_testing")
+      .is("qa_agent", null);
+
+    if (error) {
+      console.error("[QA-SCALER] Error querying queue:", error.message);
+      return;
+    }
+
+    const qaQueue = qaTasks?.length || 0;
+
+    const { body: jobList } = await batchApi.listNamespacedJob({
+      namespace: "agents",
+      labelSelector: "role=beta-worker",
+    });
+    const activeJobs = (jobList.items || []).filter(
+      (j) => !j.status?.succeeded && !j.status?.failed
+    );
+    const activeWorkers = activeJobs.length;
+
+    console.log(`[QA-SCALER] Queue: ${qaQueue}, Active workers: ${activeWorkers}`);
+
+    if (qaQueue > 1) {
+      const desired = Math.min(qaQueue - 1, MAX_QA_WORKERS);
+      const toSpawn = desired - activeWorkers;
+      for (let i = 0; i < toSpawn; i++) {
+        await spawnBetaWorker();
+      }
+    }
+
+    // Clean up completed/failed jobs older than 5 min
+    for (const job of jobList.items || []) {
+      if (job.status?.succeeded || job.status?.failed) {
+        const finishTime = job.status.completionTime || job.status.conditions?.[0]?.lastTransitionTime;
+        if (finishTime && Date.now() - new Date(finishTime).getTime() > 5 * 60 * 1000) {
+          try {
+            await batchApi.deleteNamespacedJob({
+              name: job.metadata.name,
+              namespace: "agents",
+              propagationPolicy: "Background",
+            });
+            console.log(`[QA-SCALER] Cleaned up job ${job.metadata.name}`);
+          } catch (e) {
+            console.error(`[QA-SCALER] Failed to clean up job ${job.metadata.name}:`, e.message);
+          }
+        }
+      }
+    }
+
+    await assignQueuedQATasks();
+  } catch (e) {
+    console.error("[QA-SCALER] Error:", e.message);
+  }
+}
+
+async function spawnBetaWorker() {
+  const workerName = `beta-worker-${Date.now().toString(36)}`;
+  console.log(`[QA-SCALER] Spawning worker: ${workerName}`);
+
+  const job = {
+    apiVersion: "batch/v1",
+    kind: "Job",
+    metadata: {
+      name: workerName,
+      namespace: "agents",
+      labels: {
+        app: "beta-worker",
+        role: "beta-worker",
+        "managed-by": "task-dispatcher",
+      },
+    },
+    spec: {
+      backoffLimit: 0,
+      ttlSecondsAfterFinished: 300,
+      activeDeadlineSeconds: 1200,
+      template: {
+        metadata: {
+          labels: {
+            app: "beta-worker",
+            role: "beta-worker",
+            "managed-by": "task-dispatcher",
+          },
+        },
+        spec: {
+          restartPolicy: "Never",
+          containers: [
+            {
+              name: "worker",
+              image: process.env.QA_WORKER_IMAGE || "ghcr.io/dante-alpha-assistant/openclaw-agent:latest",
+              env: [
+                { name: "SUPABASE_URL", value: process.env.SUPABASE_URL },
+                { name: "SUPABASE_SERVICE_ROLE_KEY", value: process.env.SUPABASE_SERVICE_ROLE_KEY },
+                {
+                  name: "OPENROUTER_API_KEY",
+                  valueFrom: { secretKeyRef: { name: "beta-env", key: "OPENROUTER_API_KEY" } },
+                },
+                { name: "WORKER_NAME", value: workerName },
+                { name: "WORKER_MODE", value: "qa" },
+              ],
+              resources: {
+                requests: { cpu: "100m", memory: "256Mi" },
+                limits: { cpu: "500m", memory: "512Mi" },
+              },
+            },
+          ],
+        },
+      },
+    },
+  };
+
+  try {
+    await batchApi.createNamespacedJob({ namespace: "agents", body: job });
+    console.log(`[QA-SCALER] Spawned worker job: ${workerName}`);
+  } catch (e) {
+    console.error(`[QA-SCALER] Failed to spawn worker: ${e.message}`);
+  }
+}
+
+async function assignQueuedQATasks() {
+  try {
+    const { data: unassigned, error: taskErr } = await supabase
+      .from("agent_tasks")
+      .select("id, title")
+      .eq("status", "qa_testing")
+      .is("qa_agent", null)
+      .order("created_at", { ascending: true });
+
+    if (taskErr || !unassigned?.length) return;
+
+    const { body: podList } = await coreApi.listNamespacedPod({
+      namespace: "agents",
+      labelSelector: "role=beta-worker",
+      fieldSelector: "status.phase=Running",
+    });
+
+    const runningWorkers = (podList.items || []).map((p) => p.metadata.name);
+    if (!runningWorkers.length) return;
+
+    const { data: assignedTasks } = await supabase
+      .from("agent_tasks")
+      .select("qa_agent")
+      .eq("status", "qa_testing")
+      .not("qa_agent", "is", null);
+
+    const busyWorkers = new Set((assignedTasks || []).map((t) => t.qa_agent));
+    const freeWorkers = runningWorkers.filter((w) => !busyWorkers.has(w));
+
+    for (let i = 0; i < Math.min(unassigned.length, freeWorkers.length); i++) {
+      const task = unassigned[i];
+      const worker = freeWorkers[i];
+
+      const { error: assignErr } = await supabase
+        .from("agent_tasks")
+        .update({ qa_agent: worker })
+        .eq("id", task.id)
+        .is("qa_agent", null);
+
+      if (assignErr) {
+        console.error(`[QA-SCALER] Failed to assign task ${task.id} to ${worker}:`, assignErr.message);
+        continue;
+      }
+
+      console.log(`[QA-SCALER] Assigned task ${task.id} ("${task.title}") to ${worker}`);
+
+      const workerUrl = `http://${worker}.agents.svc.cluster.local:18789/hooks/agent`;
+      try {
+        const qaMessage = `## QA Review: ${task.title}\n\n**Task ID:** ${task.id}\nReview this task and update status when done.`;
+        await fetch(workerUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            message: qaMessage,
+            name: "Task Dispatcher (QA Auto-Scaler)",
+            sessionKey: `hook:qa:${task.id}`,
+            wakeMode: "now",
+          }),
+        });
+        console.log(`[QA-SCALER] Dispatched QA review to ${worker} for task ${task.id}`);
+      } catch (e) {
+        console.error(`[QA-SCALER] Failed to dispatch to ${worker}: ${e.message}`);
+      }
+    }
+  } catch (e) {
+    console.error("[QA-SCALER] Assignment error:", e.message);
+  }
+}
+
 // --- Subscribe to Realtime changes ---
 function subscribe() {
   console.log("[BOOT] Task Dispatcher starting...");
@@ -428,6 +630,16 @@ curl -s -X PATCH "https://lessxkxujvcmublgwdaa.supabase.co/rest/v1/agent_tasks?i
                   .from("agent_tasks")
                   .update({ status: "qa_testing", qa_agent: "beta" })
                   .eq("id", task.id);
+
+                // Trigger auto-scaler if queue is building up
+                const { data: qaQueueCheck } = await supabase
+                  .from("agent_tasks")
+                  .select("id")
+                  .eq("status", "qa_testing")
+                  .is("qa_agent", null);
+                if (qaQueueCheck && qaQueueCheck.length > 1) {
+                  qaAutoScaler();
+                }
               } else {
                 console.error(`[QA] Failed to dispatch to beta: ${resp.status}`);
               }
@@ -461,8 +673,16 @@ createServer(async (req, res) => {
         capacity[card.name] = { load, max: card.max_concurrent, available: card.max_concurrent - load, capabilities: card.capabilities };
       }
     } catch {}
+    let qaWorkers = 0;
+    try {
+      const { body: jobList } = await batchApi.listNamespacedJob({
+        namespace: "agents",
+        labelSelector: "role=beta-worker",
+      });
+      qaWorkers = (jobList.items || []).filter(j => !j.status?.succeeded && !j.status?.failed).length;
+    } catch {}
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ ok: true, service: "task-dispatcher", activeTasks: activeTasks.size, capacity }));
+    res.end(JSON.stringify({ ok: true, service: "task-dispatcher", activeTasks: activeTasks.size, capacity, qaWorkers }));
   } else {
     res.writeHead(404);
     res.end("Not found");
@@ -738,6 +958,10 @@ console.log(`[BOOT] Auto-scheduler running every ${SCHEDULER_INTERVAL / 1000}s`)
 setInterval(taskMonitor, MONITOR_INTERVAL);
 setTimeout(taskMonitor, 5000); // Run 5s after boot (let realtime connect first)
 console.log(`[BOOT] Task monitor running every ${MONITOR_INTERVAL / 1000}s (hard timeout: ${TASK_HARD_TIMEOUT / 60000}min, grace: ${SESSION_GONE_GRACE / 1000}s)`);
+
+// QA Auto-Scaler
+setInterval(qaAutoScaler, 30000);
+console.log("[BOOT] QA auto-scaler running every 30s");
 
 // Graceful shutdown
 process.on("SIGTERM", () => {

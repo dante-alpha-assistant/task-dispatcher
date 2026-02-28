@@ -11,6 +11,7 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@kubernetes/client-node": "^1.0.0",
     "@supabase/supabase-js": "^2.98.0"
   }
 }
