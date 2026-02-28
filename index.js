@@ -221,6 +221,18 @@ async function dispatchViaFactory(task) {
 // Track active dispatched tasks: taskId → { agentName, dispatchedAt, sessionKey }
 const activeTasks = new Map();
 
+// --- SSE Client Management ---
+const sseClients = new Set();
+const latestProgress = new Map();
+
+function broadcast(eventType, data, taskId) {
+  const payload = `event: ${eventType}\ndata: ${JSON.stringify(data)}\n\n`;
+  for (const client of sseClients) {
+    if (taskId && client.taskFilter && !client.taskFilter.has(taskId)) continue;
+    try { client.res.write(payload); } catch { sseClients.delete(client); }
+  }
+}
+
 // --- Dispatch task to agent via /hooks/agent ---
 async function dispatchToAgent(task) {
   // Route coding tasks through the Dante ID factory pipeline
@@ -334,6 +346,18 @@ function subscribe() {
       async (payload) => {
         const { eventType, new: task, old: prev } = payload;
         console.log(`[EVENT] ${eventType} on task ${task?.id || prev?.id}: status=${task?.status}`);
+
+        // Broadcast status change to SSE clients
+        if (task) {
+          broadcast("task:status", {
+            taskId: task.id,
+            status: task.status,
+            previousStatus: prev?.status || null,
+            agent: task.assigned_agent,
+            title: task.title,
+            timestamp: new Date().toISOString(),
+          }, task.id);
+        }
 
         // Dispatch when:
         // 1. New task inserted with status 'assigned' and an assigned_agent
@@ -449,7 +473,10 @@ curl -s -X PATCH "https://lessxkxujvcmublgwdaa.supabase.co/rest/v1/agent_tasks?i
 import { createServer } from "http";
 const PORT = process.env.PORT || 8080;
 createServer(async (req, res) => {
-  if (req.url === "/health" || req.url === "/") {
+  const url = new URL(req.url, "http://localhost");
+  const pathname = url.pathname;
+
+  if (pathname === "/health" || pathname === "/") {
     let capacity = {};
     try {
       const [{ data }, cards] = await Promise.all([
@@ -463,6 +490,53 @@ createServer(async (req, res) => {
     } catch {}
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ ok: true, service: "task-dispatcher", activeTasks: activeTasks.size, capacity }));
+  } else if (pathname === "/events" && req.method === "GET") {
+    // SSE endpoint
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      "Connection": "keep-alive",
+    });
+    const tasksParam = url.searchParams.get("tasks");
+    const taskFilter = tasksParam ? new Set(tasksParam.split(",")) : null;
+    const client = { res, taskFilter };
+    sseClients.add(client);
+    req.on("close", () => sseClients.delete(client));
+    // Send initial snapshot
+    for (const [taskId, info] of activeTasks) {
+      const snapshot = { taskId, ...info, timestamp: new Date().toISOString() };
+      res.write(`event: task:status\ndata: ${JSON.stringify(snapshot)}\n\n`);
+    }
+    for (const [taskId, progress] of latestProgress) {
+      if (!taskFilter || taskFilter.has(taskId)) {
+        res.write(`event: task:progress\ndata: ${JSON.stringify({ taskId, ...progress, timestamp: new Date().toISOString() })}\n\n`);
+      }
+    }
+  } else if (pathname === "/progress" && req.method === "POST") {
+    // Progress reporting endpoint
+    let body = "";
+    req.on("data", chunk => body += chunk);
+    req.on("end", () => {
+      try {
+        const auth = req.headers.authorization || "";
+        const token = auth.replace("Bearer ", "");
+        const knownTokens = Object.values(AGENTS).map(a => a.token).filter(Boolean);
+        if (!token || !knownTokens.includes(token)) {
+          res.writeHead(401, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Unauthorized" }));
+          return;
+        }
+        const { taskId, percent, step, log } = JSON.parse(body);
+        const progressData = { percent, step, log, timestamp: new Date().toISOString() };
+        latestProgress.set(taskId, progressData);
+        broadcast("task:progress", { taskId, ...progressData }, taskId);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+      } catch (e) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: e.message }));
+      }
+    });
   } else {
     res.writeHead(404);
     res.end("Not found");
@@ -470,6 +544,11 @@ createServer(async (req, res) => {
 }).listen(PORT, () => {
   console.log(`[HEALTH] Listening on :${PORT}`);
 });
+
+// SSE heartbeat every 30s
+setInterval(() => {
+  broadcast("heartbeat", { timestamp: new Date().toISOString(), activeTasks: activeTasks.size });
+}, 30_000);
 
 // --- Unified Task Monitor ---
 // Replaces both watchdog and session checker
@@ -560,6 +639,19 @@ async function taskMonitor() {
       } catch (e) {
         console.error(`[MONITOR] Error checking ${agentName} for task ${task.id}: ${e.message}`);
         continue; // Can't determine session state, skip
+      }
+
+      // Broadcast monitor status to SSE clients
+      {
+        const startTime = task.started_at || task.created_at;
+        const monitorElapsed = startTime ? Date.now() - new Date(startTime).getTime() : 0;
+        broadcast("task:monitor", {
+          taskId: task.id,
+          sessionAlive,
+          idleSeconds: 0,
+          elapsed: monitorElapsed,
+          timestamp: new Date().toISOString(),
+        }, task.id);
       }
 
       if (sessionAlive) {
