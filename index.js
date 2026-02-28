@@ -227,6 +227,71 @@ async function dispatchViaFactory(task) {
   }
 }
 
+// --- A2A: Parent-child task completion ---
+async function checkParentCompletion(task) {
+  if (!task.parent_task_id) return;
+
+  console.log(`[A2A] Task ${task.id} has parent ${task.parent_task_id}, checking siblings...`);
+
+  const { data: siblings, error } = await supabase
+    .from('agent_tasks')
+    .select('id, status, result, error, title')
+    .eq('parent_task_id', task.parent_task_id);
+
+  if (error) {
+    console.error(`[A2A] Error querying siblings for parent ${task.parent_task_id}:`, error.message);
+    return;
+  }
+
+  if (!siblings?.length) return;
+
+  const terminal = ['done', 'completed', 'failed'];
+  const allTerminal = siblings.every(s => terminal.includes(s.status));
+
+  if (!allTerminal) {
+    const pending = siblings.filter(s => !terminal.includes(s.status)).length;
+    console.log(`[A2A] Parent ${task.parent_task_id}: ${pending}/${siblings.length} sub-tasks still pending`);
+    return;
+  }
+
+  console.log(`[A2A] All ${siblings.length} sub-tasks for parent ${task.parent_task_id} are terminal, aggregating...`);
+
+  const failed = siblings.filter(s => s.status === 'failed');
+  const succeeded = siblings.filter(s => s.status !== 'failed');
+
+  const aggregated = {
+    sub_tasks: siblings.map(s => ({
+      id: s.id,
+      title: s.title,
+      status: s.status,
+      result: s.result || null,
+      error: s.error || null,
+    })),
+    total: siblings.length,
+    succeeded: succeeded.length,
+    failed: failed.length,
+  };
+
+  if (failed.length > 0) {
+    aggregated.partial_failures = failed.map(f => ({ id: f.id, title: f.title, error: f.error }));
+  }
+
+  const { error: updateErr } = await supabase
+    .from('agent_tasks')
+    .update({
+      status: 'done',
+      result: aggregated,
+      completed_at: new Date().toISOString(),
+    })
+    .eq('id', task.parent_task_id);
+
+  if (updateErr) {
+    console.error(`[A2A] Failed to update parent ${task.parent_task_id}:`, updateErr.message);
+  } else {
+    console.log(`[A2A] Parent ${task.parent_task_id} → done (${succeeded.length} succeeded, ${failed.length} failed)`);
+  }
+}
+
 // Track active dispatched tasks: taskId → { agentName, dispatchedAt, sessionKey }
 const activeTasks = new Map();
 
@@ -272,7 +337,7 @@ ${task.prompt ? `**Prompt:** ${task.prompt}` : ""}
 **Task ID:** ${task.id}
 **Type:** ${task.type}
 **Priority:** ${task.priority}
-**Dispatched by:** ${task.dispatched_by}
+**Dispatched by:** ${task.dispatched_by}${task.parent_task_id ? `\n\n**Parent Task:** ${task.parent_task_id}\n**Sub-task:** This is a sub-task of a larger task. Complete your portion and update status.` : ""}
 
 ---
 ## ⚠️ MANDATORY: Update task status when done
@@ -573,11 +638,13 @@ function subscribe() {
         }
 
         // Remove completed/failed tasks from active tracking
-        if (task?.status === 'done' || task?.status === 'failed') {
+        if (task?.status === 'done' || task?.status === 'failed' || task?.status === 'completed') {
           if (activeTasks.has(task.id)) {
             console.log(`[TRACKER] Task ${task.id} completed (${task.status}), removing from active tracking`);
             activeTasks.delete(task.id);
           }
+          // A2A: check if parent task should be completed
+          await checkParentCompletion(task);
         }
 
         // QA routing: when task moves to "done", move it to "qa" and dispatch to Beta
