@@ -36,16 +36,189 @@ const AGENT_CONFIG = {
   flow: { maxConcurrent: 2, types: ["general", "research", "ops"] },
 };
 
+const DANTE_ID_API_URL = process.env.DANTE_ID_API_URL || "https://api.dante.id";
 const PRIORITY_ORDER = { urgent: 0, high: 1, normal: 2, low: 3 };
 const SCHEDULER_INTERVAL = 30_000; // 30 seconds
+const FACTORY_POLL_INTERVAL = 15_000; // 15 seconds
+const FACTORY_MAX_WAIT = 10 * 60 * 1000; // 10 minutes
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+
+// Map project status → task stage
+const STATUS_TO_STAGE = {
+  new: "refinery",
+  refining: "refinery",
+  designed: "foundry",
+  building: "builder",
+  testing: "inspector",
+  deploying: "deployer",
+  live: "deployer",
+};
+
+// --- Dispatch coding task via Dante ID factory pipeline ---
+async function dispatchViaFactory(task) {
+  const idea = task.description || task.prompt;
+  if (!idea) {
+    console.error(`[FACTORY] Task ${task.id} has no description/prompt, falling back to agent dispatch`);
+    return false;
+  }
+
+  try {
+    // 1. Create project in Supabase
+    const { data: project, error: projectErr } = await supabase
+      .from("projects")
+      .insert({
+        name: task.title,
+        idea,
+        description: task.description || null,
+        user_id: "system",
+        type: "external",
+        status: "new",
+      })
+      .select("id")
+      .single();
+
+    if (projectErr || !project) {
+      console.error(`[FACTORY] Failed to create project for task ${task.id}:`, projectErr?.message);
+      return false;
+    }
+
+    const projectId = project.id;
+    console.log(`[FACTORY] Created project ${projectId} for task ${task.id} ("${task.title}")`);
+
+    // 2. Link project to task and set initial stage
+    await supabase
+      .from("agent_tasks")
+      .update({
+        project_id: projectId,
+        stage: "refinery",
+        status: "in_progress",
+        started_at: new Date().toISOString(),
+      })
+      .eq("id", task.id);
+
+    // 3. Trigger the factory pipeline
+    const resp = await fetch(`${DANTE_ID_API_URL}/api/refinery/generate-all`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${SUPABASE_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ project_id: projectId, idea }),
+    });
+
+    if (!resp.ok) {
+      const errText = await resp.text();
+      console.error(`[FACTORY] API returned ${resp.status} for task ${task.id}: ${errText}`);
+      await supabase.from("agent_tasks").update({
+        status: "failed",
+        error: `Factory API error: ${resp.status} - ${errText}`,
+        completed_at: new Date().toISOString(),
+      }).eq("id", task.id);
+      return true;
+    }
+
+    console.log(`[FACTORY] Pipeline triggered for project ${projectId}, polling status...`);
+
+    // 4. Poll project status
+    const startTime = Date.now();
+    let lastStage = "refinery";
+
+    const pollInterval = setInterval(async () => {
+      try {
+        const elapsed = Date.now() - startTime;
+        if (elapsed > FACTORY_MAX_WAIT) {
+          clearInterval(pollInterval);
+          console.error(`[FACTORY] Timeout for task ${task.id} (project ${projectId})`);
+          await supabase.from("agent_tasks").update({
+            status: "failed",
+            error: `Factory pipeline timed out after ${Math.round(elapsed / 60000)} minutes`,
+            completed_at: new Date().toISOString(),
+          }).eq("id", task.id);
+          return;
+        }
+
+        const { data: proj, error: pollErr } = await supabase
+          .from("projects")
+          .select("status")
+          .eq("id", projectId)
+          .single();
+
+        if (pollErr || !proj) {
+          console.error(`[FACTORY] Poll error for project ${projectId}:`, pollErr?.message);
+          return;
+        }
+
+        const projectStatus = proj.status;
+        const newStage = STATUS_TO_STAGE[projectStatus] || lastStage;
+
+        if (newStage !== lastStage) {
+          console.log(`[FACTORY] Task ${task.id}: stage ${lastStage} → ${newStage} (project status: ${projectStatus})`);
+          await supabase.from("agent_tasks").update({ stage: newStage }).eq("id", task.id);
+          lastStage = newStage;
+        }
+
+        // Terminal: live
+        if (projectStatus === "live") {
+          clearInterval(pollInterval);
+
+          // Try to get deployment URL
+          let deploymentUrl = null;
+          try {
+            const { data: deployment } = await supabase
+              .from("deployments")
+              .select("url")
+              .eq("project_id", projectId)
+              .order("created_at", { ascending: false })
+              .limit(1)
+              .single();
+            deploymentUrl = deployment?.url;
+          } catch {}
+
+          console.log(`[FACTORY] Task ${task.id} completed! Deployment: ${deploymentUrl || "N/A"}`);
+          await supabase.from("agent_tasks").update({
+            status: "done",
+            result: { output: "Factory pipeline completed", deployment_url: deploymentUrl, project_id: projectId },
+            completed_at: new Date().toISOString(),
+          }).eq("id", task.id);
+          return;
+        }
+
+        // Terminal: error/failed
+        if (projectStatus === "error" || projectStatus === "failed") {
+          clearInterval(pollInterval);
+          console.error(`[FACTORY] Task ${task.id} failed (project status: ${projectStatus})`);
+          await supabase.from("agent_tasks").update({
+            status: "failed",
+            error: `Factory pipeline failed with status: ${projectStatus}`,
+            completed_at: new Date().toISOString(),
+          }).eq("id", task.id);
+          return;
+        }
+      } catch (e) {
+        console.error(`[FACTORY] Poll error for task ${task.id}: ${e.message}`);
+      }
+    }, FACTORY_POLL_INTERVAL);
+
+    return true;
+  } catch (e) {
+    console.error(`[FACTORY] Error dispatching task ${task.id}: ${e.message}`);
+    return false;
+  }
+}
 
 // Track active dispatched tasks: taskId → { agentName, dispatchedAt, sessionKey }
 const activeTasks = new Map();
 
 // --- Dispatch task to agent via /hooks/agent ---
 async function dispatchToAgent(task) {
+  // Route coding tasks through the Dante ID factory pipeline
+  if (task.type === "coding") {
+    const handled = await dispatchViaFactory(task);
+    if (handled) return;
+    console.log(`[DISPATCH] Factory fallback: dispatching coding task ${task.id} to agent`);
+  }
+
   const agentName = task.assigned_agent?.toLowerCase();
   const agent = AGENTS[agentName];
 
