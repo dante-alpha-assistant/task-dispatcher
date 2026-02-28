@@ -1108,15 +1108,19 @@ async function scheduler() {
         })
         .sort((a, b) => b.score - a.score);
 
-      const bestAgent = candidates[0];
+      const bestCandidate = candidates[0];
 
-      if (bestAgent) {
-        console.log(`[SCHEDULER] Auto-assigning task ${task.id} ("${task.title}") \u2192 ${bestAgent.name} (type: ${taskType}, score: ${bestAgent.score.toFixed(1)})`);
+      if (bestCandidate) {
+        // Decrement the ORIGINAL agent in availableFiltered (not the spread copy)
+        const originalAgent = availableFiltered.find(a => a.name === bestCandidate.name);
+        if (!originalAgent || originalAgent.remaining <= 0) continue;
+        
+        console.log(`[SCHEDULER] Auto-assigning task ${task.id} ("${task.title}") \u2192 ${bestCandidate.name} (type: ${taskType}, remaining: ${originalAgent.remaining})`);
         await supabase
           .from("agent_tasks")
-          .update({ status: "assigned", assigned_agent: bestAgent.name })
+          .update({ status: "assigned", assigned_agent: bestCandidate.name })
           .eq("id", task.id);
-        bestAgent.remaining--;
+        originalAgent.remaining--;
         assigned++;
       } else {
         console.log(`[SCHEDULER] No capable agent for task ${task.id} (type: ${taskType}), keeping in queue`);
