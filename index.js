@@ -41,16 +41,40 @@ async function dispatchToAgent(task) {
     return;
   }
 
-  const message = [
-    `## Task Assigned: ${task.title}`,
-    task.description ? `\n${task.description}` : "",
-    task.prompt ? `\n**Prompt:** ${task.prompt}` : "",
-    `\n**Task ID:** ${task.id}`,
-    `**Type:** ${task.type}`,
-    `**Priority:** ${task.priority}`,
-    `**Dispatched by:** ${task.dispatched_by}`,
-    `\nWhen done, update the task status to 'done' or 'failed' via Supabase.`,
-  ].join("\n");
+  const message = `## Task Assigned: ${task.title}
+
+${task.description || ""}
+${task.prompt ? `**Prompt:** ${task.prompt}` : ""}
+
+**Task ID:** ${task.id}
+**Type:** ${task.type}
+**Priority:** ${task.priority}
+**Dispatched by:** ${task.dispatched_by}
+
+---
+## ⚠️ MANDATORY: Update task status when done
+
+When you finish this task, you MUST update its status. Run this command:
+
+**On success:**
+\`\`\`bash
+curl -s -X PATCH "https://lessxkxujvcmublgwdaa.supabase.co/rest/v1/agent_tasks?id=eq.${task.id}" \\
+  -H "apikey: ${SUPABASE_KEY}" \\
+  -H "Authorization: Bearer ${SUPABASE_KEY}" \\
+  -H "Content-Type: application/json" \\
+  -d '{"status":"done","completed_at":"'$(date -u +%Y-%m-%dT%H:%M:%SZ)'","result":{"output":"DESCRIBE WHAT YOU DID"}}'
+\`\`\`
+
+**On failure:**
+\`\`\`bash
+curl -s -X PATCH "https://lessxkxujvcmublgwdaa.supabase.co/rest/v1/agent_tasks?id=eq.${task.id}" \\
+  -H "apikey: ${SUPABASE_KEY}" \\
+  -H "Authorization: Bearer ${SUPABASE_KEY}" \\
+  -H "Content-Type: application/json" \\
+  -d '{"status":"failed","completed_at":"'$(date -u +%Y-%m-%dT%H:%M:%SZ)'","error":"DESCRIBE WHAT WENT WRONG"}'
+\`\`\`
+
+Do NOT skip this step. The task board at tasks.dante.id must reflect your work.`;
 
   try {
     const resp = await fetch(agent.url, {
@@ -131,8 +155,48 @@ createServer((req, res) => {
   console.log(`[HEALTH] Listening on :${PORT}`);
 });
 
+// --- Watchdog: auto-fail stale tasks ---
+const WATCHDOG_INTERVAL = 5 * 60 * 1000; // 5 minutes
+const TASK_TIMEOUT = 30 * 60 * 1000; // 30 minutes
+
+async function watchdog() {
+  try {
+    const cutoff = new Date(Date.now() - TASK_TIMEOUT).toISOString();
+    const { data: staleTasks, error } = await supabase
+      .from("agent_tasks")
+      .select("id, title, assigned_agent, started_at")
+      .eq("status", "in_progress")
+      .lt("started_at", cutoff);
+
+    if (error) {
+      console.error("[WATCHDOG] Query error:", error.message);
+      return;
+    }
+
+    for (const task of staleTasks || []) {
+      console.log(`[WATCHDOG] Timing out task ${task.id} ("${task.title}") assigned to ${task.assigned_agent}`);
+      await supabase
+        .from("agent_tasks")
+        .update({
+          status: "failed",
+          error: "Timeout: agent did not complete within 30 minutes",
+          completed_at: new Date().toISOString(),
+        })
+        .eq("id", task.id);
+    }
+
+    if (staleTasks?.length) {
+      console.log(`[WATCHDOG] Timed out ${staleTasks.length} stale tasks`);
+    }
+  } catch (e) {
+    console.error("[WATCHDOG] Error:", e.message);
+  }
+}
+
 // --- Start ---
 subscribe();
+setInterval(watchdog, WATCHDOG_INTERVAL);
+watchdog();
 
 // Graceful shutdown
 process.on("SIGTERM", () => {
