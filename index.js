@@ -723,8 +723,38 @@ Do NOT skip this step. The task board at tasks.dante.id must reflect your work.`
 
 
 // --- QA Auto-Scaler ---
+// QA Stale Detection: re-dispatch QA tasks that have been sitting > 20 min with no progress
+async function qaStaleDetector() {
+  try {
+    const { data: staleTasks, error } = await supabase
+      .from("agent_tasks")
+      .select("id, title, qa_agent, updated_at")
+      .eq("status", "qa_testing")
+      .not("qa_agent", "is", null);
+
+    if (error || !staleTasks?.length) return;
+
+    const QA_STALE_THRESHOLD = 20 * 60 * 1000; // 20 minutes
+    for (const task of staleTasks) {
+      const age = Date.now() - new Date(task.updated_at).getTime();
+      if (age > QA_STALE_THRESHOLD) {
+        console.log(`[QA-STALE] Task ${task.id} ("${task.title.slice(0, 40)}") stuck in qa_testing for ${Math.floor(age / 60000)}min → resetting for re-dispatch`);
+        await supabase
+          .from("agent_tasks")
+          .update({ status: "done", qa_agent: null })
+          .eq("id", task.id);
+      }
+    }
+  } catch (e) {
+    console.error("[QA-STALE] Error:", e.message);
+  }
+}
+
 async function qaAutoScaler() {
   try {
+    // Run stale detection first
+    await qaStaleDetector();
+
     const { data: qaTasks, error } = await supabase
       .from("agent_tasks")
       .select("id")
