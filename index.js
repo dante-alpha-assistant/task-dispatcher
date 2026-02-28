@@ -9,18 +9,22 @@ const AGENTS = {
   neo: {
     url: process.env.NEO_HOOKS_URL || `http://neo.agents.svc.cluster.local:18789/hooks/agent`,
     token: process.env.NEO_HOOKS_TOKEN,
+    gatewayToken: process.env.NEO_GATEWAY_TOKEN,
   },
   mu: {
     url: process.env.MU_HOOKS_URL || `http://mu.agents.svc.cluster.local:18789/hooks/agent`,
     token: process.env.MU_HOOKS_TOKEN,
+    gatewayToken: process.env.MU_GATEWAY_TOKEN,
   },
   beta: {
     url: process.env.BETA_HOOKS_URL || `http://beta.agents.svc.cluster.local:18789/hooks/agent`,
     token: process.env.BETA_HOOKS_TOKEN,
+    gatewayToken: process.env.BETA_GATEWAY_TOKEN,
   },
   flow: {
     url: process.env.FLOW_HOOKS_URL || `http://flow.agents.svc.cluster.local:18789/hooks/agent`,
     token: process.env.FLOW_HOOKS_TOKEN,
+    gatewayToken: process.env.FLOW_GATEWAY_TOKEN,
   },
 };
 
@@ -265,109 +269,128 @@ createServer(async (req, res) => {
   console.log(`[HEALTH] Listening on :${PORT}`);
 });
 
-// --- Watchdog: auto-fail stale tasks ---
-const WATCHDOG_INTERVAL = 5 * 60 * 1000; // 5 minutes
-const TASK_TIMEOUT = 30 * 60 * 1000; // 30 minutes
+// --- Unified Task Monitor ---
+// Replaces both watchdog and session checker
+// Queries ALL in_progress tasks from Supabase (not just locally tracked ones)
+// Checks if agent session still exists, auto-closes if not
+const MONITOR_INTERVAL = 30_000; // 30 seconds
+const TASK_HARD_TIMEOUT = 5 * 60 * 1000; // 5 minutes hard timeout
+const SESSION_GONE_GRACE = 60_000; // 1 minute grace after session disappears
 
-async function watchdog() {
+// Track when we first noticed a session was gone: taskId → timestamp
+const sessionGoneAt = new Map();
+
+async function taskMonitor() {
   try {
-    const cutoff = new Date(Date.now() - TASK_TIMEOUT).toISOString();
-    const { data: staleTasks, error } = await supabase
+    // Get ALL in_progress and assigned tasks from Supabase
+    const { data: activeTasks_db, error } = await supabase
       .from("agent_tasks")
-      .select("id, title, assigned_agent, started_at")
-      .eq("status", "in_progress")
-      .lt("started_at", cutoff);
+      .select("id, title, status, assigned_agent, started_at, created_at")
+      .in("status", ["in_progress", "assigned"]);
 
     if (error) {
-      console.error("[WATCHDOG] Query error:", error.message);
+      console.error("[MONITOR] Query error:", error.message);
       return;
     }
 
-    for (const task of staleTasks || []) {
-      console.log(`[WATCHDOG] Timing out task ${task.id} ("${task.title}") assigned to ${task.assigned_agent}`);
-      await supabase
-        .from("agent_tasks")
-        .update({
-          status: "failed",
-          error: "Timeout: agent did not complete within 30 minutes",
-          completed_at: new Date().toISOString(),
-        })
-        .eq("id", task.id);
+    if (!activeTasks_db?.length) {
+      sessionGoneAt.clear(); // No active tasks, clear tracking
+      return;
     }
 
-    if (staleTasks?.length) {
-      console.log(`[WATCHDOG] Timed out ${staleTasks.length} stale tasks`);
-    }
-  } catch (e) {
-    console.error("[WATCHDOG] Error:", e.message);
-  }
-}
+    for (const task of activeTasks_db) {
+      const agentName = task.assigned_agent?.toLowerCase();
+      const agent = AGENTS[agentName];
 
-// --- Session checker: poll agent gateways for hook session status ---
-const SESSION_CHECK_INTERVAL = 10_000; // 10 seconds
-
-async function checkActiveSessions() {
-  for (const [taskId, info] of activeTasks) {
-    try {
-      const agent = AGENTS[info.agentName];
       if (!agent) continue;
 
-      const resp = await fetch(agent.url.replace('/hooks/agent', '/tools/invoke'), {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${agent.token}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          tool: 'sessions_list',
-          params: { limit: 50, messageLimit: 0 },
-        }),
-      });
+      // Use gateway token for session polling (NOT hooks token)
+      const authToken = agent.gatewayToken || agent.token;
+      const invokeUrl = agent.url.replace('/hooks/agent', '/tools/invoke');
 
-      if (!resp.ok) {
-        console.log(`[SESSION] Cannot reach ${info.agentName} gateway for task ${taskId}`);
+      // Hard timeout: if task has been in_progress for too long, fail it
+      const startTime = task.started_at || task.created_at;
+      if (startTime && (Date.now() - new Date(startTime).getTime()) > TASK_HARD_TIMEOUT) {
+        console.log(`[MONITOR] Hard timeout: task ${task.id} ("${task.title}") → ${agentName} (${Math.round((Date.now() - new Date(startTime).getTime()) / 60000)}min)`);
+        await supabase
+          .from("agent_tasks")
+          .update({
+            status: "failed",
+            error: `Timeout: task exceeded ${TASK_HARD_TIMEOUT / 60000} minute limit`,
+            completed_at: new Date().toISOString(),
+          })
+          .eq("id", task.id);
+        sessionGoneAt.delete(task.id);
+        activeTasks.delete(task.id);
         continue;
       }
 
-      const data = await resp.json();
-      const sessions = data?.result?.details?.sessions || [];
-      const hookSession = sessions.find(s => s.key === `agent:main:${info.sessionKey}`);
+      // Only check sessions for in_progress tasks (assigned tasks haven't started yet)
+      if (task.status !== "in_progress") continue;
 
-      if (!hookSession) {
-        const { data: task } = await supabase
-          .from('agent_tasks')
-          .select('status')
-          .eq('id', taskId)
-          .single();
+      // Try to check if the hook session still exists
+      try {
+        const resp = await fetch(invokeUrl, {
+          method: "POST",
+          headers: {
+            "Authorization": `Bearer ${authToken}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            tool: "sessions_list",
+            params: { limit: 100, messageLimit: 0 },
+          }),
+        });
 
-        if (task?.status === 'in_progress') {
-          const elapsed = Date.now() - info.dispatchedAt;
-          if (elapsed > 60_000) {
-            console.log(`[SESSION] Task ${taskId} session gone, marking done (agent likely completed without updating)`);
-            await supabase
-              .from('agent_tasks')
-              .update({
-                status: 'done',
-                completed_at: new Date().toISOString(),
-                result: { output: 'Session completed (auto-detected by dispatcher)' },
-              })
-              .eq('id', taskId);
-            activeTasks.delete(taskId);
+        if (!resp.ok) {
+          console.log(`[MONITOR] Cannot reach ${agentName} gateway (${resp.status}) for task ${task.id}`);
+          continue;
+        }
+
+        const data = await resp.json();
+        const sessions = data?.result?.details?.sessions || [];
+        const sessionKey = `agent:main:hook:task:${task.id}`;
+        const hookSession = sessions.find(s => s.key === sessionKey);
+
+        if (hookSession) {
+          // Session exists — task is actively being worked on
+          sessionGoneAt.delete(task.id);
+          const idleSec = Math.floor((Date.now() - hookSession.updatedAt) / 1000);
+          if (idleSec > 120) {
+            console.log(`[MONITOR] Task ${task.id} → ${agentName}: session exists but idle ${idleSec}s`);
           }
         } else {
-          activeTasks.delete(taskId);
+          // Session is gone — agent probably finished
+          if (!sessionGoneAt.has(task.id)) {
+            sessionGoneAt.set(task.id, Date.now());
+            console.log(`[MONITOR] Task ${task.id} ("${task.title}") → ${agentName}: session gone, starting grace period`);
+          } else if (Date.now() - sessionGoneAt.get(task.id) > SESSION_GONE_GRACE) {
+            // Grace period expired — auto-close
+            console.log(`[MONITOR] Auto-closing task ${task.id} ("${task.title}") — session gone, grace expired`);
+            await supabase
+              .from("agent_tasks")
+              .update({
+                status: "done",
+                completed_at: new Date().toISOString(),
+                result: { output: "Auto-closed by dispatcher: agent session ended" },
+              })
+              .eq("id", task.id);
+            sessionGoneAt.delete(task.id);
+            activeTasks.delete(task.id);
+          }
         }
-      } else {
-        const lastActivity = hookSession.updatedAt;
-        const idleSec = Math.floor((Date.now() - lastActivity) / 1000);
-
-        if (idleSec > 0 && idleSec % 60 < 10) {
-          console.log(`[SESSION] Task ${taskId} → ${info.agentName}: session active, idle ${idleSec}s`);
-        }
+      } catch (e) {
+        console.error(`[MONITOR] Error checking ${agentName} for task ${task.id}: ${e.message}`);
       }
-    } catch (e) {
-      console.error(`[SESSION] Error checking task ${taskId}: ${e.message}`);
     }
+
+    // Clean up sessionGoneAt for tasks no longer in the active list
+    const activeIds = new Set(activeTasks_db.map(t => t.id));
+    for (const taskId of sessionGoneAt.keys()) {
+      if (!activeIds.has(taskId)) sessionGoneAt.delete(taskId);
+    }
+  } catch (e) {
+    console.error("[MONITOR] Error:", e.message);
   }
 }
 
@@ -461,13 +484,16 @@ async function scheduler() {
 
 // --- Start ---
 subscribe();
+
+// Auto-scheduler
 setInterval(scheduler, SCHEDULER_INTERVAL);
-scheduler(); // Run once on boot
+scheduler();
 console.log(`[BOOT] Auto-scheduler running every ${SCHEDULER_INTERVAL / 1000}s`);
-setInterval(watchdog, WATCHDOG_INTERVAL);
-watchdog();
-setInterval(checkActiveSessions, SESSION_CHECK_INTERVAL);
-console.log(`[BOOT] Session checker running every ${SESSION_CHECK_INTERVAL / 1000}s`);
+
+// Unified task monitor (replaces watchdog + session checker)
+setInterval(taskMonitor, MONITOR_INTERVAL);
+setTimeout(taskMonitor, 5000); // Run 5s after boot (let realtime connect first)
+console.log(`[BOOT] Task monitor running every ${MONITOR_INTERVAL / 1000}s (hard timeout: ${TASK_HARD_TIMEOUT / 60000}min, grace: ${SESSION_GONE_GRACE / 1000}s)`);
 
 // Graceful shutdown
 process.on("SIGTERM", () => {
