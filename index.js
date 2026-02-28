@@ -1,5 +1,5 @@
 import { createClient } from "@supabase/supabase-js";
-import k8s from "@kubernetes/client-node";
+import * as k8s from "@kubernetes/client-node";
 
 // K8s client setup
 const kc = new k8s.KubeConfig();
