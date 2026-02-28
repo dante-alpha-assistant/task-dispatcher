@@ -51,7 +51,7 @@ async function getAgentCards() {
   return (data || []).map(c => ({
     name: c.name.toLowerCase(),
     capabilities: c.task_types || [],
-    max_concurrent: c.max_capacity || 2,
+    max_concurrent: c.max_capacity != null ? c.max_capacity : 2,
     priority_affinity: c.priority_affinity || {},
   }));
 }
