@@ -26,6 +26,9 @@ const AGENTS = {
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
+// Track active dispatched tasks: taskId → { agentName, dispatchedAt, sessionKey }
+const activeTasks = new Map();
+
 // --- Dispatch task to agent via /hooks/agent ---
 async function dispatchToAgent(task) {
   const agentName = task.assigned_agent?.toLowerCase();
@@ -94,6 +97,13 @@ Do NOT skip this step. The task board at tasks.dante.id must reflect your work.`
     if (resp.ok) {
       console.log(`[OK] Dispatched task ${task.id} ("${task.title}") → ${agentName}`);
 
+      // Track the dispatched task
+      activeTasks.set(task.id, {
+        agentName,
+        dispatchedAt: Date.now(),
+        sessionKey: `hook:task:${task.id}`,
+      });
+
       // Update status to in_progress
       await supabase
         .from("agent_tasks")
@@ -136,6 +146,14 @@ function subscribe() {
             dispatchToAgent(task);
           }
         }
+
+        // Remove completed/failed tasks from active tracking
+        if (task?.status === 'done' || task?.status === 'failed') {
+          if (activeTasks.has(task.id)) {
+            console.log(`[TRACKER] Task ${task.id} completed (${task.status}), removing from active tracking`);
+            activeTasks.delete(task.id);
+          }
+        }
       }
     )
     .subscribe((status) => {
@@ -150,7 +168,7 @@ import { createServer } from "http";
 const PORT = process.env.PORT || 8080;
 createServer((req, res) => {
   res.writeHead(200, { "Content-Type": "application/json" });
-  res.end(JSON.stringify({ ok: true, service: "task-dispatcher" }));
+  res.end(JSON.stringify({ ok: true, service: "task-dispatcher", activeTasks: activeTasks.size }));
 }).listen(PORT, () => {
   console.log(`[HEALTH] Listening on :${PORT}`);
 });
@@ -193,10 +211,80 @@ async function watchdog() {
   }
 }
 
+// --- Session checker: poll agent gateways for hook session status ---
+const SESSION_CHECK_INTERVAL = 10_000; // 10 seconds
+
+async function checkActiveSessions() {
+  for (const [taskId, info] of activeTasks) {
+    try {
+      const agent = AGENTS[info.agentName];
+      if (!agent) continue;
+
+      const resp = await fetch(agent.url.replace('/hooks/agent', '/tools/invoke'), {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${agent.token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          tool: 'sessions_list',
+          params: { limit: 50, messageLimit: 0 },
+        }),
+      });
+
+      if (!resp.ok) {
+        console.log(`[SESSION] Cannot reach ${info.agentName} gateway for task ${taskId}`);
+        continue;
+      }
+
+      const data = await resp.json();
+      const sessions = data?.result?.details?.sessions || [];
+      const hookSession = sessions.find(s => s.key === `agent:main:${info.sessionKey}`);
+
+      if (!hookSession) {
+        const { data: task } = await supabase
+          .from('agent_tasks')
+          .select('status')
+          .eq('id', taskId)
+          .single();
+
+        if (task?.status === 'in_progress') {
+          const elapsed = Date.now() - info.dispatchedAt;
+          if (elapsed > 60_000) {
+            console.log(`[SESSION] Task ${taskId} session gone, marking done (agent likely completed without updating)`);
+            await supabase
+              .from('agent_tasks')
+              .update({
+                status: 'done',
+                completed_at: new Date().toISOString(),
+                result: { output: 'Session completed (auto-detected by dispatcher)' },
+              })
+              .eq('id', taskId);
+            activeTasks.delete(taskId);
+          }
+        } else {
+          activeTasks.delete(taskId);
+        }
+      } else {
+        const lastActivity = hookSession.updatedAt;
+        const idleSec = Math.floor((Date.now() - lastActivity) / 1000);
+
+        if (idleSec > 0 && idleSec % 60 < 10) {
+          console.log(`[SESSION] Task ${taskId} → ${info.agentName}: session active, idle ${idleSec}s`);
+        }
+      }
+    } catch (e) {
+      console.error(`[SESSION] Error checking task ${taskId}: ${e.message}`);
+    }
+  }
+}
+
 // --- Start ---
 subscribe();
 setInterval(watchdog, WATCHDOG_INTERVAL);
 watchdog();
+setInterval(checkActiveSessions, SESSION_CHECK_INTERVAL);
+console.log(`[BOOT] Session checker running every ${SESSION_CHECK_INTERVAL / 1000}s`);
 
 // Graceful shutdown
 process.on("SIGTERM", () => {
