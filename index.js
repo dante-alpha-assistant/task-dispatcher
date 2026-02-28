@@ -132,7 +132,7 @@ function subscribe() {
         schema: "public",
         table: "agent_tasks",
       },
-      (payload) => {
+      async (payload) => {
         const { eventType, new: task, old: prev } = payload;
         console.log(`[EVENT] ${eventType} on task ${task?.id || prev?.id}: status=${task?.status}`);
 
@@ -152,6 +152,71 @@ function subscribe() {
           if (activeTasks.has(task.id)) {
             console.log(`[TRACKER] Task ${task.id} completed (${task.status}), removing from active tracking`);
             activeTasks.delete(task.id);
+          }
+        }
+
+        // QA routing: when task moves to "done", create QA task for Beta
+        if (task?.status === "done" && eventType === "UPDATE" && prev?.status !== "done") {
+          // Don't QA tasks that are already QA tasks (prevent infinite loop)
+          if (task.type === "qa") return;
+
+          console.log(`[QA] Task ${task.id} ("${task.title}") moved to done — creating QA task for beta`);
+
+          const qaDescription = [
+            `## QA Review: ${task.title}`,
+            ``,
+            `**Original Task:** ${task.id}`,
+            `**Type:** ${task.type}`,
+            `**Assigned to:** ${task.assigned_agent}`,
+            `**Dispatched by:** ${task.dispatched_by}`,
+            ``,
+            `### Description`,
+            task.description || "(none)",
+            ``,
+            `### Result`,
+            task.result ? JSON.stringify(task.result, null, 2) : "(no result reported)",
+            ``,
+            `### Acceptance Criteria`,
+            task.acceptance_criteria || "Verify the task was completed correctly based on the description and result.",
+            ``,
+            `### Your Job`,
+            `1. Review the result against the acceptance criteria`,
+            `2. If the task involved code: check the repo, run tests if possible`,
+            `3. If the task involved a URL/service: test it`,
+            `4. Update the ORIGINAL task (not this QA task) status:`,
+            `   - If passed: update to "completed"`,
+            `   - If failed: update to "failed" with error describing what's wrong`,
+          ].join("\n");
+
+          try {
+            const { data: qaTask, error } = await supabase
+              .from("agent_tasks")
+              .insert({
+                title: `QA: ${task.title}`,
+                description: qaDescription,
+                type: "qa",
+                priority: task.priority,
+                status: "assigned",
+                assigned_agent: "beta",
+                dispatched_by: "dispatcher",
+                acceptance_criteria: task.acceptance_criteria,
+              })
+              .select()
+              .single();
+
+            if (error) {
+              console.error(`[QA] Failed to create QA task: ${error.message}`);
+            } else {
+              console.log(`[QA] Created QA task ${qaTask.id} assigned to beta`);
+
+              // Also update original task status to "qa"
+              await supabase
+                .from("agent_tasks")
+                .update({ status: "qa", qa_agent: "beta" })
+                .eq("id", task.id);
+            }
+          } catch (e) {
+            console.error(`[QA] Error creating QA task: ${e.message}`);
           }
         }
       }
