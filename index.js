@@ -28,13 +28,18 @@ const AGENTS = {
   },
 };
 
-// Agent capacity and type affinity
-const AGENT_CONFIG = {
-  neo:  { maxConcurrent: 2, types: ["coding", "ops", "general", "research"] },
-  mu:   { maxConcurrent: 2, types: ["coding", "ops", "general"] },
-  beta: { maxConcurrent: 1, types: ["qa"] },  // QA only
-  flow: { maxConcurrent: 2, types: ["general", "research", "ops"] },
-};
+// Dynamic agent capability cards from Supabase
+async function getAgentCards() {
+  const { data, error } = await supabase
+    .from('agent_cards')
+    .select('*')
+    .eq('active', true);
+  if (error) {
+    console.error('[CARDS] Failed to fetch agent cards:', error.message);
+    return [];
+  }
+  return data;
+}
 
 const DANTE_ID_API_URL = process.env.DANTE_ID_API_URL || "https://api.dante.id";
 const PRIORITY_ORDER = { urgent: 0, high: 1, normal: 2, low: 3 };
@@ -441,13 +446,13 @@ createServer(async (req, res) => {
   if (req.url === "/health" || req.url === "/") {
     let capacity = {};
     try {
-      const { data } = await supabase
-        .from("agent_tasks")
-        .select("assigned_agent")
-        .in("status", ["assigned", "in_progress"]);
-      for (const [name, config] of Object.entries(AGENT_CONFIG)) {
-        const load = (data || []).filter(t => t.assigned_agent?.toLowerCase() === name).length;
-        capacity[name] = { load, max: config.maxConcurrent, available: config.maxConcurrent - load };
+      const [{ data }, cards] = await Promise.all([
+        supabase.from("agent_tasks").select("assigned_agent").in("status", ["assigned", "in_progress"]),
+        getAgentCards(),
+      ]);
+      for (const card of cards) {
+        const load = (data || []).filter(t => t.assigned_agent?.toLowerCase() === card.name).length;
+        capacity[card.name] = { load, max: card.max_concurrent, available: card.max_concurrent - load, capabilities: card.capabilities };
       }
     } catch {}
     res.writeHead(200, { "Content-Type": "application/json" });
@@ -612,6 +617,9 @@ async function taskMonitor() {
 // --- Auto-scheduler: assign todo tasks to available agents ---
 async function scheduler() {
   try {
+    const cards = await getAgentCards();
+    if (!cards.length) return;
+
     const { data: activeTasks_db, error: activeErr } = await supabase
       .from("agent_tasks")
       .select("assigned_agent")
@@ -622,18 +630,20 @@ async function scheduler() {
       return;
     }
 
+    // Build load map from active tasks
     const agentLoad = {};
-    for (const name of Object.keys(AGENT_CONFIG)) agentLoad[name] = 0;
+    for (const card of cards) agentLoad[card.name] = 0;
     for (const t of activeTasks_db || []) {
       const agent = t.assigned_agent?.toLowerCase();
       if (agent && agentLoad[agent] !== undefined) agentLoad[agent]++;
     }
 
+    // Build available agents with remaining capacity
     const available = [];
-    for (const [name, config] of Object.entries(AGENT_CONFIG)) {
-      const remaining = config.maxConcurrent - (agentLoad[name] || 0);
+    for (const card of cards) {
+      const remaining = card.max_concurrent - (agentLoad[card.name] || 0);
       if (remaining > 0) {
-        available.push({ name, remaining, types: config.types });
+        available.push({ name: card.name, remaining, capabilities: card.capabilities, priority_affinity: card.priority_affinity || {} });
       }
     }
 
@@ -657,11 +667,12 @@ async function scheduler() {
     let assigned = 0;
 
     for (const task of todoTasks) {
+      // Respect assigned_agent hint
       if (task.assigned_agent) {
         const hintAgent = task.assigned_agent.toLowerCase();
         const agentSlot = available.find(a => a.name === hintAgent && a.remaining > 0);
         if (agentSlot) {
-          console.log(`[SCHEDULER] Assigning task ${task.id} ("${task.title}") → ${hintAgent} (hint)`);
+          console.log(`[SCHEDULER] Assigning task ${task.id} ("${task.title}") \u2192 ${hintAgent} (hint)`);
           await supabase
             .from("agent_tasks")
             .update({ status: "assigned", assigned_agent: hintAgent })
@@ -674,18 +685,30 @@ async function scheduler() {
       }
 
       const taskType = task.type || "general";
-      const bestAgent = available
-        .filter(a => a.remaining > 0 && a.types.includes(taskType))
-        .sort((a, b) => b.remaining - a.remaining)[0];
+
+      // Score agents: must have capability, then rank by capacity + priority affinity
+      const candidates = available
+        .filter(a => a.remaining > 0 && a.capabilities.includes(taskType))
+        .map(a => {
+          let score = a.remaining;
+          const affinityMultiplier = a.priority_affinity[task.priority];
+          if (affinityMultiplier) score *= affinityMultiplier;
+          return { ...a, score };
+        })
+        .sort((a, b) => b.score - a.score);
+
+      const bestAgent = candidates[0];
 
       if (bestAgent) {
-        console.log(`[SCHEDULER] Auto-assigning task ${task.id} ("${task.title}") → ${bestAgent.name} (type: ${taskType})`);
+        console.log(`[SCHEDULER] Auto-assigning task ${task.id} ("${task.title}") \u2192 ${bestAgent.name} (type: ${taskType}, score: ${bestAgent.score.toFixed(1)})`);
         await supabase
           .from("agent_tasks")
           .update({ status: "assigned", assigned_agent: bestAgent.name })
           .eq("id", task.id);
         bestAgent.remaining--;
         assigned++;
+      } else {
+        console.log(`[SCHEDULER] No capable agent for task ${task.id} (type: ${taskType}), keeping in queue`);
       }
     }
 
