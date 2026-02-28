@@ -32,13 +32,19 @@ const AGENTS = {
 async function getAgentCards() {
   const { data, error } = await supabase
     .from('agent_cards')
-    .select('*')
-    .eq('active', true);
+    .select('name, capabilities, task_types, max_capacity, priority_affinity, status')
+    .eq('status', 'online');
   if (error) {
     console.error('[CARDS] Failed to fetch agent cards:', error.message);
     return [];
   }
-  return data;
+  // Normalize to common shape used by scheduler
+  return (data || []).map(c => ({
+    name: c.name.toLowerCase(),
+    capabilities: c.task_types || [],
+    max_concurrent: c.max_capacity || 2,
+    priority_affinity: c.priority_affinity || {},
+  }));
 }
 
 const DANTE_ID_API_URL = process.env.DANTE_ID_API_URL || "https://api.dante.id";
