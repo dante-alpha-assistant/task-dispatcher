@@ -342,7 +342,26 @@ async function dispatchToAgent(task) {
     return;
   }
 
-  const message = `## Task Assigned: ${task.title}
+  const taskPayload = JSON.stringify({
+    task_id: task.id,
+    title: task.title,
+    description: task.description,
+    acceptance_criteria: task.acceptance_criteria,
+    type: task.type,
+    priority: task.priority,
+    stage: task.stage,
+    parent_task_id: task.parent_task_id,
+    dispatched_by: task.dispatched_by,
+    repo: task.repo,
+    branch: task.branch,
+    context: task.context,
+  }, null, 2);
+
+  const message = `\`\`\`json
+${taskPayload}
+\`\`\`
+
+## Task Assigned: ${task.title}
 
 ${task.description || ""}
 ${task.prompt ? `**Prompt:** ${task.prompt}` : ""}
@@ -363,7 +382,7 @@ curl -s -X PATCH "https://lessxkxujvcmublgwdaa.supabase.co/rest/v1/agent_tasks?i
   -H "apikey: ${SUPABASE_KEY}" \\
   -H "Authorization: Bearer ${SUPABASE_KEY}" \\
   -H "Content-Type: application/json" \\
-  -d '{"status":"done","completed_at":"'$(date -u +%Y-%m-%dT%H:%M:%SZ)'","result":{"output":"DESCRIBE WHAT YOU DID"}}'
+  -d '{"status":"done","completed_at":"'$(date -u +%Y-%m-%dT%H:%M:%SZ)'","result":{"summary":"DESCRIBE WHAT YOU DID","artifacts":[],"test_results":null}}'
 \`\`\`
 
 **On failure:**
@@ -673,7 +692,26 @@ function subscribe() {
           try {
 
             // Dispatch the SAME task to Beta for review
-            const qaMessage = `## QA Review: ${task.title}
+            const qaPayload = JSON.stringify({
+              task_id: task.id,
+              title: task.title,
+              description: task.description,
+              acceptance_criteria: task.acceptance_criteria,
+              type: task.type,
+              priority: task.priority,
+              stage: task.stage,
+              parent_task_id: task.parent_task_id,
+              dispatched_by: task.dispatched_by,
+              repo: task.repo,
+              branch: task.branch,
+              context: task.context,
+            }, null, 2);
+
+            const qaMessage = `\`\`\`json
+${qaPayload}
+\`\`\`
+
+## QA Review: ${task.title}
 
 **Task ID:** ${task.id}
 **Type:** ${task.type}
