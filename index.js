@@ -552,11 +552,12 @@ async function assignQueuedQATasks() {
 
     if (taskErr || !unassigned?.length) return;
 
-    const { body: podList } = await coreApi.listNamespacedPod({
+    const podListResp = await coreApi.listNamespacedPod({
       namespace: "agents",
       labelSelector: "role=beta-worker",
       fieldSelector: "status.phase=Running",
     });
+    const podList = podListResp?.body || podListResp || {};
 
     const runningWorkers = (podList.items || []).map((p) => p.metadata.name);
     if (!runningWorkers.length) return;
