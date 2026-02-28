@@ -307,6 +307,90 @@ function broadcast(eventType, data, taskId) {
   }
 }
 
+// --- Context Manager: build institutional memory block ---
+async function buildContextBlock(task) {
+  const sections = [];
+
+  // 1. Previous task results for same repo
+  if (task.repo) {
+    try {
+      const { data } = await supabase
+        .from('agent_tasks')
+        .select('title, status, result, error')
+        .eq('repo', task.repo)
+        .in('status', ['done', 'completed', 'failed'])
+        .order('completed_at', { ascending: false })
+        .limit(5);
+      if (data?.length) {
+        const lines = data.map(t => {
+          const detail = t.status === 'failed'
+            ? (t.error || '').slice(0, 200)
+            : (typeof t.result === 'string' ? t.result : JSON.stringify(t.result || '')).slice(0, 200);
+          return `- **${t.title}** → \`${t.status}\` — ${detail || '(no detail)'}`;
+        });
+        sections.push(`### 📋 Recent Tasks (${task.repo})\n${lines.join('\n')}`);
+      }
+    } catch (e) {
+      console.error('[CONTEXT] Error fetching previous tasks:', e.message);
+    }
+  }
+
+  // 2. Related failed tasks (same repo or type)
+  try {
+    let query = supabase
+      .from('agent_tasks')
+      .select('title, error, repo, type')
+      .eq('status', 'failed')
+      .order('completed_at', { ascending: false })
+      .limit(3);
+    if (task.repo) {
+      query = query.or(`repo.eq.${task.repo},type.eq.${task.type || 'general'}`);
+    } else if (task.type) {
+      query = query.eq('type', task.type);
+    }
+    const { data } = await query;
+    if (data?.length) {
+      const lines = data.map(t => `- **${t.title}** — ${(t.error || '').slice(0, 200) || '(no error detail)'}`);
+      sections.push(`### ⚠️ Recent Failures\n${lines.join('\n')}`);
+    }
+  } catch (e) {
+    console.error('[CONTEXT] Error fetching failed tasks:', e.message);
+  }
+
+  // 3. Active agents
+  try {
+    const { data } = await supabase
+      .from('agent_cards')
+      .select('name, status')
+      .eq('status', 'online');
+    if (data?.length) {
+      const lines = data.map(a => `- **${a.name}** — ${a.status}`);
+      sections.push(`### 🤖 Active Agents\n${lines.join('\n')}`);
+    }
+  } catch (e) {
+    console.error('[CONTEXT] Error fetching active agents:', e.message);
+  }
+
+  // 4. Project context
+  if (task.project_id) {
+    try {
+      const { data } = await supabase
+        .from('projects')
+        .select('name, status, description')
+        .eq('id', task.project_id)
+        .single();
+      if (data) {
+        sections.push(`### 🏗️ Project: ${data.name}\n**Status:** ${data.status}\n${data.description || ''}`);
+      }
+    } catch (e) {
+      console.error('[CONTEXT] Error fetching project:', e.message);
+    }
+  }
+
+  if (!sections.length) return '';
+  return `## 🧠 Institutional Memory\n\n${sections.join('\n\n')}\n\n`;
+}
+
 // --- Dispatch task to agent via /hooks/agent ---
 async function dispatchToAgent(task) {
   // Never dispatch to disabled agents
@@ -357,6 +441,8 @@ async function dispatchToAgent(task) {
     context: task.context,
   }, null, 2);
 
+  const contextBlock = await buildContextBlock(task);
+
   const message = `\`\`\`json
 ${taskPayload}
 \`\`\`
@@ -371,7 +457,7 @@ ${task.prompt ? `**Prompt:** ${task.prompt}` : ""}
 **Priority:** ${task.priority}
 **Dispatched by:** ${task.dispatched_by}${task.parent_task_id ? `\n\n**Parent Task:** ${task.parent_task_id}\n**Sub-task:** This is a sub-task of a larger task. Complete your portion and update status.` : ""}
 
----
+${contextBlock}---
 ## ⚠️ MANDATORY: Update task status when done
 
 When you finish this task, you MUST update its status. Run this command:
