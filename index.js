@@ -369,13 +369,22 @@ function broadcast(eventType, data, taskId) {
 
 // --- Context Manager: build institutional memory block ---
 // --- Context Manager: inject institutional memory into agent sessions ---
+function extractKeywords(title) {
+  const stopWords = new Set(['the','a','an','and','or','for','to','in','on','with','of','is','it','fix','add','update','task','feat','feature','bug','refactor','v2','v1']);
+  return (title || '').toLowerCase().split(/[\s\-_:,|/]+/).filter(w => w.length > 2 && !stopWords.has(w));
+}
+
 async function buildContextBlock(task) {
   const sections = [];
+  let previousResultsSection = '';
+  let retryAlert = '';
+  let failedSection = '';
 
   try {
-    // 1. Previous task results for same repo/project
-    if (task.repo || task.project_id) {
-      try {
+    // 1. Previous task results — by repo/project or title keyword similarity
+    try {
+      let data = null;
+      if (task.repo || task.project_id) {
         let query = supabase.from('agent_tasks')
           .select('title, status, result, assigned_agent, completed_at')
           .in('status', ['done', 'completed'])
@@ -383,51 +392,126 @@ async function buildContextBlock(task) {
           .limit(5);
         if (task.repo) query = query.eq('repo', task.repo);
         else if (task.project_id) query = query.eq('project_id', task.project_id);
-        const { data } = await query;
-        if (data?.length) {
-          sections.push('### Previous Task Results');
-          for (const t of data) {
-            const summary = t.result?.output || t.result?.summary || (t.result ? JSON.stringify(t.result).slice(0, 200) : '(no result)');
-            sections.push(`- **${t.title}** (${t.status}, by ${t.assigned_agent}): ${summary}`);
-          }
+        const res = await query;
+        data = res.data;
+      } else {
+        // Title-based similarity: query by top keywords using ilike
+        const keywords = extractKeywords(task.title).slice(0, 3);
+        if (keywords.length) {
+          const filters = keywords.map(k => `title.ilike.%${k}%`);
+          const { data: kwData } = await supabase.from('agent_tasks')
+            .select('title, status, result, assigned_agent, completed_at')
+            .in('status', ['done', 'completed'])
+            .or(filters.join(','))
+            .order('completed_at', { ascending: false })
+            .limit(5);
+          data = kwData;
         }
-      } catch (e) { console.error('[CONTEXT] Previous results query failed:', e.message); }
-    }
+      }
+      if (data?.length) {
+        const lines = ['### Previous Task Results'];
+        for (const t of data) {
+          const summary = t.result?.output || t.result?.summary || (t.result ? JSON.stringify(t.result).slice(0, 200) : '(no result)');
+          lines.push(`- **${t.title}** (${t.status}, by ${t.assigned_agent}): ${summary}`);
+        }
+        previousResultsSection = lines.join('\n');
+      }
+    } catch (e) { console.error('[CONTEXT] Previous results query failed:', e.message); }
 
-    // 2. Related failed tasks
+    // 2. Failed tasks — by repo/type AND title keyword similarity
     try {
+      const taskKeywords = extractKeywords(task.title);
+      // Fetch recent failed tasks (broad query, filter in JS for keyword match)
       let query = supabase.from('agent_tasks')
         .select('title, error, type, repo, completed_at')
         .eq('status', 'failed')
         .order('completed_at', { ascending: false })
-        .limit(3);
+        .limit(10);
       if (task.repo) query = query.eq('repo', task.repo);
       else if (task.type) query = query.eq('type', task.type);
-      const { data } = await query;
-      if (data?.length) {
-        sections.push('### ⚠️ Previously Failed Tasks (avoid repeating these mistakes)');
-        for (const t of data) {
-          const errorMsg = typeof t.error === 'string' ? t.error : (t.error ? JSON.stringify(t.error).slice(0, 300) : '(unknown error)');
-          sections.push(`- **${t.title}**: ${errorMsg}`);
+      const { data: repoFailed } = await query;
+
+      // Also fetch by keyword similarity if we have keywords
+      let keywordFailed = [];
+      if (taskKeywords.length >= 2) {
+        const filters = taskKeywords.slice(0, 3).map(k => `title.ilike.%${k}%`);
+        const { data: kwFailed } = await supabase.from('agent_tasks')
+          .select('title, error, type, repo, completed_at')
+          .eq('status', 'failed')
+          .or(filters.join(','))
+          .order('completed_at', { ascending: false })
+          .limit(10);
+        keywordFailed = kwFailed || [];
+      }
+
+      // Merge and deduplicate
+      const seenTitles = new Set();
+      const allFailed = [];
+      for (const t of [...(repoFailed || []), ...keywordFailed]) {
+        const key = t.title + '|' + t.completed_at;
+        if (!seenTitles.has(key)) {
+          seenTitles.add(key);
+          // Include if repo/type matched OR shares 2+ keywords
+          const fKeywords = extractKeywords(t.title);
+          const overlap = taskKeywords.filter(k => fKeywords.includes(k)).length;
+          if ((repoFailed || []).includes(t) || overlap >= 2) {
+            allFailed.push(t);
+          }
         }
+      }
+
+      // 3. Retry detection — very similar failed task within 24h
+      const now = Date.now();
+      const dayAgo = new Date(now - 24 * 60 * 60 * 1000).toISOString();
+      for (const t of allFailed) {
+        if (t.completed_at && t.completed_at > dayAgo) {
+          const fKeywords = extractKeywords(t.title);
+          const overlap = taskKeywords.filter(k => fKeywords.includes(k)).length;
+          if (overlap >= 2 || (taskKeywords.length > 0 && overlap === taskKeywords.length)) {
+            const errorMsg = typeof t.error === 'string' ? t.error : (t.error ? JSON.stringify(t.error).slice(0, 500) : '(unknown error)');
+            retryAlert = `### 🔴 RETRY ALERT\nThis task appears to be a retry of recently failed: **${t.title}**\nFull failure reason: ${errorMsg}`;
+            break;
+          }
+        }
+      }
+
+      if (allFailed.length) {
+        const lines = ['### ⚠️ Previously Failed Tasks (avoid repeating these mistakes)'];
+        for (const t of allFailed.slice(0, 5)) {
+          const errorMsg = typeof t.error === 'string' ? t.error : (t.error ? JSON.stringify(t.error).slice(0, 300) : '(unknown error)');
+          lines.push(`- **${t.title}**: ${errorMsg}`);
+        }
+        failedSection = lines.join('\n');
       }
     } catch (e) { console.error('[CONTEXT] Failed tasks query failed:', e.message); }
 
-    // 3. Currently active work
+    // 4. Agent cards context — online agents with capabilities and task counts
     try {
-      const { data } = await supabase.from('agent_tasks')
-        .select('title, assigned_agent, status')
-        .in('status', ['assigned', 'in_progress'])
-        .limit(10);
-      if (data?.length) {
-        sections.push('### Active Work (other agents)');
-        for (const t of data) {
-          sections.push(`- ${t.assigned_agent}: ${t.title} (${t.status})`);
+      const { data: agents } = await supabase.from('agent_cards')
+        .select('name, task_types, status')
+        .eq('status', 'online')
+        .limit(20);
+      if (agents?.length) {
+        // Get active task counts per agent
+        const { data: activeTasks } = await supabase.from('agent_tasks')
+          .select('assigned_agent')
+          .in('status', ['assigned', 'in_progress'])
+          .limit(100);
+        const taskCounts = {};
+        for (const t of (activeTasks || [])) {
+          taskCounts[t.assigned_agent] = (taskCounts[t.assigned_agent] || 0) + 1;
         }
+        const lines = ['### Online Agents'];
+        for (const a of agents) {
+          const caps = Array.isArray(a.task_types) ? a.task_types.join(', ') : (a.task_types || 'general');
+          const count = taskCounts[a.name] || 0;
+          lines.push(`- **${a.name}** [${caps}] — ${count} active task${count !== 1 ? 's' : ''}`);
+        }
+        sections.push(lines.join('\n'));
       }
-    } catch (e) { console.error('[CONTEXT] Active work query failed:', e.message); }
+    } catch (e) { console.error('[CONTEXT] Agent cards query failed:', e.message); }
 
-    // 4. Project context
+    // 5. Project context
     if (task.project_id) {
       try {
         const { data: project } = await supabase.from('projects')
@@ -444,9 +528,36 @@ async function buildContextBlock(task) {
     console.error('[CONTEXT] Unexpected error building context:', e.message);
   }
 
-  if (!sections.length) return '';
-  console.log(`[CONTEXT] Built context for task ${task.id}: ${sections.length} sections`);
-  return '\n## Context (Institutional Memory)\n\n' + sections.join('\n') + '\n';
+  // Assemble with token budget (max 2000 chars)
+  // Priority: retry alert > failed tasks > agent cards/project > previous results (truncated first)
+  const TOKEN_BUDGET = 2000;
+
+  // Fixed sections (high priority — keep at full length)
+  const fixedParts = [retryAlert, failedSection, ...sections].filter(Boolean);
+  const fixedText = fixedParts.join('\n');
+
+  let result = '';
+  if (previousResultsSection) {
+    const available = TOKEN_BUDGET - fixedText.length - 50; // 50 for header/separators
+    if (available > 100 && previousResultsSection.length > available) {
+      previousResultsSection = previousResultsSection.slice(0, available) + '…';
+    } else if (available <= 100) {
+      previousResultsSection = '';
+    }
+  }
+
+  const allParts = [retryAlert, previousResultsSection, failedSection, ...sections].filter(Boolean);
+  if (!allParts.length) return '';
+
+  result = '\n## Context (Institutional Memory)\n\n' + allParts.join('\n\n') + '\n';
+
+  // Final hard truncation
+  if (result.length > TOKEN_BUDGET) {
+    result = result.slice(0, TOKEN_BUDGET - 1) + '…';
+  }
+
+  console.log(`[CONTEXT] Built context v2 for task ${task.id}: ${result.length} chars`);
+  return result;
 }
 
 async function buildContextBlockWithTimeout(task) {
