@@ -170,68 +170,91 @@ function subscribe() {
           }
         }
 
-        // QA routing: when task moves to "done", create QA task for Beta
+        // QA routing: when task moves to "done", move it to "qa" and dispatch to Beta
+        // No separate QA task — the original task goes through QA itself
         if (task?.status === "done" && eventType === "UPDATE" && prev?.status !== "done") {
-          // Don't QA tasks that are already QA tasks (prevent infinite loop)
+          // Don't QA tasks that were already QA'd (prevent loops)
           if (task.type === "qa") return;
 
-          console.log(`[QA] Task ${task.id} ("${task.title}") moved to done — creating QA task for beta`);
-
-          const qaDescription = [
-            `## QA Review: ${task.title}`,
-            ``,
-            `**Original Task:** ${task.id}`,
-            `**Type:** ${task.type}`,
-            `**Assigned to:** ${task.assigned_agent}`,
-            `**Dispatched by:** ${task.dispatched_by}`,
-            ``,
-            `### Description`,
-            task.description || "(none)",
-            ``,
-            `### Result`,
-            task.result ? JSON.stringify(task.result, null, 2) : "(no result reported)",
-            ``,
-            `### Acceptance Criteria`,
-            task.acceptance_criteria || "Verify the task was completed correctly based on the description and result.",
-            ``,
-            `### Your Job`,
-            `1. Review the result against the acceptance criteria`,
-            `2. If the task involved code: check the repo, run tests if possible`,
-            `3. If the task involved a URL/service: test it`,
-            `4. Update the ORIGINAL task (not this QA task) status:`,
-            `   - If passed: update to "completed"`,
-            `   - If failed: update to "failed" with error describing what's wrong`,
-          ].join("\n");
+          console.log(`[QA] Task ${task.id} ("${task.title}") → moving to qa, dispatching to beta`);
 
           try {
-            const { data: qaTask, error } = await supabase
+            // Move task to "qa" status (waiting for QA)
+            await supabase
               .from("agent_tasks")
-              .insert({
-                title: `QA: ${task.title}`,
-                description: qaDescription,
-                type: "qa",
-                priority: task.priority,
-                status: "assigned",
-                assigned_agent: "beta",
-                dispatched_by: "dispatcher",
-                acceptance_criteria: task.acceptance_criteria,
-              })
-              .select()
-              .single();
+              .update({ status: "qa", qa_agent: "beta" })
+              .eq("id", task.id);
 
-            if (error) {
-              console.error(`[QA] Failed to create QA task: ${error.message}`);
-            } else {
-              console.log(`[QA] Created QA task ${qaTask.id} assigned to beta`);
+            // Dispatch the SAME task to Beta for review
+            const qaMessage = `## QA Review: ${task.title}
 
-              // Also update original task status to "qa"
-              await supabase
-                .from("agent_tasks")
-                .update({ status: "qa", qa_agent: "beta" })
-                .eq("id", task.id);
+**Task ID:** ${task.id}
+**Type:** ${task.type}
+**Originally assigned to:** ${task.assigned_agent}
+**Dispatched by:** ${task.dispatched_by}
+
+### Description
+${task.description || "(none)"}
+
+### Result
+${task.result ? JSON.stringify(task.result, null, 2) : "(no result reported)"}
+
+### Acceptance Criteria
+${task.acceptance_criteria || "Verify the task was completed correctly based on the description and result."}
+
+### Your Job
+1. Review the result against the acceptance criteria
+2. If the task involved code: check the repo, run tests if possible
+3. If the task involved a URL/service: test it
+4. Update THIS task status directly:
+
+**If QA passes:**
+\`\`\`bash
+curl -s -X PATCH "https://lessxkxujvcmublgwdaa.supabase.co/rest/v1/agent_tasks?id=eq.${task.id}" \\
+  -H "apikey: ${SUPABASE_KEY}" \\
+  -H "Authorization: Bearer ${SUPABASE_KEY}" \\
+  -H "Content-Type: application/json" \\
+  -d '{"status":"completed","completed_at":"'$(date -u +%Y-%m-%dT%H:%M:%SZ)'","qa_result":{"passed":true,"notes":"WHAT YOU VERIFIED"}}'
+\`\`\`
+
+**If QA fails:**
+\`\`\`bash
+curl -s -X PATCH "https://lessxkxujvcmublgwdaa.supabase.co/rest/v1/agent_tasks?id=eq.${task.id}" \\
+  -H "apikey: ${SUPABASE_KEY}" \\
+  -H "Authorization: Bearer ${SUPABASE_KEY}" \\
+  -H "Content-Type: application/json" \\
+  -d '{"status":"failed","completed_at":"'$(date -u +%Y-%m-%dT%H:%M:%SZ)'","qa_result":{"passed":false,"failures":["SPECIFIC ISSUE"]}}'
+\`\`\``;
+
+            const betaAgent = AGENTS.beta;
+            if (betaAgent?.token) {
+              const resp = await fetch(betaAgent.url, {
+                method: "POST",
+                headers: {
+                  Authorization: `Bearer ${betaAgent.token}`,
+                  "Content-Type": "application/json",
+                },
+                body: JSON.stringify({
+                  message: qaMessage,
+                  name: "Task Dispatcher (QA)",
+                  sessionKey: `hook:qa:${task.id}`,
+                  wakeMode: "now",
+                }),
+              });
+
+              if (resp.ok) {
+                console.log(`[QA] Dispatched task ${task.id} to beta for QA review`);
+                // Move to qa_testing (Beta is actively reviewing)
+                await supabase
+                  .from("agent_tasks")
+                  .update({ status: "qa_testing" })
+                  .eq("id", task.id);
+              } else {
+                console.error(`[QA] Failed to dispatch to beta: ${resp.status}`);
+              }
             }
           } catch (e) {
-            console.error(`[QA] Error creating QA task: ${e.message}`);
+            console.error(`[QA] Error routing task ${task.id} to QA: ${e.message}`);
           }
         }
       }
