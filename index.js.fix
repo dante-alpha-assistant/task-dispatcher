@@ -37,7 +37,7 @@ const AGENTS = {
   },
 };
 
-// Only fetch online agents — disabled agents are never auto-assigned or dispatched to
+// Dynamic agent capability cards from Supabase
 async function getAgentCards() {
   const { data, error } = await supabase
     .from('agent_cards')
@@ -309,19 +309,6 @@ function broadcast(eventType, data, taskId) {
 
 // --- Dispatch task to agent via /hooks/agent ---
 async function dispatchToAgent(task) {
-  // Never dispatch to disabled agents
-  if (task.assigned_agent) {
-    const { data: agentCard } = await supabase
-      .from('agent_cards')
-      .select('status')
-      .ilike('name', task.assigned_agent)
-      .single();
-    if (agentCard?.status === 'disabled') {
-      console.log(`[SKIP] Agent ${task.assigned_agent} is disabled, skipping task ${task.id}`);
-      return;
-    }
-  }
-
   // Route coding tasks through the Dante ID factory pipeline
   if (task.type === "coding") {
     const handled = await dispatchViaFactory(task);
@@ -433,10 +420,9 @@ async function qaAutoScaler() {
 
     const qaQueue = qaTasks?.length || 0;
 
-    const jobListResp = await batchApi.listNamespacedJob({
+    const { body: jobList } = await batchApi.listNamespacedJob({
       namespace: "agents",
       labelSelector: "role=beta-worker",
-    const jobList = jobListResp?.body || jobListResp || {};
     });
     const activeJobs = (jobList.items || []).filter(
       (j) => !j.status?.succeeded && !j.status?.failed
@@ -783,8 +769,7 @@ createServer(async (req, res) => {
     } catch {}
     let qaWorkers = 0;
     try {
-      const jobListResp = await batchApi.listNamespacedJob({
-      const jobList = jobListResp?.body || jobListResp || {};
+      const { body: jobList } = await batchApi.listNamespacedJob({
         namespace: "agents",
         labelSelector: "role=beta-worker",
       });
@@ -857,10 +842,9 @@ setInterval(() => {
 // Queries ALL in_progress tasks from Supabase (not just locally tracked ones)
 // Checks if agent session still exists, auto-closes if not
 const MONITOR_INTERVAL = 30_000; // 30 seconds
-const TASK_HARD_TIMEOUT = 15 * 60 * 1000; // 15 minutes for normal tasks
-const QA_HARD_TIMEOUT = 20 * 60 * 1000; // 20 minutes for QA tasks
+const TASK_HARD_TIMEOUT = 10 * 60 * 1000; // 10 minutes for normal tasks
+const QA_HARD_TIMEOUT = 20 * 60 * 1000; // 20 minutes for QA tasks (Beta is slow)
 const SESSION_GONE_GRACE = 90_000; // 1.5 minute grace after session disappears
-const CODING_HARD_TIMEOUT = 45 * 60 * 1000; // 45 minutes for coding tasks
 
 // Track when we first noticed a session was gone: taskId → timestamp
 const sessionGoneAt = new Map();
@@ -960,7 +944,7 @@ async function taskMonitor() {
       if (sessionAlive) {
         // Session is active — only hard-timeout if REALLY old (safety net)
         const startTime = task.started_at || task.created_at;
-        const timeout = task.type === "qa" ? QA_HARD_TIMEOUT : task.type === "coding" ? CODING_HARD_TIMEOUT : TASK_HARD_TIMEOUT;
+        const timeout = task.type === "qa" ? QA_HARD_TIMEOUT : TASK_HARD_TIMEOUT;
         const elapsed = startTime ? Date.now() - new Date(startTime).getTime() : 0;
         // Even with active session, kill after 2x the timeout (absolute safety)
         if (elapsed > timeout * 2) {
@@ -981,7 +965,7 @@ async function taskMonitor() {
         } else if (Date.now() - sessionGoneAt.get(task.id) > SESSION_GONE_GRACE) {
           // Check if past hard timeout → fail, otherwise → done
           const startTime = task.started_at || task.created_at;
-          const timeout = task.type === "qa" ? QA_HARD_TIMEOUT : task.type === "coding" ? CODING_HARD_TIMEOUT : TASK_HARD_TIMEOUT;
+          const timeout = task.type === "qa" ? QA_HARD_TIMEOUT : TASK_HARD_TIMEOUT;
           const elapsed = startTime ? Date.now() - new Date(startTime).getTime() : 0;
 
           if (elapsed > timeout) {
@@ -1050,15 +1034,6 @@ async function scheduler() {
 
     if (available.length === 0) return;
 
-    // Belt-and-suspenders: fetch disabled agents and exclude them
-    const { data: disabledAgents } = await supabase
-      .from('agent_cards')
-      .select('name')
-      .eq('status', 'disabled');
-    const disabledNames = new Set((disabledAgents || []).map(a => a.name.toLowerCase()));
-    const availableFiltered = available.filter(a => !disabledNames.has(a.name));
-    if (availableFiltered.length === 0) return;
-
     const { data: todoTasks, error: todoErr } = await supabase
       .from("agent_tasks")
       .select("*")
@@ -1080,7 +1055,7 @@ async function scheduler() {
       // Respect assigned_agent hint
       if (task.assigned_agent) {
         const hintAgent = task.assigned_agent.toLowerCase();
-        const agentSlot = availableFiltered.find(a => a.name === hintAgent && a.remaining > 0);
+        const agentSlot = available.find(a => a.name === hintAgent && a.remaining > 0);
         if (agentSlot) {
           console.log(`[SCHEDULER] Assigning task ${task.id} ("${task.title}") \u2192 ${hintAgent} (hint)`);
           await supabase
@@ -1097,7 +1072,7 @@ async function scheduler() {
       const taskType = task.type || "general";
 
       // Score agents: must have capability, then rank by capacity + priority affinity
-      const candidates = availableFiltered
+      const candidates = available
         .filter(a => a.remaining > 0 && a.capabilities.includes(taskType))
         .map(a => {
           let score = a.remaining;
