@@ -93,7 +93,8 @@ async function checkAgentBusy(agentName) {
     const data = await res.json();
     const sessions = data?.result?.details?.sessions || data?.details?.sessions || [];
     
-    // Filter out noise: cron sessions and heartbeat sessions are not "busy"
+    // Filter out noise: only count sessions where the agent is ACTIVELY working
+    // Discord sessions update on every received message — that doesn't mean the agent is busy
     const activeSessions = sessions.filter(s => {
       const key = s.key || '';
       // Skip cron and heartbeat sessions
@@ -102,6 +103,16 @@ async function checkAgentBusy(agentName) {
       // Skip sessions older than 2 minutes
       const age = Date.now() - (s.updatedAt || 0);
       if (age > 2 * 60 * 1000) return false;
+      // Discord sessions: only "busy" if the agent is mid-turn (abortedLastRun === false 
+      // means a run completed, not that one is active). Check if the session has been 
+      // actively generating tokens very recently — use a tighter window for Discord.
+      if (key.includes('discord:channel:')) {
+        // Only count as busy if agent responded very recently (< 30s)
+        // This catches active conversations but not idle channels
+        if (age > 30 * 1000) return false;
+      }
+      // Hook task sessions: always count as busy (agent is working a task)
+      // Sub-agent sessions: always count as busy
       return true;
     });
     
