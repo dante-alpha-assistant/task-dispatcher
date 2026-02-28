@@ -1130,6 +1130,33 @@ async function scheduler() {
   }
 }
 
+// Stale agent detection — mark agents offline if last_heartbeat > 10min ago
+const STALE_AGENT_INTERVAL = 60_000;
+async function staleAgentDetector() {
+  try {
+    const tenMinAgo = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+    const { data, error } = await supabase
+      .from('agent_cards')
+      .select('id, name, status, last_heartbeat')
+      .eq('status', 'online')
+      .lt('last_heartbeat', tenMinAgo);
+    if (error) {
+      console.error('[STALE] Failed to check stale agents:', error.message);
+      return;
+    }
+    for (const agent of (data || [])) {
+      console.log(`[STALE] Marking ${agent.name} as offline (last_heartbeat: ${agent.last_heartbeat})`);
+      await supabase
+        .from('agent_cards')
+        .update({ status: 'offline' })
+        .eq('id', agent.id)
+        .neq('status', 'disabled');
+    }
+  } catch (err) {
+    console.error('[STALE] Error:', err.message);
+  }
+}
+
 // --- Start ---
 subscribe();
 
@@ -1146,6 +1173,11 @@ console.log(`[BOOT] Task monitor running every ${MONITOR_INTERVAL / 1000}s (hard
 // QA Auto-Scaler
 setInterval(qaAutoScaler, 30000);
 console.log("[BOOT] QA auto-scaler running every 30s");
+
+// Stale agent detector
+setInterval(staleAgentDetector, STALE_AGENT_INTERVAL);
+setTimeout(staleAgentDetector, 10000);
+console.log("[BOOT] Stale agent detector running every 60s (threshold: 10min)");
 
 // Graceful shutdown
 process.on("SIGTERM", () => {
