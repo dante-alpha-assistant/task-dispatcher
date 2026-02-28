@@ -436,8 +436,8 @@ async function qaAutoScaler() {
     const jobListResp = await batchApi.listNamespacedJob({
       namespace: "agents",
       labelSelector: "role=beta-worker",
-    const jobList = jobListResp?.body || jobListResp || {};
     });
+    const jobList = jobListResp?.body || jobListResp || {};
     const activeJobs = (jobList.items || []).filter(
       (j) => !j.status?.succeeded && !j.status?.failed
     );
@@ -784,10 +784,10 @@ createServer(async (req, res) => {
     let qaWorkers = 0;
     try {
       const jobListResp = await batchApi.listNamespacedJob({
-      const jobList = jobListResp?.body || jobListResp || {};
         namespace: "agents",
         labelSelector: "role=beta-worker",
       });
+      const jobList = jobListResp?.body || jobListResp || {};
       qaWorkers = (jobList.items || []).filter(j => !j.status?.succeeded && !j.status?.failed).length;
     } catch {}
     res.writeHead(200, { "Content-Type": "application/json" });
