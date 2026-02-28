@@ -58,6 +58,66 @@ async function getAgentCards() {
 
 const DANTE_ID_API_URL = process.env.DANTE_ID_API_URL || "https://api.dante.id";
 const PRIORITY_ORDER = { urgent: 0, high: 1, normal: 2, low: 3 };
+
+// --- Gateway Concurrency Check ---
+// Check if an agent is currently busy by querying their gateway's sessions_list.
+// Returns true if the agent has active sessions (Discord, hooks, sub-agents) updated recently.
+async function checkAgentBusy(agentName) {
+  const agent = AGENTS[agentName];
+  if (!agent?.gatewayToken) return false; // No token = can't check = assume free
+  
+  const gatewayBase = agent.url.replace(/\/hooks\/agent$/, '');
+  const invokeUrl = `${gatewayBase}/tools/invoke`;
+  
+  try {
+    const res = await fetch(invokeUrl, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${agent.gatewayToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ tool: 'sessions_list', parameters: { activeMinutes: 2, messageLimit: 0 } }),
+      signal: AbortSignal.timeout(5000),
+    });
+    
+    if (!res.ok) {
+      console.log(`[BUSY-CHECK] ${agentName}: gateway returned ${res.status}, treating as busy`);
+      return true; // Fail safe: if we can't check, assume busy
+    }
+    
+    const data = await res.json();
+    const sessions = data?.result?.details?.sessions || data?.details?.sessions || [];
+    
+    // Filter out noise: cron sessions and heartbeat sessions are not "busy"
+    const activeSessions = sessions.filter(s => {
+      const key = s.key || '';
+      // Skip cron and heartbeat sessions
+      if (key.includes(':cron:')) return false;
+      if (key.includes(':main') && s.displayName === 'heartbeat') return false;
+      // Skip sessions older than 2 minutes
+      const age = Date.now() - (s.updatedAt || 0);
+      if (age > 2 * 60 * 1000) return false;
+      return true;
+    });
+    
+    if (activeSessions.length > 0) {
+      const types = activeSessions.map(s => {
+        if (s.key?.includes('discord:')) return 'discord';
+        if (s.key?.includes('hook:')) return 'hook';
+        if (s.key?.includes('subagent:')) return 'subagent';
+        return 'other';
+      });
+      console.log(`[BUSY-CHECK] ${agentName}: BUSY (${activeSessions.length} active: ${[...new Set(types)].join(', ')})`);
+      return true;
+    }
+    
+    console.log(`[BUSY-CHECK] ${agentName}: FREE`);
+    return false;
+  } catch (err) {
+    console.log(`[BUSY-CHECK] ${agentName}: error (${err.message}), treating as busy`);
+    return true; // Fail safe
+  }
+}
 const SCHEDULER_INTERVAL = 30_000; // 30 seconds
 const FACTORY_POLL_INTERVAL = 15_000; // 15 seconds
 const FACTORY_MAX_WAIT = 10 * 60 * 1000; // 10 minutes
@@ -1199,6 +1259,21 @@ async function scheduler() {
     const availableFiltered = available.filter(a => !disabledNames.has(a.name));
     if (availableFiltered.length === 0) return;
 
+    // Gateway concurrency check: remove agents that are currently busy
+    const busyChecks = await Promise.all(
+      availableFiltered.map(async a => ({ name: a.name, busy: await checkAgentBusy(a.name) }))
+    );
+    const busyAgents = new Set(busyChecks.filter(c => c.busy).map(c => c.name));
+    const freeAgents = availableFiltered.filter(a => !busyAgents.has(a.name));
+    
+    if (busyAgents.size > 0) {
+      console.log(`[SCHEDULER] Busy agents skipped: ${[...busyAgents].join(', ')}`);
+    }
+    if (freeAgents.length === 0) {
+      if (busyAgents.size > 0) console.log(`[SCHEDULER] All agents busy, waiting for next cycle`);
+      return;
+    }
+
     const { data: todoTasks, error: todoErr } = await supabase
       .from("agent_tasks")
       .select("*")
@@ -1220,7 +1295,7 @@ async function scheduler() {
       // Respect assigned_agent hint
       if (task.assigned_agent) {
         const hintAgent = task.assigned_agent.toLowerCase();
-        const agentSlot = availableFiltered.find(a => a.name === hintAgent && a.remaining > 0);
+        const agentSlot = freeAgents.find(a => a.name === hintAgent && a.remaining > 0);
         if (agentSlot) {
           console.log(`[SCHEDULER] Assigning task ${task.id} ("${task.title}") \u2192 ${hintAgent} (hint)`);
           await supabase
@@ -1237,7 +1312,7 @@ async function scheduler() {
       const taskType = task.type || "general";
 
       // Score agents: must have capability, then rank by capacity + priority affinity
-      const candidates = availableFiltered
+      const candidates = freeAgents
         .filter(a => a.remaining > 0 && a.capabilities.includes(taskType))
         .map(a => {
           let score = a.remaining;
@@ -1250,8 +1325,8 @@ async function scheduler() {
       const bestCandidate = candidates[0];
 
       if (bestCandidate) {
-        // Decrement the ORIGINAL agent in availableFiltered (not the spread copy)
-        const originalAgent = availableFiltered.find(a => a.name === bestCandidate.name);
+        // Decrement the ORIGINAL agent in freeAgents (not the spread copy)
+        const originalAgent = freeAgents.find(a => a.name === bestCandidate.name);
         if (!originalAgent || originalAgent.remaining <= 0) continue;
         
         console.log(`[SCHEDULER] Auto-assigning task ${task.id} ("${task.title}") \u2192 ${bestCandidate.name} (type: ${taskType}, remaining: ${originalAgent.remaining})`);
