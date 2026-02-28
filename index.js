@@ -24,6 +24,17 @@ const AGENTS = {
   },
 };
 
+// Agent capacity and type affinity
+const AGENT_CONFIG = {
+  neo:  { maxConcurrent: 2, types: ["coding", "ops", "general", "research"] },
+  mu:   { maxConcurrent: 2, types: ["coding", "ops", "general"] },
+  beta: { maxConcurrent: 1, types: ["qa"] },  // QA only
+  flow: { maxConcurrent: 2, types: ["general", "research", "ops"] },
+};
+
+const PRIORITY_ORDER = { urgent: 0, high: 1, normal: 2, low: 3 };
+const SCHEDULER_INTERVAL = 30_000; // 30 seconds
+
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
 // Track active dispatched tasks: taskId → { agentName, dispatchedAt, sessionKey }
@@ -231,9 +242,25 @@ function subscribe() {
 // --- Health check server ---
 import { createServer } from "http";
 const PORT = process.env.PORT || 8080;
-createServer((req, res) => {
-  res.writeHead(200, { "Content-Type": "application/json" });
-  res.end(JSON.stringify({ ok: true, service: "task-dispatcher", activeTasks: activeTasks.size }));
+createServer(async (req, res) => {
+  if (req.url === "/health" || req.url === "/") {
+    let capacity = {};
+    try {
+      const { data } = await supabase
+        .from("agent_tasks")
+        .select("assigned_agent")
+        .in("status", ["assigned", "in_progress"]);
+      for (const [name, config] of Object.entries(AGENT_CONFIG)) {
+        const load = (data || []).filter(t => t.assigned_agent?.toLowerCase() === name).length;
+        capacity[name] = { load, max: config.maxConcurrent, available: config.maxConcurrent - load };
+      }
+    } catch {}
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ok: true, service: "task-dispatcher", activeTasks: activeTasks.size, capacity }));
+  } else {
+    res.writeHead(404);
+    res.end("Not found");
+  }
 }).listen(PORT, () => {
   console.log(`[HEALTH] Listening on :${PORT}`);
 });
@@ -344,8 +371,99 @@ async function checkActiveSessions() {
   }
 }
 
+// --- Auto-scheduler: assign todo tasks to available agents ---
+async function scheduler() {
+  try {
+    const { data: activeTasks_db, error: activeErr } = await supabase
+      .from("agent_tasks")
+      .select("assigned_agent")
+      .in("status", ["assigned", "in_progress"]);
+
+    if (activeErr) {
+      console.error("[SCHEDULER] Error fetching active tasks:", activeErr.message);
+      return;
+    }
+
+    const agentLoad = {};
+    for (const name of Object.keys(AGENT_CONFIG)) agentLoad[name] = 0;
+    for (const t of activeTasks_db || []) {
+      const agent = t.assigned_agent?.toLowerCase();
+      if (agent && agentLoad[agent] !== undefined) agentLoad[agent]++;
+    }
+
+    const available = [];
+    for (const [name, config] of Object.entries(AGENT_CONFIG)) {
+      const remaining = config.maxConcurrent - (agentLoad[name] || 0);
+      if (remaining > 0) {
+        available.push({ name, remaining, types: config.types });
+      }
+    }
+
+    if (available.length === 0) return;
+
+    const { data: todoTasks, error: todoErr } = await supabase
+      .from("agent_tasks")
+      .select("*")
+      .eq("status", "todo")
+      .order("created_at", { ascending: true });
+
+    if (todoErr) {
+      console.error("[SCHEDULER] Error fetching todo tasks:", todoErr.message);
+      return;
+    }
+
+    if (!todoTasks?.length) return;
+
+    todoTasks.sort((a, b) => (PRIORITY_ORDER[a.priority] ?? 2) - (PRIORITY_ORDER[b.priority] ?? 2));
+
+    let assigned = 0;
+
+    for (const task of todoTasks) {
+      if (task.assigned_agent) {
+        const hintAgent = task.assigned_agent.toLowerCase();
+        const agentSlot = available.find(a => a.name === hintAgent && a.remaining > 0);
+        if (agentSlot) {
+          console.log(`[SCHEDULER] Assigning task ${task.id} ("${task.title}") → ${hintAgent} (hint)`);
+          await supabase
+            .from("agent_tasks")
+            .update({ status: "assigned", assigned_agent: hintAgent })
+            .eq("id", task.id);
+          agentSlot.remaining--;
+          assigned++;
+          continue;
+        }
+        continue;
+      }
+
+      const taskType = task.type || "general";
+      const bestAgent = available
+        .filter(a => a.remaining > 0 && a.types.includes(taskType))
+        .sort((a, b) => b.remaining - a.remaining)[0];
+
+      if (bestAgent) {
+        console.log(`[SCHEDULER] Auto-assigning task ${task.id} ("${task.title}") → ${bestAgent.name} (type: ${taskType})`);
+        await supabase
+          .from("agent_tasks")
+          .update({ status: "assigned", assigned_agent: bestAgent.name })
+          .eq("id", task.id);
+        bestAgent.remaining--;
+        assigned++;
+      }
+    }
+
+    if (assigned > 0) {
+      console.log(`[SCHEDULER] Assigned ${assigned} tasks this cycle`);
+    }
+  } catch (e) {
+    console.error("[SCHEDULER] Error:", e.message);
+  }
+}
+
 // --- Start ---
 subscribe();
+setInterval(scheduler, SCHEDULER_INTERVAL);
+scheduler(); // Run once on boot
+console.log(`[BOOT] Auto-scheduler running every ${SCHEDULER_INTERVAL / 1000}s`);
 setInterval(watchdog, WATCHDOG_INTERVAL);
 watchdog();
 setInterval(checkActiveSessions, SESSION_CHECK_INTERVAL);
