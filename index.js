@@ -1227,8 +1227,8 @@ async function taskMonitor() {
     // Get ALL in_progress and assigned tasks from Supabase
     const { data: activeTasks_db, error } = await supabase
       .from("agent_tasks")
-      .select("id, title, status, assigned_agent, started_at, created_at")
-      .in("status", ["in_progress", "assigned"]);
+      .select("id, title, status, assigned_agent, qa_agent, started_at, created_at")
+      .in("status", ["in_progress", "assigned", "qa_testing"]);
 
     if (error) {
       console.error("[MONITOR] Query error:", error.message);
@@ -1251,7 +1251,11 @@ async function taskMonitor() {
         continue;
       }
 
-      const agentName = task.assigned_agent?.toLowerCase();
+      // For qa_testing tasks, check the QA agent (Beta); for others, check assigned_agent
+      const isQaTesting = task.status === "qa_testing";
+      const agentName = isQaTesting
+        ? (task.qa_agent?.toLowerCase() || "beta")
+        : task.assigned_agent?.toLowerCase();
       const agent = AGENTS[agentName];
 
       if (!agent) continue;
@@ -1260,8 +1264,8 @@ async function taskMonitor() {
       const authToken = agent.gatewayToken || agent.token;
       const invokeUrl = agent.url.replace('/hooks/agent', '/tools/invoke');
 
-      // Only check sessions for in_progress tasks (assigned tasks haven't started yet)
-      if (task.status !== "in_progress") continue;
+      // Only check sessions for in_progress and qa_testing tasks (assigned tasks haven't started yet)
+      if (task.status !== "in_progress" && task.status !== "qa_testing") continue;
 
       // Check if session still exists FIRST (before any timeout logic)
       let sessionAlive = false;
@@ -1281,7 +1285,9 @@ async function taskMonitor() {
         if (resp.ok) {
           const data = await resp.json();
           const sessions = data?.result?.details?.sessions || [];
-          const sessionKey = `agent:main:hook:task:${task.id}`;
+          const sessionKey = isQaTesting
+            ? `agent:main:hook:qa:${task.id}`
+            : `agent:main:hook:task:${task.id}`;
           const hookSession = sessions.find(s => s.key === sessionKey);
 
           if (hookSession) {
@@ -1341,7 +1347,14 @@ async function taskMonitor() {
           const timeout = task.type === "qa" ? QA_HARD_TIMEOUT : task.type === "coding" ? CODING_HARD_TIMEOUT : TASK_HARD_TIMEOUT;
           const elapsed = startTime ? Date.now() - new Date(startTime).getTime() : 0;
 
-          if (elapsed > timeout) {
+          if (isQaTesting) {
+            // QA session crashed — reset to done + clear qa_agent so qaAutoScaler re-dispatches
+            console.log(`[MONITOR] QA session gone for task ${task.id} ("${task.title}") → resetting to done for re-dispatch`);
+            await supabase.from("agent_tasks").update({
+              status: "done",
+              qa_agent: null,
+            }).eq("id", task.id);
+          } else if (elapsed > timeout) {
             console.log(`[MONITOR] Timeout + session gone: task ${task.id} ("${task.title}") → failed (${Math.round(elapsed / 60000)}min)`);
             await supabase.from("agent_tasks").update({
               status: "failed",
