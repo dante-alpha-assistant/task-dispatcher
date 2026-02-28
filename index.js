@@ -176,14 +176,9 @@ function subscribe() {
           // Don't QA tasks that were already QA'd (prevent loops)
           if (task.type === "qa") return;
 
-          console.log(`[QA] Task ${task.id} ("${task.title}") → moving to qa, dispatching to beta`);
+          console.log(`[QA] Task ${task.id} ("${task.title}") → moving to qa_testing, dispatching to beta`);
 
           try {
-            // Move task to "qa" status (waiting for QA)
-            await supabase
-              .from("agent_tasks")
-              .update({ status: "qa", qa_agent: "beta" })
-              .eq("id", task.id);
 
             // Dispatch the SAME task to Beta for review
             const qaMessage = `## QA Review: ${task.title}
@@ -244,10 +239,10 @@ curl -s -X PATCH "https://lessxkxujvcmublgwdaa.supabase.co/rest/v1/agent_tasks?i
 
               if (resp.ok) {
                 console.log(`[QA] Dispatched task ${task.id} to beta for QA review`);
-                // Move to qa_testing (Beta is actively reviewing)
+                // Move to qa_testing in one step (no intermediate 'qa' status)
                 await supabase
                   .from("agent_tasks")
-                  .update({ status: "qa_testing" })
+                  .update({ status: "qa_testing", qa_agent: "beta" })
                   .eq("id", task.id);
               } else {
                 console.error(`[QA] Failed to dispatch to beta: ${resp.status}`);
@@ -323,6 +318,16 @@ async function taskMonitor() {
     }
 
     for (const task of activeTasks_db) {
+      // Race condition protection: re-check task status before processing
+      const { data: freshTask } = await supabase
+        .from("agent_tasks")
+        .select("status")
+        .eq("id", task.id)
+        .single();
+      if (freshTask && ["done", "failed", "completed"].includes(freshTask.status)) {
+        continue;
+      }
+
       const agentName = task.assigned_agent?.toLowerCase();
       const agent = AGENTS[agentName];
 
@@ -408,11 +413,11 @@ async function taskMonitor() {
               completed_at: new Date().toISOString(),
             }).eq("id", task.id);
           } else {
-            console.log(`[MONITOR] Auto-closing task ${task.id} ("${task.title}") — session ended normally`);
+            console.log(`[MONITOR] Task ${task.id} ("${task.title}") — session ended without reporting completion → failed`);
             await supabase.from("agent_tasks").update({
-              status: "done",
+              status: "failed",
+              error: "Session ended without reporting completion",
               completed_at: new Date().toISOString(),
-              result: { output: "Auto-closed by dispatcher: agent session ended" },
             }).eq("id", task.id);
           }
           sessionGoneAt.delete(task.id);
