@@ -274,8 +274,9 @@ createServer(async (req, res) => {
 // Queries ALL in_progress tasks from Supabase (not just locally tracked ones)
 // Checks if agent session still exists, auto-closes if not
 const MONITOR_INTERVAL = 30_000; // 30 seconds
-const TASK_HARD_TIMEOUT = 5 * 60 * 1000; // 5 minutes hard timeout
-const SESSION_GONE_GRACE = 60_000; // 1 minute grace after session disappears
+const TASK_HARD_TIMEOUT = 10 * 60 * 1000; // 10 minutes for normal tasks
+const QA_HARD_TIMEOUT = 20 * 60 * 1000; // 20 minutes for QA tasks (Beta is slow)
+const SESSION_GONE_GRACE = 90_000; // 1.5 minute grace after session disappears
 
 // Track when we first noticed a session was gone: taskId → timestamp
 const sessionGoneAt = new Map();
@@ -308,27 +309,11 @@ async function taskMonitor() {
       const authToken = agent.gatewayToken || agent.token;
       const invokeUrl = agent.url.replace('/hooks/agent', '/tools/invoke');
 
-      // Hard timeout: if task has been in_progress for too long, fail it
-      const startTime = task.started_at || task.created_at;
-      if (startTime && (Date.now() - new Date(startTime).getTime()) > TASK_HARD_TIMEOUT) {
-        console.log(`[MONITOR] Hard timeout: task ${task.id} ("${task.title}") → ${agentName} (${Math.round((Date.now() - new Date(startTime).getTime()) / 60000)}min)`);
-        await supabase
-          .from("agent_tasks")
-          .update({
-            status: "failed",
-            error: `Timeout: task exceeded ${TASK_HARD_TIMEOUT / 60000} minute limit`,
-            completed_at: new Date().toISOString(),
-          })
-          .eq("id", task.id);
-        sessionGoneAt.delete(task.id);
-        activeTasks.delete(task.id);
-        continue;
-      }
-
       // Only check sessions for in_progress tasks (assigned tasks haven't started yet)
       if (task.status !== "in_progress") continue;
 
-      // Try to check if the hook session still exists
+      // Check if session still exists FIRST (before any timeout logic)
+      let sessionAlive = false;
       try {
         const resp = await fetch(invokeUrl, {
           method: "POST",
@@ -342,45 +327,74 @@ async function taskMonitor() {
           }),
         });
 
-        if (!resp.ok) {
-          console.log(`[MONITOR] Cannot reach ${agentName} gateway (${resp.status}) for task ${task.id}`);
-          continue;
-        }
+        if (resp.ok) {
+          const data = await resp.json();
+          const sessions = data?.result?.details?.sessions || [];
+          const sessionKey = `agent:main:hook:task:${task.id}`;
+          const hookSession = sessions.find(s => s.key === sessionKey);
 
-        const data = await resp.json();
-        const sessions = data?.result?.details?.sessions || [];
-        const sessionKey = `agent:main:hook:task:${task.id}`;
-        const hookSession = sessions.find(s => s.key === sessionKey);
-
-        if (hookSession) {
-          // Session exists — task is actively being worked on
-          sessionGoneAt.delete(task.id);
-          const idleSec = Math.floor((Date.now() - hookSession.updatedAt) / 1000);
-          if (idleSec > 120) {
-            console.log(`[MONITOR] Task ${task.id} → ${agentName}: session exists but idle ${idleSec}s`);
+          if (hookSession) {
+            sessionAlive = true;
+            sessionGoneAt.delete(task.id);
+            const idleSec = Math.floor((Date.now() - hookSession.updatedAt) / 1000);
+            if (idleSec > 120) {
+              console.log(`[MONITOR] Task ${task.id} → ${agentName}: session alive, idle ${idleSec}s`);
+            }
           }
         } else {
-          // Session is gone — agent probably finished
-          if (!sessionGoneAt.has(task.id)) {
-            sessionGoneAt.set(task.id, Date.now());
-            console.log(`[MONITOR] Task ${task.id} ("${task.title}") → ${agentName}: session gone, starting grace period`);
-          } else if (Date.now() - sessionGoneAt.get(task.id) > SESSION_GONE_GRACE) {
-            // Grace period expired — auto-close
-            console.log(`[MONITOR] Auto-closing task ${task.id} ("${task.title}") — session gone, grace expired`);
-            await supabase
-              .from("agent_tasks")
-              .update({
-                status: "done",
-                completed_at: new Date().toISOString(),
-                result: { output: "Auto-closed by dispatcher: agent session ended" },
-              })
-              .eq("id", task.id);
-            sessionGoneAt.delete(task.id);
-            activeTasks.delete(task.id);
-          }
+          console.log(`[MONITOR] Cannot reach ${agentName} gateway (${resp.status}) for task ${task.id}`);
+          continue; // Can't determine session state, skip
         }
       } catch (e) {
         console.error(`[MONITOR] Error checking ${agentName} for task ${task.id}: ${e.message}`);
+        continue; // Can't determine session state, skip
+      }
+
+      if (sessionAlive) {
+        // Session is active — only hard-timeout if REALLY old (safety net)
+        const startTime = task.started_at || task.created_at;
+        const timeout = task.type === "qa" ? QA_HARD_TIMEOUT : TASK_HARD_TIMEOUT;
+        const elapsed = startTime ? Date.now() - new Date(startTime).getTime() : 0;
+        // Even with active session, kill after 2x the timeout (absolute safety)
+        if (elapsed > timeout * 2) {
+          console.log(`[MONITOR] Absolute timeout: task ${task.id} ("${task.title}") → ${agentName} (${Math.round(elapsed / 60000)}min, session still alive but too old)`);
+          await supabase.from("agent_tasks").update({
+            status: "failed",
+            error: `Absolute timeout: task ran for ${Math.round(elapsed / 60000)} minutes`,
+            completed_at: new Date().toISOString(),
+          }).eq("id", task.id);
+          sessionGoneAt.delete(task.id);
+          activeTasks.delete(task.id);
+        }
+      } else {
+        // Session is gone — start grace period then auto-close
+        if (!sessionGoneAt.has(task.id)) {
+          sessionGoneAt.set(task.id, Date.now());
+          console.log(`[MONITOR] Task ${task.id} ("${task.title}") → ${agentName}: session gone, grace period started`);
+        } else if (Date.now() - sessionGoneAt.get(task.id) > SESSION_GONE_GRACE) {
+          // Check if past hard timeout → fail, otherwise → done
+          const startTime = task.started_at || task.created_at;
+          const timeout = task.type === "qa" ? QA_HARD_TIMEOUT : TASK_HARD_TIMEOUT;
+          const elapsed = startTime ? Date.now() - new Date(startTime).getTime() : 0;
+
+          if (elapsed > timeout) {
+            console.log(`[MONITOR] Timeout + session gone: task ${task.id} ("${task.title}") → failed (${Math.round(elapsed / 60000)}min)`);
+            await supabase.from("agent_tasks").update({
+              status: "failed",
+              error: `Timeout: session ended after ${Math.round(elapsed / 60000)} minutes without completion`,
+              completed_at: new Date().toISOString(),
+            }).eq("id", task.id);
+          } else {
+            console.log(`[MONITOR] Auto-closing task ${task.id} ("${task.title}") — session ended normally`);
+            await supabase.from("agent_tasks").update({
+              status: "done",
+              completed_at: new Date().toISOString(),
+              result: { output: "Auto-closed by dispatcher: agent session ended" },
+            }).eq("id", task.id);
+          }
+          sessionGoneAt.delete(task.id);
+          activeTasks.delete(task.id);
+        }
       }
     }
 
