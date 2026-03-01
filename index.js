@@ -1682,6 +1682,8 @@ async function staleAgentDetector() {
       return;
     }
     for (const agent of (data || [])) {
+      // Skip headless workers — they don't have heartbeat crons
+      if (agent.name.endsWith('-worker')) continue;
       console.log(`[STALE] Marking ${agent.name} as offline (last_heartbeat: ${agent.last_heartbeat})`);
       await supabase
         .from('agent_cards')
