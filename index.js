@@ -1623,20 +1623,9 @@ async function scheduler() {
     const availableFiltered = available.filter(a => !disabledNames.has(a.name));
     if (availableFiltered.length === 0) return;
 
-    // Gateway concurrency check: remove agents that are currently busy
-    const busyChecks = await Promise.all(
-      availableFiltered.map(async a => ({ name: a.name, busy: await checkAgentBusy(a.name) }))
-    );
-    const busyAgents = new Set(busyChecks.filter(c => c.busy).map(c => c.name));
-    const freeAgents = availableFiltered.filter(a => !busyAgents.has(a.name));
-    
-    if (busyAgents.size > 0) {
-      console.log(`[SCHEDULER] Busy agents skipped: ${[...busyAgents].join(', ')}`);
-    }
-    if (freeAgents.length === 0) {
-      if (busyAgents.size > 0) console.log(`[SCHEDULER] All agents busy, waiting for next cycle`);
-      return;
-    }
+    // DB is the source of truth for agent availability — no gateway session checks.
+    // The agent_load count + max_capacity + inflightCheck guard are sufficient.
+    const freeAgents = availableFiltered;
 
     const { data: todoTasks, error: todoErr } = await supabase
       .from("agent_tasks")
