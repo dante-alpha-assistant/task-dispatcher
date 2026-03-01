@@ -1,0 +1,13 @@
+Add an auth preflight check to the task dispatcher in index.js.
+
+Requirements:
+1. Add a preflightAuthCheck(agentName) function right after the existing checkAgentBusy function. It should POST to the agent gateway /tools/invoke with { tool: "sessions_list", parameters: { limit: 1, messageLimit: 0 } } using agent.gatewayToken as Bearer auth. Returns { ok: boolean, status: number, error?: string }. 5s AbortSignal timeout. On 200 return {ok:true, status:200}. On 401/403 return {ok:false, status: res.status}. On network error return {ok:false, status:0, error: err.message}.
+
+2. In dispatchToAgent(), after the disabled-agent check (the if block that checks agentCard?.status === 'disabled') and BEFORE the factory routing (the if block checking task.type === 'coding'), add preflight auth check. Resolve agentName from task.assigned_agent?.toLowerCase(). Call preflightAuthCheck(agentName). If !result.ok: log "[AUTH-PREFLIGHT] Agent ${agentName} failed auth check (HTTP ${result.status}), skipping task ${task.id}", reset the task in supabase to {status:'todo', assigned_agent:null, started_at:null, error:'Auth preflight failed for agentName (HTTP status)'}, and return early.
+
+3. In checkAgentBusy(), where it currently has the log line with "gateway returned status, treating as busy", add a check: if res.status is 401 or 403, log "[BUSY-CHECK] agentName: AUTH FAILED (status), credentials invalid" instead of the generic message. Still return true.
+
+After making all changes, run these git commands:
+git add -A
+git commit -m "feat: add auth preflight check before task dispatch (fixes #16)"
+git push origin feat/auth-preflight

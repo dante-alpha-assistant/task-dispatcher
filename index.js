@@ -91,7 +91,11 @@ async function checkAgentBusy(agentName) {
     });
     
     if (!res.ok) {
-      console.log(`[BUSY-CHECK] ${agentName}: gateway returned ${res.status}, treating as busy`);
+      if (res.status === 401 || res.status === 403) {
+        console.log(`[BUSY-CHECK] ${agentName}: AUTH FAILED (${res.status}), credentials invalid`);
+      } else {
+        console.log(`[BUSY-CHECK] ${agentName}: gateway returned ${res.status}, treating as busy`);
+      }
       return true; // Fail safe: if we can't check, assume busy
     }
     
@@ -139,6 +143,38 @@ async function checkAgentBusy(agentName) {
     return true; // Fail safe
   }
 }
+// --- Auth Preflight Check ---
+// Verify agent gateway credentials before dispatching a task.
+// Prevents: token expires → dispatch → session can't call LLM → 10min timeout → requeue loop
+async function preflightAuthCheck(agentName) {
+  const agent = AGENTS[agentName];
+  if (!agent?.gatewayToken) return { ok: true, status: 0 }; // No token configured = skip check
+
+  const gatewayBase = agent.url.replace(/\/hooks\/agent$/, '');
+  const invokeUrl = `${gatewayBase}/tools/invoke`;
+
+  try {
+    const res = await fetch(invokeUrl, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${agent.gatewayToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ tool: 'sessions_list', parameters: { limit: 1, messageLimit: 0 } }),
+      signal: AbortSignal.timeout(5000),
+    });
+
+    if (res.ok) {
+      return { ok: true, status: 200 };
+    }
+    console.log(`[AUTH-PREFLIGHT] ${agentName}: gateway returned ${res.status}`);
+    return { ok: false, status: res.status };
+  } catch (err) {
+    console.log(`[AUTH-PREFLIGHT] ${agentName}: network error (${err.message})`);
+    return { ok: false, status: 0, error: err.message };
+  }
+}
+
 const SCHEDULER_INTERVAL = 30_000; // 30 seconds
 const FACTORY_POLL_INTERVAL = 15_000; // 15 seconds
 const FACTORY_MAX_WAIT = 10 * 60 * 1000; // 10 minutes
@@ -655,6 +691,23 @@ async function dispatchToAgent(task) {
     }
   }
 
+  // Auth preflight: verify gateway credentials before dispatching
+  const agentName = task.assigned_agent?.toLowerCase();
+  const authCheck = await preflightAuthCheck(agentName);
+  if (!authCheck.ok) {
+    console.log(`[AUTH-PREFLIGHT] Agent ${agentName} failed auth check (HTTP ${authCheck.status}), skipping task ${task.id}`);
+    await supabase
+      .from('agent_tasks')
+      .update({
+        status: 'todo',
+        assigned_agent: null,
+        started_at: null,
+        error: `Auth preflight failed for ${agentName} (HTTP ${authCheck.status})`,
+      })
+      .eq('id', task.id);
+    return;
+  }
+
   // Route coding tasks through the Dante ID factory pipeline
   if (task.type === "coding") {
     const handled = await dispatchViaFactory(task);
@@ -662,7 +715,6 @@ async function dispatchToAgent(task) {
     console.log(`[DISPATCH] Factory fallback: dispatching coding task ${task.id} to agent`);
   }
 
-  const agentName = task.assigned_agent?.toLowerCase();
   const agent = AGENTS[agentName];
 
   if (!agent) {
