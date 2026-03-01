@@ -705,7 +705,7 @@ async function buildContextBlockWithTimeout(task) {
 
 // --- Dispatch task to agent via /hooks/agent ---
 async function dispatchToAgent(task) {
-  // Never dispatch to disabled agents
+  // Never dispatch to disabled agents — remap or reset to todo
   if (task.assigned_agent) {
     const { data: agentCard } = await supabase
       .from('agent_cards')
@@ -713,8 +713,29 @@ async function dispatchToAgent(task) {
       .ilike('name', task.assigned_agent)
       .single();
     if (agentCard?.status === 'disabled') {
-      console.log(`[SKIP] Agent ${task.assigned_agent} is disabled, skipping task ${task.id}`);
-      return;
+      // Try to find the -worker variant of this agent
+      const workerName = task.assigned_agent.toLowerCase() + '-worker';
+      const { data: workerCard } = await supabase
+        .from('agent_cards')
+        .select('status')
+        .ilike('name', workerName)
+        .single();
+      if (workerCard && workerCard.status !== 'disabled') {
+        console.log(`[REMAP] Agent ${task.assigned_agent} is disabled, remapping task ${task.id} → ${workerName}`);
+        task.assigned_agent = workerName;
+        await supabase
+          .from('agent_tasks')
+          .update({ assigned_agent: workerName })
+          .eq('id', task.id);
+      } else {
+        // No worker variant available — reset to todo for scheduler to pick up
+        console.log(`[SKIP] Agent ${task.assigned_agent} is disabled, resetting task ${task.id} to todo`);
+        await supabase
+          .from('agent_tasks')
+          .update({ status: 'todo', assigned_agent: null, started_at: null })
+          .eq('id', task.id);
+        return;
+      }
     }
   }
 
@@ -1635,12 +1656,25 @@ async function scheduler() {
     let assigned = 0;
 
     for (const task of todoTasks) {
-      // Respect assigned_agent hint
+      // Respect assigned_agent hint — but remap disabled agents
       if (task.assigned_agent) {
-        const hintAgent = task.assigned_agent.toLowerCase();
+        let hintAgent = task.assigned_agent.toLowerCase();
+        // If hint points to a disabled agent, try the -worker variant
+        if (disabledNames.has(hintAgent)) {
+          const workerVariant = hintAgent + '-worker';
+          if (!disabledNames.has(workerVariant)) {
+            console.log(`[SCHEDULER] Remapping disabled hint ${hintAgent} → ${workerVariant} for task ${task.id}`);
+            hintAgent = workerVariant;
+          } else {
+            // Both disabled — clear hint and let capability-based routing handle it
+            console.log(`[SCHEDULER] Hint ${hintAgent} is disabled, clearing for task ${task.id}`);
+            await supabase.from("agent_tasks").update({ assigned_agent: null }).eq("id", task.id);
+            // Fall through to capability-based assignment below
+          }
+        }
         const agentSlot = freeAgents.find(a => a.name === hintAgent && a.remaining > 0);
         if (agentSlot) {
-          console.log(`[SCHEDULER] Assigning task ${task.id} ("${task.title}") \u2192 ${hintAgent} (hint)`);
+          console.log(`[SCHEDULER] Assigning task ${task.id} ("${task.title}") → ${hintAgent} (hint)`);
           await supabase
             .from("agent_tasks")
             .update({ status: "assigned", assigned_agent: hintAgent })
