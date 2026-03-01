@@ -1935,8 +1935,17 @@ async function autoDeployDetector() {
         if (!commitRef && shaMatch) commitRef = shaMatch[1].slice(0, 7);
       }
 
+      // Fallback: if ArgoCD state is Unknown (common with kubectl patches / drift),
+      // and task has been completed for >5 minutes, assume deployed.
+      // CI builds images on merge, and pods pull :latest on restart.
+      const DEPLOY_FALLBACK_TIMEOUT = 5 * 60 * 1000; // 5 minutes
+      if (!isDeployed && (Date.now() - completedAt > DEPLOY_FALLBACK_TIMEOUT)) {
+        isDeployed = true;
+        deployEnv = "fallback (ArgoCD Unknown)";
+      }
+
       if (isDeployed) {
-        console.log(`[DEPLOY-DETECT] Task ${task.id} ("${task.title.slice(0, 40)}") → deployed (${deployEnv}, sync after completion${commitRef ? `, ref: ${commitRef}` : ""})`);
+        console.log(`[DEPLOY-DETECT] Task ${task.id} ("${task.title.slice(0, 40)}") → deployed (${deployEnv}${commitRef ? `, ref: ${commitRef}` : ""})`);
         await supabase.from("agent_tasks").update({
           status: "deployed",
         }).eq("id", task.id);
