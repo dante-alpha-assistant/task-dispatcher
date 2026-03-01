@@ -739,8 +739,43 @@ async function dispatchToAgent(task) {
     }
   }
 
-  // Auth preflight: verify gateway credentials before dispatching
   const agentName = task.assigned_agent?.toLowerCase();
+
+  // Session cleanup: if worker pod has too many stale sessions, restart it
+  const SESSION_THRESHOLD = 5;
+  if (agentName?.endsWith('-worker')) {
+    try {
+      const agent = AGENTS[agentName];
+      if (agent?.gatewayToken) {
+        const sessResp = await fetch(`http://${agentName}.agents.svc.cluster.local:18789/tools/invoke`, {
+          method: 'POST',
+          headers: { 'Authorization': `Bearer ${agent.gatewayToken}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ tool: 'sessions_list', parameters: { activeMinutes: 60, messageLimit: 0 } }),
+          signal: AbortSignal.timeout(5000),
+        });
+        if (sessResp.ok) {
+          const sessData = await sessResp.json();
+          const sessionCount = sessData?.result?.details?.count || sessData?.result?.details?.sessions?.length || 0;
+          if (sessionCount > SESSION_THRESHOLD) {
+            console.log(`[SESSION-CLEANUP] ${agentName} has ${sessionCount} sessions (threshold: ${SESSION_THRESHOLD}) → restarting pod`);
+            const { execSync } = require('child_process');
+            try {
+              execSync(`kubectl rollout restart deployment/${agentName} -n agents`, { timeout: 15000 });
+              // Wait for pod to come back
+              console.log(`[SESSION-CLEANUP] Waiting 30s for ${agentName} pod to restart...`);
+              await new Promise(r => setTimeout(r, 30000));
+            } catch (restartErr) {
+              console.error(`[SESSION-CLEANUP] Failed to restart ${agentName}:`, restartErr.message);
+            }
+          }
+        }
+      }
+    } catch (e) {
+      console.warn(`[SESSION-CLEANUP] Error checking sessions for ${agentName}:`, e.message);
+    }
+  }
+
+  // Auth preflight: verify gateway credentials before dispatching
   const authCheck = await preflightAuthCheck(agentName);
   if (!authCheck.ok) {
     console.log(`[AUTH-PREFLIGHT] Agent ${agentName} failed auth check (HTTP ${authCheck.status}), skipping task ${task.id}`);
