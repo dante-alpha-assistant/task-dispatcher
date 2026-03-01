@@ -1537,7 +1537,10 @@ async function taskMonitor() {
 async function scheduler() {
   try {
     const cards = await getAgentCards();
-    if (!cards.length) return;
+    if (!cards.length) {
+      console.log("[SCHEDULER] No online agents found — skipping cycle");
+      return;
+    }
 
     const { data: activeTasks_db, error: activeErr } = await supabase
       .from("agent_tasks")
