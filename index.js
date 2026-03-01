@@ -1858,10 +1858,7 @@ async function autoDeployDetector() {
     const prodSynced = prodApp && isAppSyncedHealthy(prodApp);
     console.log(`[DEPLOY-DETECT] dev: ${devSynced ? 'Synced+Healthy' : 'not ready'}, prod: ${prodSynced ? 'Synced+Healthy' : 'not ready'}`);
 
-    if (!devSynced && !prodSynced) {
-      // Neither environment is synced+healthy, skip
-      return;
-    }
+    // Even if neither env is synced, continue — fallback logic handles Unknown state
 
     const devSyncTime = devApp ? getAppSyncFinishedAt(devApp) : null;
     const prodSyncTime = prodApp ? getAppSyncFinishedAt(prodApp) : null;
