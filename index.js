@@ -6,6 +6,7 @@ const kc = new k8s.KubeConfig();
 kc.loadFromCluster();
 const batchApi = kc.makeApiClient(k8s.BatchV1Api);
 const coreApi = kc.makeApiClient(k8s.CoreV1Api);
+const customApi = kc.makeApiClient(k8s.CustomObjectsApi);
 const MAX_QA_WORKERS = 3;
 
 
@@ -1116,7 +1117,7 @@ function subscribe() {
         }
 
         // Remove completed/failed tasks from active tracking
-        if (task?.status === 'done' || task?.status === 'failed' || task?.status === 'completed') {
+        if (task?.status === 'done' || task?.status === 'failed' || task?.status === 'completed' || task?.status === 'deployed') {
           if (activeTasks.has(task.id)) {
             console.log(`[TRACKER] Task ${task.id} completed (${task.status}), removing from active tracking`);
             activeTasks.delete(task.id);
@@ -1720,6 +1721,167 @@ async function staleAgentDetector() {
   }
 }
 
+// --- Auto-Deploy Detection ---
+// Polls ArgoCD app sync status via K8s CRD API. When apps are Synced+Healthy,
+// moves "completed" tasks to "deployed" if they were completed after the last sync.
+const DEPLOY_DETECT_INTERVAL = 60_000; // 60 seconds
+// Grace period: wait this long after task completion before checking deploy status
+// Gives ArgoCD Image Updater time to detect new image and trigger sync
+const DEPLOY_GRACE_PERIOD = 90_000; // 90 seconds
+
+async function getArgoApps() {
+  try {
+    const resp = await customApi.listNamespacedCustomObject({
+      group: "argoproj.io",
+      version: "v1alpha1",
+      namespace: "argocd",
+      plural: "applications",
+    });
+    const body = resp?.body || resp || {};
+    return body.items || [];
+  } catch (e) {
+    console.error("[DEPLOY-DETECT] Failed to query ArgoCD apps:", e.message);
+    return [];
+  }
+}
+
+function isAppSyncedHealthy(app) {
+  const status = app?.status || {};
+  const syncStatus = status.sync?.status; // "Synced" | "OutOfSync"
+  const healthStatus = status.health?.status; // "Healthy" | "Degraded" | "Progressing"
+  return syncStatus === "Synced" && healthStatus === "Healthy";
+}
+
+function getAppSyncFinishedAt(app) {
+  // Get the timestamp when the last sync operation finished
+  const opState = app?.status?.operationState;
+  if (opState?.finishedAt) return new Date(opState.finishedAt).getTime();
+  // Fallback: reconciledAt
+  if (app?.status?.reconciledAt) return new Date(app.status.reconciledAt).getTime();
+  return null;
+}
+
+async function autoDeployDetector() {
+  try {
+    // 1. Get ArgoCD apps and check if they're synced+healthy
+    const apps = await getArgoApps();
+    if (!apps.length) {
+      console.log("[DEPLOY-DETECT] No ArgoCD apps found");
+      return;
+    }
+
+    // Check dev app specifically (primary deploy target)
+    const devApp = apps.find(a => a.metadata?.name === "dev");
+    const prodApp = apps.find(a => a.metadata?.name === "prod");
+
+    const devSynced = devApp && isAppSyncedHealthy(devApp);
+    const prodSynced = prodApp && isAppSyncedHealthy(prodApp);
+
+    if (!devSynced && !prodSynced) {
+      // Neither environment is synced+healthy, skip
+      return;
+    }
+
+    const devSyncTime = devApp ? getAppSyncFinishedAt(devApp) : null;
+    const prodSyncTime = prodApp ? getAppSyncFinishedAt(prodApp) : null;
+
+    // 2. Query completed tasks (QA passed) that haven't been marked as deployed yet
+    const { data: completedTasks, error } = await supabase
+      .from("agent_tasks")
+      .select("id, title, status, completed_at, result, type")
+      .eq("status", "completed")
+      .order("completed_at", { ascending: true });
+
+    if (error) {
+      console.error("[DEPLOY-DETECT] Error querying completed tasks:", error.message);
+      return;
+    }
+
+    if (!completedTasks?.length) return;
+
+    let deployed = 0;
+
+    for (const task of completedTasks) {
+      const completedAt = task.completed_at ? new Date(task.completed_at).getTime() : null;
+      if (!completedAt) continue;
+
+      // Grace period: don't try to deploy-detect tasks that just completed
+      // Give CI + ArgoCD Image Updater time to push and sync
+      if (Date.now() - completedAt < DEPLOY_GRACE_PERIOD) continue;
+
+      // Determine if this task's code changes are deployed:
+      // Strategy: If the ArgoCD sync finished AFTER the task was completed,
+      // the new image (built from the task's merged PR) is live.
+      // This works because: PR merge → CI builds image → GHCR push →
+      // Image Updater detects → ArgoCD syncs → app is Synced+Healthy
+      const isCodingTask = task.type === "coding";
+      
+      // For coding tasks, check if ArgoCD synced after task completion
+      // For non-coding tasks (ops, research, etc.), they don't need deploy detection —
+      // mark them as deployed immediately since there's nothing to deploy
+      if (!isCodingTask) {
+        console.log(`[DEPLOY-DETECT] Task ${task.id} ("${task.title.slice(0, 40)}") is non-coding (${task.type}) → deployed`);
+        await supabase.from("agent_tasks").update({
+          status: "deployed",
+        }).eq("id", task.id);
+        deployed++;
+        continue;
+      }
+
+      // For coding tasks: check if ArgoCD synced after task completion
+      // The sync must have happened AFTER the task was completed (meaning the new image is live)
+      let isDeployed = false;
+      let deployEnv = null;
+
+      if (devSynced && devSyncTime && devSyncTime > completedAt) {
+        isDeployed = true;
+        deployEnv = "dev";
+      }
+      if (prodSynced && prodSyncTime && prodSyncTime > completedAt) {
+        isDeployed = true;
+        deployEnv = deployEnv ? "dev+prod" : "prod";
+      }
+
+      // Also check: extract commit SHA or PR from result for logging
+      let commitRef = null;
+      if (task.result) {
+        const resultStr = typeof task.result === "string" ? task.result : JSON.stringify(task.result);
+        // Match PR numbers like "PR #13" or "PR#13" or "#13 merged"
+        const prMatch = resultStr.match(/PR\s*#(\d+)/i) || resultStr.match(/#(\d+)\s*merged/i);
+        if (prMatch) commitRef = `PR #${prMatch[1]}`;
+        // Match commit SHAs
+        const shaMatch = resultStr.match(/\b([0-9a-f]{7,40})\b/);
+        if (!commitRef && shaMatch) commitRef = shaMatch[1].slice(0, 7);
+      }
+
+      if (isDeployed) {
+        console.log(`[DEPLOY-DETECT] Task ${task.id} ("${task.title.slice(0, 40)}") → deployed (${deployEnv}, sync after completion${commitRef ? `, ref: ${commitRef}` : ""})`);
+        await supabase.from("agent_tasks").update({
+          status: "deployed",
+        }).eq("id", task.id);
+        deployed++;
+
+        // Broadcast to SSE clients
+        broadcast("task:status", {
+          taskId: task.id,
+          status: "deployed",
+          previousStatus: "completed",
+          title: task.title,
+          environment: deployEnv,
+          commitRef,
+          timestamp: new Date().toISOString(),
+        }, task.id);
+      }
+    }
+
+    if (deployed > 0) {
+      console.log(`[DEPLOY-DETECT] Moved ${deployed} task(s) to deployed`);
+    }
+  } catch (e) {
+    console.error("[DEPLOY-DETECT] Error:", e.message);
+  }
+}
+
 // --- Start ---
 subscribe();
 
@@ -1741,6 +1903,11 @@ console.log("[BOOT] QA auto-scaler running every 30s");
 setInterval(staleAgentDetector, STALE_AGENT_INTERVAL);
 setTimeout(staleAgentDetector, 10000);
 console.log("[BOOT] Stale agent detector running every 60s (threshold: 10min)");
+
+// Auto-deploy detector
+setInterval(autoDeployDetector, DEPLOY_DETECT_INTERVAL);
+setTimeout(autoDeployDetector, 15000); // Run 15s after boot
+console.log(`[BOOT] Auto-deploy detector running every ${DEPLOY_DETECT_INTERVAL / 1000}s`);
 
 // Graceful shutdown
 process.on("SIGTERM", () => {
