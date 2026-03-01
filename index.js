@@ -1845,8 +1845,8 @@ async function autoDeployDetector() {
   try {
     // 1. Get ArgoCD apps and check if they're synced+healthy
     const apps = await getArgoApps();
+    console.log(`[DEPLOY-DETECT] Found ${apps.length} ArgoCD apps`);
     if (!apps.length) {
-      console.log("[DEPLOY-DETECT] No ArgoCD apps found");
       return;
     }
 
@@ -1856,6 +1856,7 @@ async function autoDeployDetector() {
 
     const devSynced = devApp && isAppSyncedHealthy(devApp);
     const prodSynced = prodApp && isAppSyncedHealthy(prodApp);
+    console.log(`[DEPLOY-DETECT] dev: ${devSynced ? 'Synced+Healthy' : 'not ready'}, prod: ${prodSynced ? 'Synced+Healthy' : 'not ready'}`);
 
     if (!devSynced && !prodSynced) {
       // Neither environment is synced+healthy, skip
