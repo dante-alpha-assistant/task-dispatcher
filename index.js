@@ -1587,7 +1587,7 @@ async function scheduler() {
     for (const card of cards) {
       const remaining = card.max_concurrent - (agentLoad[card.name] || 0);
       if (remaining > 0) {
-        available.push({ name: card.name, remaining, capabilities: card.capabilities, priority_affinity: card.priority_affinity || {} });
+        available.push({ name: card.name, remaining, max_concurrent: card.max_concurrent, capabilities: card.capabilities, priority_affinity: card.priority_affinity || {} });
       }
     }
 
@@ -1672,6 +1672,20 @@ async function scheduler() {
         const originalAgent = freeAgents.find(a => a.name === bestCandidate.name);
         if (!originalAgent || originalAgent.remaining <= 0) continue;
         
+        // Double-check: re-query DB for in-flight tasks this agent has RIGHT NOW
+        const { data: inflightCheck } = await supabase
+          .from("agent_tasks")
+          .select("id")
+          .eq("assigned_agent", bestCandidate.name)
+          .in("status", ["assigned", "in_progress"])
+          .limit(5);
+        const inflightCount = inflightCheck?.length || 0;
+        if (inflightCount >= originalAgent.max_concurrent) {
+          console.log(`[SCHEDULER] ${bestCandidate.name} already has ${inflightCount} in-flight tasks (max ${originalAgent.max_concurrent}), skipping`);
+          originalAgent.remaining = 0;
+          continue;
+        }
+
         console.log(`[SCHEDULER] Auto-assigning task ${task.id} ("${task.title}") \u2192 ${bestCandidate.name} (type: ${taskType}, remaining: ${originalAgent.remaining})`);
         await supabase
           .from("agent_tasks")
