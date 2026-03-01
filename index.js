@@ -1741,7 +1741,34 @@ const DEPLOY_DETECT_INTERVAL = 60_000; // 60 seconds
 // Gives ArgoCD Image Updater time to detect new image and trigger sync
 const DEPLOY_GRACE_PERIOD = 90_000; // 90 seconds
 
+const ARGOCD_URL = process.env.ARGOCD_URL || "https://ops.dante.id";
+const ARGOCD_USERNAME = process.env.ARGOCD_USERNAME;
+const ARGOCD_PASSWORD = process.env.ARGOCD_PASSWORD;
+
+async function getArgoAppsViaHTTP() {
+  if (!ARGOCD_USERNAME || !ARGOCD_PASSWORD) return [];
+  try {
+    const sessionResp = await fetch(`${ARGOCD_URL}/api/v1/session`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username: ARGOCD_USERNAME, password: ARGOCD_PASSWORD }),
+    });
+    if (!sessionResp.ok) throw new Error(`Session: ${sessionResp.status}`);
+    const { token } = await sessionResp.json();
+    const appsResp = await fetch(`${ARGOCD_URL}/api/v1/applications`, {
+      headers: { "Authorization": `Bearer ${token}` },
+    });
+    if (!appsResp.ok) throw new Error(`Apps: ${appsResp.status}`);
+    const data = await appsResp.json();
+    return data.items || [];
+  } catch (e) {
+    console.error("[DEPLOY-DETECT] ArgoCD HTTP API failed:", e.message);
+    return [];
+  }
+}
+
 async function getArgoApps() {
+  // Try K8s CRD first (in-cluster RBAC), fallback to ArgoCD HTTP API
   try {
     const resp = await customApi.listNamespacedCustomObject({
       group: "argoproj.io",
@@ -1750,11 +1777,12 @@ async function getArgoApps() {
       plural: "applications",
     });
     const body = resp?.body || resp || {};
-    return body.items || [];
+    const items = body.items || [];
+    if (items.length > 0) return items;
   } catch (e) {
-    console.error("[DEPLOY-DETECT] Failed to query ArgoCD apps:", e.message);
-    return [];
+    console.warn("[DEPLOY-DETECT] K8s CRD query failed, trying HTTP API:", e.message);
   }
+  return getArgoAppsViaHTTP();
 }
 
 function isAppSyncedHealthy(app) {
