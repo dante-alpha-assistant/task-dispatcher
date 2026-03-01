@@ -45,6 +45,11 @@ const AGENTS = {
     token: process.env.NEO_WORKER_HOOKS_TOKEN,
     gatewayToken: process.env.NEO_WORKER_GATEWAY_TOKEN,
   },
+  "ifra-worker": {
+    url: process.env.IFRA_WORKER_HOOKS_URL || `http://ifra-worker.agents.svc.cluster.local:18789/hooks/agent`,
+    token: process.env.IFRA_WORKER_HOOKS_TOKEN,
+    gatewayToken: process.env.IFRA_WORKER_GATEWAY_TOKEN,
+  },
 };
 
 // Only fetch online agents — disabled agents are never auto-assigned or dispatched to
