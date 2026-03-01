@@ -1741,7 +1741,7 @@ const DEPLOY_DETECT_INTERVAL = 60_000; // 60 seconds
 // Gives ArgoCD Image Updater time to detect new image and trigger sync
 const DEPLOY_GRACE_PERIOD = 90_000; // 90 seconds
 
-const ARGOCD_URL = process.env.ARGOCD_URL || "https://ops.dante.id";
+const ARGOCD_URL = process.env.ARGOCD_URL || "http://argocd-server.argocd.svc.cluster.local";
 const ARGOCD_USERNAME = process.env.ARGOCD_USERNAME;
 const ARGOCD_PASSWORD = process.env.ARGOCD_PASSWORD;
 
