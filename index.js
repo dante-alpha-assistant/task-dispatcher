@@ -1901,7 +1901,7 @@ async function autoDeployDetector() {
     // 2. Query completed tasks (QA passed) that haven't been marked as deployed yet
     const { data: completedTasks, error } = await supabase
       .from("agent_tasks")
-      .select("id, title, status, completed_at, result, type")
+      .select("id, title, status, completed_at, result, type, repository_id")
       .eq("status", "completed")
       .order("completed_at", { ascending: true });
 
@@ -2005,8 +2005,19 @@ async function autoDeployDetector() {
           console.warn(`[DEPLOY-DETECT] GitHub API error for task ${task.id}:`, ghErr.message);
         }
       } else {
-        // No PR number in result — can't verify deployment, skip
-        console.log(`[DEPLOY-DETECT] Task ${task.id} ("${task.title.slice(0, 40)}") has no PR reference — cannot verify deployment, skipping`);
+        // No PR number in result — fall back to ArgoCD sync check
+        // If ArgoCD synced after task completion, the image likely includes this task's changes
+        if (devSynced && devSyncTime && devSyncTime > completedAt) {
+          isDeployed = true;
+          deployEnv = "dev";
+        }
+        if (prodSynced && prodSyncTime && prodSyncTime > completedAt) {
+          isDeployed = true;
+          deployEnv = deployEnv ? "dev+prod" : "prod";
+        }
+        if (isDeployed) {
+          console.log(`[DEPLOY-DETECT] Task ${task.id} ("${task.title.slice(0, 40)}") no PR ref, but ArgoCD synced after completion → deployed (${deployEnv})`);
+        }
       }
 
       if (isDeployed) {
