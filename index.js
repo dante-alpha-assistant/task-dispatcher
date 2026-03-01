@@ -1941,30 +1941,72 @@ async function autoDeployDetector() {
         continue;
       }
 
-      // For coding tasks: check if ArgoCD synced after task completion
-      // The sync must have happened AFTER the task was completed (meaning the new image is live)
-      let isDeployed = false;
-      let deployEnv = null;
-
-      if (devSynced && devSyncTime && devSyncTime > completedAt) {
-        isDeployed = true;
-        deployEnv = "dev";
-      }
-      if (prodSynced && prodSyncTime && prodSyncTime > completedAt) {
-        isDeployed = true;
-        deployEnv = deployEnv ? "dev+prod" : "prod";
-      }
-
-      // Also check: extract commit SHA or PR from result for logging
+      // Extract PR number or commit from task result
       let commitRef = null;
+      let prNumber = null;
+      let repoFullName = null;
       if (task.result) {
         const resultStr = typeof task.result === "string" ? task.result : JSON.stringify(task.result);
         // Match PR numbers like "PR #13" or "PR#13" or "#13 merged"
         const prMatch = resultStr.match(/PR\s*#(\d+)/i) || resultStr.match(/#(\d+)\s*merged/i);
-        if (prMatch) commitRef = `PR #${prMatch[1]}`;
+        if (prMatch) {
+          prNumber = parseInt(prMatch[1]);
+          commitRef = `PR #${prNumber}`;
+        }
         // Match commit SHAs
         const shaMatch = resultStr.match(/\b([0-9a-f]{7,40})\b/);
         if (!commitRef && shaMatch) commitRef = shaMatch[1].slice(0, 7);
+        // Extract repo name from result (e.g. "dante-alpha-assistant/queue-dashboard")
+        const repoMatch = resultStr.match(/(dante-alpha-assistant\/[\w-]+)/);
+        if (repoMatch) repoFullName = repoMatch[1];
+      }
+
+      // For coding tasks: MUST verify the specific PR was merged via GitHub API
+      // Don't rely solely on ArgoCD sync time — that catches unrelated deploys
+      let isDeployed = false;
+      let deployEnv = null;
+
+      if (prNumber) {
+        // Look up repo from task's repository_id or fall back to extracted repo
+        if (!repoFullName && task.repository_id) {
+          const { data: repo } = await supabase.from('agent_repositories').select('full_name').eq('id', task.repository_id).single();
+          if (repo) repoFullName = repo.full_name;
+        }
+        if (!repoFullName) repoFullName = 'dante-alpha-assistant/queue-dashboard'; // default
+
+        try {
+          const ghResp = await fetch(`https://api.github.com/repos/${repoFullName}/pulls/${prNumber}`, {
+            headers: { 'Authorization': `token ${process.env.GH_TOKEN}`, 'Accept': 'application/vnd.github.v3+json' },
+            signal: AbortSignal.timeout(5000),
+          });
+          if (ghResp.ok) {
+            const pr = await ghResp.json();
+            if (pr.merged && pr.merged_at) {
+              const mergedAt = new Date(pr.merged_at).getTime();
+              // PR is merged — now check if ArgoCD synced AFTER the merge
+              if (devSynced && devSyncTime && devSyncTime > mergedAt) {
+                isDeployed = true;
+                deployEnv = "dev";
+              }
+              if (prodSynced && prodSyncTime && prodSyncTime > mergedAt) {
+                isDeployed = true;
+                deployEnv = deployEnv ? "dev+prod" : "prod";
+              }
+              if (!isDeployed) {
+                console.log(`[DEPLOY-DETECT] Task ${task.id} PR #${prNumber} merged but ArgoCD hasn't synced since merge yet`);
+              }
+            } else {
+              console.log(`[DEPLOY-DETECT] Task ${task.id} PR #${prNumber} NOT merged yet — skipping`);
+            }
+          } else {
+            console.log(`[DEPLOY-DETECT] Task ${task.id} GitHub API returned ${ghResp.status} for ${repoFullName}#${prNumber}`);
+          }
+        } catch (ghErr) {
+          console.warn(`[DEPLOY-DETECT] GitHub API error for task ${task.id}:`, ghErr.message);
+        }
+      } else {
+        // No PR number in result — can't verify deployment, skip
+        console.log(`[DEPLOY-DETECT] Task ${task.id} ("${task.title.slice(0, 40)}") has no PR reference — cannot verify deployment, skipping`);
       }
 
       if (isDeployed) {
