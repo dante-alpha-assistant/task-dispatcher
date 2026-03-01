@@ -877,21 +877,32 @@ async function qaStaleDetector() {
   try {
     const { data: staleTasks, error } = await supabase
       .from("agent_tasks")
-      .select("id, title, qa_agent, updated_at")
+      .select("id, title, qa_agent, updated_at, qa_retries")
       .eq("status", "qa_testing")
       .not("qa_agent", "is", null);
 
     if (error || !staleTasks?.length) return;
 
     const QA_STALE_THRESHOLD = 20 * 60 * 1000; // 20 minutes
+    const MAX_QA_RETRIES = 3;
     for (const task of staleTasks) {
       const age = Date.now() - new Date(task.updated_at).getTime();
       if (age > QA_STALE_THRESHOLD) {
-        console.log(`[QA-STALE] Task ${task.id} ("${task.title.slice(0, 40)}") stuck in qa_testing for ${Math.floor(age / 60000)}min → resetting for re-dispatch`);
-        await supabase
-          .from("agent_tasks")
-          .update({ status: "done", qa_agent: null })
-          .eq("id", task.id);
+        // Track QA retries to prevent infinite loops
+        const retryCount = (task.qa_retries || 0) + 1;
+        if (retryCount > MAX_QA_RETRIES) {
+          console.log(`[QA-STALE] Task ${task.id} ("${task.title.slice(0, 40)}") exceeded ${MAX_QA_RETRIES} QA retries → marking failed`);
+          await supabase
+            .from("agent_tasks")
+            .update({ status: "failed", qa_agent: null, result: `QA failed: timed out ${retryCount} times` })
+            .eq("id", task.id);
+        } else {
+          console.log(`[QA-STALE] Task ${task.id} ("${task.title.slice(0, 40)}") stuck in qa_testing for ${Math.floor(age / 60000)}min → retry ${retryCount}/${MAX_QA_RETRIES}`);
+          await supabase
+            .from("agent_tasks")
+            .update({ status: "done", qa_agent: null, qa_retries: retryCount })
+            .eq("id", task.id);
+        }
       }
     }
   } catch (e) {
@@ -1744,6 +1755,8 @@ async function staleAgentDetector() {
       return;
     }
     for (const agent of (data || [])) {
+      // Skip worker pods — they don't have heartbeat crons yet
+      if (agent.name.endsWith('-worker')) continue;
       console.log(`[STALE] Marking ${agent.name} as offline (last_heartbeat: ${agent.last_heartbeat})`);
       await supabase
         .from('agent_cards')
