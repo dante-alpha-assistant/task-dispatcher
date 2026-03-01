@@ -1829,7 +1829,7 @@ function isAppSyncedHealthy(app) {
   const status = app?.status || {};
   const syncStatus = status.sync?.status; // "Synced" | "OutOfSync"
   const healthStatus = status.health?.status; // "Healthy" | "Degraded" | "Progressing"
-  return syncStatus === "Synced" && healthStatus === "Healthy";
+  return syncStatus === "Synced" && (healthStatus === "Healthy" || healthStatus === "Progressing");
 }
 
 function getAppSyncFinishedAt(app) {
