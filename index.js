@@ -107,6 +107,23 @@ async function checkAgentBusy(agentName) {
     const data = await res.json();
     const sessions = data?.result?.details?.sessions || data?.details?.sessions || [];
     
+    // Build set of task IDs that are NOT active (completed/failed/todo/done) — these are zombie sessions
+    const hookTaskIds = sessions
+      .map(s => (s.key || '').match(/hook:task:(.+)/)?.[1])
+      .filter(Boolean);
+    const zombieTaskIds = new Set();
+    if (hookTaskIds.length > 0) {
+      const { data: tasks } = await supabase
+        .from('agent_tasks')
+        .select('id, status')
+        .in('id', hookTaskIds);
+      for (const t of (tasks || [])) {
+        if (!['assigned', 'in_progress', 'qa_testing'].includes(t.status)) {
+          zombieTaskIds.add(t.id);
+        }
+      }
+    }
+
     // Filter out noise: only count sessions where the agent is ACTIVELY working
     // Discord sessions update on every received message — that doesn't mean the agent is busy
     const activeSessions = sessions.filter(s => {
@@ -125,7 +142,11 @@ async function checkAgentBusy(agentName) {
         // This catches active conversations but not idle channels
         if (age > 30 * 1000) return false;
       }
-      // Hook task sessions: always count as busy (agent is working a task)
+      // Hook task sessions: only count as busy if the task is actually active
+      if (key.includes('hook:task:')) {
+        const taskId = key.split('hook:task:')[1];
+        if (taskId && zombieTaskIds.has(taskId)) return false;
+      }
       // Sub-agent sessions: always count as busy
       return true;
     });
