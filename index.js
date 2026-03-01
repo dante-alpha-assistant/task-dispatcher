@@ -1305,6 +1305,7 @@ async function taskMonitor() {
       if (task.status !== "in_progress" && task.status !== "qa_testing") continue;
 
       // Check if session still exists FIRST (before any timeout logic)
+      let sessions = [];
       let sessionAlive = false;
       try {
         const resp = await fetch(invokeUrl, {
@@ -1321,7 +1322,7 @@ async function taskMonitor() {
 
         if (resp.ok) {
           const data = await resp.json();
-          const sessions = data?.result?.details?.sessions || [];
+          sessions = data?.result?.details?.sessions || [];
           const sessionKey = isQaTesting
             ? `agent:main:hook:qa:${task.id}`
             : `agent:main:hook:task:${task.id}`;
@@ -1358,6 +1359,23 @@ async function taskMonitor() {
       }
 
       if (sessionAlive) {
+        // Idle timeout: session exists but hasn't been updated in 5 minutes
+        // This catches orphaned hook sessions where the LLM never started working
+        const IDLE_TIMEOUT = 5 * 60 * 1000; // 5 minutes
+        const hookSession = sessions?.find(s => s.key === (isQaTesting ? `agent:main:hook:qa:${task.id}` : `agent:main:hook:task:${task.id}`));
+        const idleMs = hookSession ? Date.now() - (hookSession.updatedAt || 0) : 0;
+        if (idleMs > IDLE_TIMEOUT) {
+          console.log(`[MONITOR] Idle timeout: task ${task.id} ("${task.title.slice(0,40)}") → ${agentName} idle ${Math.floor(idleMs/60000)}min → resetting to todo`);
+          await supabase.from("agent_tasks").update({
+            status: "todo",
+            assigned_agent: null,
+            started_at: null,
+            error: `Idle timeout: hook session idle ${Math.floor(idleMs/60000)}min — agent was occupied elsewhere`,
+          }).eq("id", task.id);
+          activeTasks.delete(task.id);
+          continue;
+        }
+
         // Session is active — only hard-timeout if REALLY old (safety net)
         const startTime = task.started_at || task.created_at;
         const timeout = task.type === "qa" ? QA_HARD_TIMEOUT : task.type === "coding" ? CODING_HARD_TIMEOUT : TASK_HARD_TIMEOUT;
