@@ -138,6 +138,19 @@ const SCHEDULER_INTERVAL = 30_000; // 30 seconds
 const FACTORY_POLL_INTERVAL = 15_000; // 15 seconds
 const FACTORY_MAX_WAIT = 10 * 60 * 1000; // 10 minutes
 
+// Factory pipeline stage order
+const STAGE_PIPELINE = ['refinery', 'foundry', 'builder', 'inspector', 'deployer'];
+
+function getNextStage(currentStage) {
+  const idx = STAGE_PIPELINE.indexOf(currentStage);
+  if (idx < 0 || idx >= STAGE_PIPELINE.length - 1) return null;
+  return STAGE_PIPELINE[idx + 1];
+}
+
+function isFinalStage(stage) {
+  return stage === STAGE_PIPELINE[STAGE_PIPELINE.length - 1];
+}
+
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
 // Map project status → task stage
@@ -996,6 +1009,30 @@ function subscribe() {
           }
           // A2A: check if parent task should be completed
           await checkParentCompletion(task);
+        }
+
+        // Factory pipeline stage transitions: auto-advance to next stage
+        if (task?.status === "done" && eventType === "UPDATE" && prev?.status !== "done" && task.stage) {
+          const nextStage = getNextStage(task.stage);
+          if (nextStage) {
+            // Guard: only advance forward (check current stage is valid and not final)
+            const currentIdx = STAGE_PIPELINE.indexOf(task.stage);
+            const nextIdx = STAGE_PIPELINE.indexOf(nextStage);
+            if (nextIdx > currentIdx) {
+              console.log(`[STAGE] Task ${task.id} ("${task.title}"): ${task.stage} → ${nextStage}`);
+              await supabase.from("agent_tasks").update({
+                stage: nextStage,
+                status: "assigned",
+                started_at: null,
+                completed_at: null,
+              }).eq("id", task.id);
+              return; // Don't trigger QA routing for intermediate stages
+            }
+          }
+          // Final stage (deployer) completed — fall through to QA routing
+          if (isFinalStage(task.stage)) {
+            console.log(`[STAGE] Task ${task.id} ("${task.title}"): final stage (${task.stage}) completed, proceeding to QA`);
+          }
         }
 
         // QA routing: when task moves to "done", move it to "qa" and dispatch to Beta
