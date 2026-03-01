@@ -179,7 +179,6 @@ async function dispatchViaFactory(task) {
       .insert({
         name: task.title,
         idea,
-        description: task.description || null,
         user_id: "system",
         type: "external",
         status: "new",
@@ -232,6 +231,8 @@ async function dispatchViaFactory(task) {
     // 4. Poll project status
     const startTime = Date.now();
     let lastStage = "refinery";
+    const stageResults = {};
+    let staleCount = 0;
 
     const pollInterval = setInterval(async () => {
       try {
@@ -264,7 +265,37 @@ async function dispatchViaFactory(task) {
         if (newStage !== lastStage) {
           console.log(`[FACTORY] Task ${task.id}: stage ${lastStage} → ${newStage} (project status: ${projectStatus})`);
           await supabase.from("agent_tasks").update({ stage: newStage }).eq("id", task.id);
+          staleCount = 0;
+
+          // Capture results from completed stage
+          try {
+            if (lastStage === "refinery") {
+              const { data: prds } = await supabase.from("prds").select("id, title, content").eq("project_id", projectId);
+              const { data: features } = await supabase.from("features").select("id, name, description").eq("project_id", projectId);
+              stageResults.refinery = { prds: prds || [], features: features || [] };
+            } else if (lastStage === "foundry") {
+              const { data: blueprints } = await supabase.from("blueprints").select("id, feature_id, content").eq("project_id", projectId);
+              stageResults.foundry = { blueprints: blueprints || [] };
+            } else if (lastStage === "builder") {
+              const { data: builds } = await supabase.from("builds").select("id, feature_id, status, code").eq("project_id", projectId);
+              stageResults.builder = { builds: builds || [] };
+            } else if (lastStage === "inspector") {
+              const { data: testResults } = await supabase.from("test_results").select("id, feature_id, score, summary").eq("project_id", projectId);
+              stageResults.inspector = { test_results: testResults || [] };
+            } else if (lastStage === "deployer") {
+              const { data: deployments } = await supabase.from("deployments").select("id, url, status").eq("project_id", projectId);
+              stageResults.deployer = { deployments: deployments || [] };
+            }
+          } catch (stageErr) {
+            console.warn(`[FACTORY] Failed to capture ${lastStage} results for project ${projectId}:`, stageErr.message);
+          }
+
           lastStage = newStage;
+        } else {
+          staleCount++;
+          if (staleCount >= 5) {
+            console.warn(`[FACTORY] Task ${task.id}: project ${projectId} stale — no stage change for ${staleCount} polls (~${staleCount * 15}s)`);
+          }
         }
 
         // Terminal: live
@@ -287,7 +318,7 @@ async function dispatchViaFactory(task) {
           console.log(`[FACTORY] Task ${task.id} completed! Deployment: ${deploymentUrl || "N/A"}`);
           await supabase.from("agent_tasks").update({
             status: "done",
-            result: { output: "Factory pipeline completed", deployment_url: deploymentUrl, project_id: projectId },
+            result: { output: "Factory pipeline completed", deployment_url: deploymentUrl, project_id: projectId, stage_results: stageResults },
             completed_at: new Date().toISOString(),
           }).eq("id", task.id);
           return;
