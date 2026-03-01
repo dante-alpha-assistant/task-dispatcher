@@ -1767,17 +1767,21 @@ const DEPLOY_GRACE_PERIOD = 90_000; // 90 seconds
 const ARGOCD_URL = process.env.ARGOCD_URL || "http://argocd-server.argocd.svc.cluster.local";
 const ARGOCD_USERNAME = process.env.ARGOCD_USERNAME;
 const ARGOCD_PASSWORD = process.env.ARGOCD_PASSWORD;
+const ARGOCD_TOKEN = process.env.ARGOCD_TOKEN;
 
 async function getArgoAppsViaHTTP() {
-  if (!ARGOCD_USERNAME || !ARGOCD_PASSWORD) return [];
   try {
-    const sessionResp = await fetch(`${ARGOCD_URL}/api/v1/session`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ username: ARGOCD_USERNAME, password: ARGOCD_PASSWORD }),
-    });
-    if (!sessionResp.ok) throw new Error(`Session: ${sessionResp.status}`);
-    const { token } = await sessionResp.json();
+    let token = ARGOCD_TOKEN;
+    if (!token) {
+      if (!ARGOCD_USERNAME || !ARGOCD_PASSWORD) return [];
+      const sessionResp = await fetch(`${ARGOCD_URL}/api/v1/session`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username: ARGOCD_USERNAME, password: ARGOCD_PASSWORD }),
+      });
+      if (!sessionResp.ok) throw new Error(`Session: ${sessionResp.status}`);
+      ({ token } = await sessionResp.json());
+    }
     const appsResp = await fetch(`${ARGOCD_URL}/api/v1/applications`, {
       headers: { "Authorization": `Bearer ${token}` },
     });
