@@ -439,7 +439,7 @@ async function checkParentCompletion(task) {
 
   if (!siblings?.length) return;
 
-  const terminal = ['done', 'qa_testing', 'completed', 'failed'];
+  const terminal = ['qa_testing', 'completed', 'failed'];
   const allTerminal = siblings.every(s => terminal.includes(s.status));
 
   if (!allTerminal) {
@@ -858,7 +858,7 @@ curl -s -X PATCH "https://lessxkxujvcmublgwdaa.supabase.co/rest/v1/agent_tasks?i
   -H "apikey: ${SUPABASE_KEY}" \\
   -H "Authorization: Bearer ${SUPABASE_KEY}" \\
   -H "Content-Type: application/json" \\
-  -d '{"status":"qa_testing","completed_at":"'$(date -u +%Y-%m-%dT%H:%M:%SZ)'","result":{"summary":"DESCRIBE WHAT YOU DID","artifacts":[],"test_results":null}}'
+  -d '{"status":"qa_testing","assigned_agent":null,"completed_at":"'$(date -u +%Y-%m-%dT%H:%M:%SZ)'","result":{"summary":"DESCRIBE WHAT YOU DID","artifacts":[],"test_results":null}}'
 \`\`\`
 
 **On success (ops/review tasks WITHOUT a PR — skip QA):**
@@ -1274,7 +1274,7 @@ function subscribe() {
         }
 
         // Remove completed/failed tasks from active tracking
-        if (task?.status === 'done' || task?.status === 'qa_testing' || task?.status === 'failed' || task?.status === 'completed' || task?.status === 'deployed') {
+        if (task?.status === 'qa_testing' || task?.status === 'failed' || task?.status === 'completed' || task?.status === 'deployed') {
           if (activeTasks.has(task.id)) {
             console.log(`[TRACKER] Task ${task.id} completed (${task.status}), removing from active tracking`);
             activeTasks.delete(task.id);
@@ -1285,7 +1285,7 @@ function subscribe() {
 
         // Factory pipeline stage transitions: auto-advance to next stage
         // Note: factory tasks still use "done" internally for stage transitions before final QA
-        if ((task?.status === "done" || task?.status === "qa_testing") && eventType === "UPDATE" && prev?.status !== task?.status && task.stage) {
+        if (task?.status === "qa_testing" && eventType === "UPDATE" && prev?.status !== task?.status && task.stage) {
           const nextStage = getNextStage(task.stage);
           if (nextStage) {
             // Guard: only advance forward (check current stage is valid and not final)
@@ -1428,7 +1428,7 @@ curl -s -X PATCH "https://lessxkxujvcmublgwdaa.supabase.co/rest/v1/agent_tasks?i
                 // Task is already qa_testing — just assign the QA agent
                 await supabase
                   .from("agent_tasks")
-                  .update({ qa_agent: "beta-worker" })
+                  .update({ qa_agent: "beta-worker", assigned_agent: null })
                   .eq("id", task.id);
 
                 // Trigger auto-scaler if queue is building up
