@@ -837,12 +837,20 @@ async function dispatchToAgent(task) {
   const codingTaskSection = task.type === "coding" ? `
 ## Coding Task
 
-**Use the coding-task skill for this work.** Read \`skills/coding-task/SKILL.md\` and follow it step by step.
+**⚠️ MANDATORY: Read \`skills/coding-task/SKILL.md\` FIRST and follow it step by step.**
+
+If the skill file does not exist, follow this workflow:
+1. Clone/update the repo in \`/root/.openclaw/workspace/\` (NEVER \`/tmp/\`)
+2. Create a feature branch (\`feat/<short-description>\` or \`fix/<short-description>\`)
+3. Make the changes, run build/lint if available
+4. Commit, push, and create a PR via \`gh pr create\`
+5. Update task status with the PR number
 
 - **Repo:** ${task.repo || "See task description for target repo(s)"}
 - **Branch convention:** \`feat/<short-description>\` or \`fix/<short-description>\`
 - **PR template:** Include task ID, summary of changes, and testing notes
 - **Known repos:** queue-dashboard, task-dispatcher, dante-gitops (all under dante-alpha-assistant)
+- **Git auth:** \`GH_TOKEN\` env var is available for \`gh\` CLI and git operations
 ` : "";
 
   const message = `\`\`\`json
