@@ -391,7 +391,7 @@ async function dispatchViaFactory(task) {
 
           console.log(`[FACTORY] Task ${task.id} completed! Deployment: ${deploymentUrl || "N/A"}`);
           await supabase.from("agent_tasks").update({
-            status: "done",
+            status: "qa_testing",
             result: { output: "Factory pipeline completed", deployment_url: deploymentUrl, project_id: projectId, stage_results: stageResults },
             completed_at: new Date().toISOString(),
           }).eq("id", task.id);
@@ -439,7 +439,7 @@ async function checkParentCompletion(task) {
 
   if (!siblings?.length) return;
 
-  const terminal = ['done', 'completed', 'failed'];
+  const terminal = ['done', 'qa_testing', 'completed', 'failed'];
   const allTerminal = siblings.every(s => terminal.includes(s.status));
 
   if (!allTerminal) {
@@ -473,7 +473,7 @@ async function checkParentCompletion(task) {
   const { error: updateErr } = await supabase
     .from('agent_tasks')
     .update({
-      status: 'done',
+      status: 'qa_testing',
       result: aggregated,
       completed_at: new Date().toISOString(),
     })
@@ -852,13 +852,22 @@ ${contextBlock}---
 
 When you finish this task, you MUST update its status. Run this command:
 
-**On success:**
+**On success (coding tasks with a PR):**
 \`\`\`bash
 curl -s -X PATCH "https://lessxkxujvcmublgwdaa.supabase.co/rest/v1/agent_tasks?id=eq.${task.id}" \\
   -H "apikey: ${SUPABASE_KEY}" \\
   -H "Authorization: Bearer ${SUPABASE_KEY}" \\
   -H "Content-Type: application/json" \\
-  -d '{"status":"done","completed_at":"'$(date -u +%Y-%m-%dT%H:%M:%SZ)'","result":{"summary":"DESCRIBE WHAT YOU DID","artifacts":[],"test_results":null}}'
+  -d '{"status":"qa_testing","completed_at":"'$(date -u +%Y-%m-%dT%H:%M:%SZ)'","result":{"summary":"DESCRIBE WHAT YOU DID","artifacts":[],"test_results":null}}'
+\`\`\`
+
+**On success (ops/review tasks WITHOUT a PR — skip QA):**
+\`\`\`bash
+curl -s -X PATCH "https://lessxkxujvcmublgwdaa.supabase.co/rest/v1/agent_tasks?id=eq.${task.id}" \\
+  -H "apikey: ${SUPABASE_KEY}" \\
+  -H "Authorization: Bearer ${SUPABASE_KEY}" \\
+  -H "Content-Type: application/json" \\
+  -d '{"status":"completed","completed_at":"'$(date -u +%Y-%m-%dT%H:%M:%SZ)'","result":{"summary":"DESCRIBE WHAT YOU DID","artifacts":[],"test_results":null}}'
 \`\`\`
 
 **On failure:**
@@ -941,7 +950,7 @@ async function qaStaleDetector() {
           console.log(`[QA-STALE] Task ${task.id} ("${task.title.slice(0, 40)}") stuck in qa_testing for ${Math.floor(age / 60000)}min → retry ${retryCount}/${MAX_QA_RETRIES}`);
           await supabase
             .from("agent_tasks")
-            .update({ status: "done", qa_agent: null, qa_retries: retryCount })
+            .update({ qa_agent: null, qa_retries: retryCount })
             .eq("id", task.id);
         }
       }
@@ -1265,7 +1274,7 @@ function subscribe() {
         }
 
         // Remove completed/failed tasks from active tracking
-        if (task?.status === 'done' || task?.status === 'failed' || task?.status === 'completed' || task?.status === 'deployed') {
+        if (task?.status === 'done' || task?.status === 'qa_testing' || task?.status === 'failed' || task?.status === 'completed' || task?.status === 'deployed') {
           if (activeTasks.has(task.id)) {
             console.log(`[TRACKER] Task ${task.id} completed (${task.status}), removing from active tracking`);
             activeTasks.delete(task.id);
@@ -1275,7 +1284,8 @@ function subscribe() {
         }
 
         // Factory pipeline stage transitions: auto-advance to next stage
-        if (task?.status === "done" && eventType === "UPDATE" && prev?.status !== "done" && task.stage) {
+        // Note: factory tasks still use "done" internally for stage transitions before final QA
+        if ((task?.status === "done" || task?.status === "qa_testing") && eventType === "UPDATE" && prev?.status !== task?.status && task.stage) {
           const nextStage = getNextStage(task.stage);
           if (nextStage) {
             // Guard: only advance forward (check current stage is valid and not final)
@@ -1298,29 +1308,13 @@ function subscribe() {
           }
         }
 
-        // QA routing: when task moves to "done", move it to "qa" and dispatch to Beta
-        // No separate QA task — the original task goes through QA itself
-        if (task?.status === "done" && eventType === "UPDATE" && prev?.status !== "done") {
+        // QA routing: when task moves to "qa_testing" with no qa_agent, dispatch to Beta
+        // Agents now set qa_testing directly (no intermediate "done" status)
+        if (task?.status === "qa_testing" && eventType === "UPDATE" && prev?.status !== "qa_testing" && !task.qa_agent) {
           // Don't QA tasks that were already QA'd (prevent loops)
           if (task.type === "qa") return;
 
-
-          // Auto-skip QA for ops/review tasks without a PR — nothing for QA to review
-          if (task.type === "ops" || task.type === "review") {
-            const resultStr = typeof task.result === 'string' ? task.result : JSON.stringify(task.result || {});
-            const hasPR = /PR\s*#\d+/i.test(resultStr);
-            if (!hasPR) {
-              console.log(`[QA-SKIP] Task ${task.id} ("${task.title}") is ${task.type} with no PR → auto-promoting to completed`);
-              await supabase
-                .from("agent_tasks")
-                .update({ status: "completed", completed_at: new Date().toISOString() })
-                .eq("id", task.id);
-              // Check parent completion for sub-tasks
-              await checkParentCompletion({ ...task, status: 'completed' });
-              return;
-            }
-          }
-          console.log(`[QA] Task ${task.id} ("${task.title}") → moving to qa_testing, dispatching to beta`);
+          console.log(`[QA] Task ${task.id} ("${task.title}") → qa_testing (unassigned), dispatching to beta`);
 
           try {
 
@@ -1431,10 +1425,10 @@ curl -s -X PATCH "https://lessxkxujvcmublgwdaa.supabase.co/rest/v1/agent_tasks?i
 
               if (resp.ok) {
                 console.log(`[QA] Dispatched task ${task.id} to beta for QA review`);
-                // Move to qa_testing in one step (no intermediate 'qa' status)
+                // Task is already qa_testing — just assign the QA agent
                 await supabase
                   .from("agent_tasks")
-                  .update({ status: "qa_testing", qa_agent: "beta-worker" })
+                  .update({ qa_agent: "beta-worker" })
                   .eq("id", task.id);
 
                 // Trigger auto-scaler if queue is building up
@@ -1725,10 +1719,9 @@ async function taskMonitor() {
           const elapsed = startTime ? Date.now() - new Date(startTime).getTime() : 0;
 
           if (isQaTesting) {
-            // QA session crashed — reset to done + clear qa_agent so qaAutoScaler re-dispatches
-            console.log(`[MONITOR] QA session gone for task ${task.id} ("${task.title}") → resetting to done for re-dispatch`);
+            // QA session crashed — clear qa_agent so qaAutoScaler re-dispatches (stays in qa_testing)
+            console.log(`[MONITOR] QA session gone for task ${task.id} ("${task.title}") → clearing qa_agent for re-dispatch`);
             await supabase.from("agent_tasks").update({
-              status: "done",
               qa_agent: null,
             }).eq("id", task.id);
           } else if (elapsed > timeout) {
