@@ -1178,8 +1178,25 @@ function subscribe() {
         if (task?.status === "assigned" && task?.assigned_agent) {
           // Only dispatch if status actually changed to 'assigned'
           if (eventType === "INSERT" || (eventType === "UPDATE" && prev?.status !== "assigned")) {
-            console.log(`[DISPATCH] Task ${task.id} → ${task.assigned_agent}`);
-            dispatchToAgent(task);
+            // Concurrency guard: check if this agent already has an in-progress task
+            const agentName = task.assigned_agent.toLowerCase();
+            const { data: inFlight } = await supabase
+              .from('agent_tasks')
+              .select('id')
+              .eq('assigned_agent', task.assigned_agent)
+              .in('status', ['in_progress'])
+              .neq('id', task.id);
+            if (inFlight && inFlight.length > 0) {
+              console.log(`[DISPATCH] Agent ${agentName} already has ${inFlight.length} in-progress task(s) — resetting ${task.id} to todo for scheduler`);
+              await supabase.from('agent_tasks').update({
+                status: 'todo',
+                assigned_agent: null,
+                started_at: null,
+              }).eq('id', task.id);
+            } else {
+              console.log(`[DISPATCH] Task ${task.id} → ${task.assigned_agent}`);
+              dispatchToAgent(task);
+            }
           }
         }
 
