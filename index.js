@@ -1415,6 +1415,16 @@ createServer(async (req, res) => {
         res.end(JSON.stringify({ error: e.message }));
       }
     });
+  } else if (pathname === "/api/dispatch" && req.method === "POST") {
+    // Manual dispatch: trigger the scheduler immediately and return count
+    try {
+      const assigned = await scheduler();
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true, assigned: assigned ?? 0 }));
+    } catch (e) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: false, error: e.message }));
+    }
   } else {
     res.writeHead(404);
     res.end("Not found");
@@ -1770,8 +1780,10 @@ async function scheduler() {
     if (assigned > 0) {
       console.log(`[SCHEDULER] Assigned ${assigned} tasks this cycle`);
     }
+    return assigned;
   } catch (e) {
     console.error("[SCHEDULER] Error:", e.message);
+    return -1;
   }
 }
 
