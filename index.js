@@ -72,6 +72,10 @@ async function getAgentCards() {
   }));
 }
 
+const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
+const DANTE_AGENTS_CHANNEL_ID = "1476656995221111027";
+const DANTE_USER_ID = "185059032531206146";
+
 const DANTE_ID_API_URL = process.env.DANTE_ID_API_URL || "https://api.dante.id";
 const PRIORITY_ORDER = { urgent: 0, high: 1, normal: 2, low: 3 };
 
@@ -1142,6 +1146,28 @@ async function assignQueuedQATasks() {
   }
 }
 
+// --- Discord notification for blocked tasks ---
+async function notifyBlocked(task) {
+  // Try Discord webhook first, fall back to bot API
+  const message = `🚫 **Task blocked**: "${task.title}"\n**Needs**: ${task.blocked_reason || '(no reason given)'}\n**Assigned**: ${task.assigned_agent || 'unassigned'}\nReact ✅ or reply to unblock`;
+
+  if (DISCORD_WEBHOOK_URL) {
+    try {
+      await fetch(DISCORD_WEBHOOK_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content: `<@${DANTE_USER_ID}>\n${message}` }),
+        signal: AbortSignal.timeout(5000),
+      });
+      console.log(`[BLOCKED] Sent Discord notification for task ${task.id}`);
+    } catch (e) {
+      console.error(`[BLOCKED] Discord webhook failed: ${e.message}`);
+    }
+  } else {
+    console.log(`[BLOCKED] No DISCORD_WEBHOOK_URL configured, logging only:\n${message}`);
+  }
+}
+
 // --- Subscribe to Realtime changes ---
 function subscribe() {
   console.log("[BOOT] Task Dispatcher starting...");
@@ -1181,6 +1207,15 @@ function subscribe() {
             console.log(`[DISPATCH] Task ${task.id} → ${task.assigned_agent}`);
             dispatchToAgent(task);
           }
+        }
+
+        // Handle blocked status: notify and remove from active tracking
+        if (task?.status === 'blocked' && eventType === 'UPDATE' && prev?.status !== 'blocked') {
+          console.log(`[BLOCKED] Task ${task.id} ("${task.title}") moved to blocked: ${task.blocked_reason || '(no reason)'}`);
+          if (activeTasks.has(task.id)) {
+            activeTasks.delete(task.id);
+          }
+          await notifyBlocked(task);
         }
 
         // Remove completed/failed tasks from active tracking
