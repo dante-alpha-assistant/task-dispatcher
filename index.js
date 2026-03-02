@@ -51,6 +51,11 @@ const AGENTS = {
     token: process.env.IFRA_WORKER_HOOKS_TOKEN,
     gatewayToken: process.env.IFRA_WORKER_GATEWAY_TOKEN,
   },
+  "beta-worker": {
+    url: process.env.BETA_WORKER_HOOKS_URL || `http://beta-worker.agents.svc.cluster.local:18789/hooks/agent`,
+    token: process.env.BETA_WORKER_HOOKS_TOKEN || "beta-worker-hooks-tok-2026",
+    gatewayToken: process.env.BETA_WORKER_GATEWAY_TOKEN || "beta-worker-gw-tok-2026",
+  },
 };
 
 // Only fetch online agents — disabled agents are never auto-assigned or dispatched to
