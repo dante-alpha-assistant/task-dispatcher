@@ -843,6 +843,9 @@ async function dispatchToAgent(task) {
 - **Branch convention:** \`feat/<short-description>\` or \`fix/<short-description>\`
 - **PR template:** Include task ID, summary of changes, and testing notes
 - **Known repos:** queue-dashboard, task-dispatcher, dante-gitops (all under dante-alpha-assistant)
+- **GitHub org:** \`dante-alpha-assistant\`
+- **Git auth:** Use \`GH_TOKEN\` env var (already configured)
+- **Workspace:** All repos should be in \`/root/.openclaw/workspace/\` — do NOT clone to \`/tmp/\`
 ` : "";
 
   const message = `\`\`\`json
