@@ -900,7 +900,7 @@ Do NOT skip this step. The task board at tasks.dante.id must reflect your work.`
       // Update status to in_progress
       await supabase
         .from("agent_tasks")
-        .update({ status: "in_progress", started_at: new Date().toISOString() })
+        .update({ status: "in_progress", started_at: new Date().toISOString(), error: null, result: null, idle_retries: 0 })
         .eq("id", task.id);
     } else {
       const err = await resp.text();
@@ -1655,13 +1655,28 @@ async function taskMonitor() {
         const hookSession = sessions?.find(s => s.key === (isQaTesting ? `agent:main:hook:qa:${task.id}` : `agent:main:hook:task:${task.id}`));
         const idleMs = hookSession ? Date.now() - (hookSession.updatedAt || 0) : 0;
         if (idleMs > IDLE_TIMEOUT) {
-          console.log(`[MONITOR] Idle timeout: task ${task.id} ("${task.title.slice(0,40)}") → ${agentName} idle ${Math.floor(idleMs/60000)}min → resetting to todo`);
-          await supabase.from("agent_tasks").update({
-            status: "todo",
-            assigned_agent: null,
-            started_at: null,
-            error: `Idle timeout: hook session idle ${Math.floor(idleMs/60000)}min — agent was occupied elsewhere`,
-          }).eq("id", task.id);
+          const idleRetries = (task.idle_retries || 0) + 1;
+          const MAX_IDLE_RETRIES = 3;
+          if (idleRetries >= MAX_IDLE_RETRIES) {
+            console.log(`[MONITOR] Idle timeout: task ${task.id} ("${task.title.slice(0,40)}") → ${agentName} idle ${idleRetries} times → moving to BLOCKED`);
+            await supabase.from("agent_tasks").update({
+              status: "blocked",
+              assigned_agent: null,
+              started_at: null,
+              idle_retries: idleRetries,
+              blocked_reason: `Timed out ${idleRetries} times — agent may be down or task needs manual intervention`,
+              error: null,
+            }).eq("id", task.id);
+          } else {
+            console.log(`[MONITOR] Idle timeout: task ${task.id} ("${task.title.slice(0,40)}") → ${agentName} idle ${Math.floor(idleMs/60000)}min (retry ${idleRetries}/${MAX_IDLE_RETRIES}) → resetting to todo`);
+            await supabase.from("agent_tasks").update({
+              status: "todo",
+              assigned_agent: null,
+              started_at: null,
+              idle_retries: idleRetries,
+              error: null,
+            }).eq("id", task.id);
+          }
           activeTasks.delete(task.id);
           continue;
         }
