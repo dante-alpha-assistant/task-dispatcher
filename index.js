@@ -1303,6 +1303,22 @@ function subscribe() {
           // Don't QA tasks that were already QA'd (prevent loops)
           if (task.type === "qa") return;
 
+
+          // Auto-skip QA for ops/review tasks without a PR — nothing for QA to review
+          if (task.type === "ops" || task.type === "review") {
+            const resultStr = typeof task.result === 'string' ? task.result : JSON.stringify(task.result || {});
+            const hasPR = /PR\s*#\d+/i.test(resultStr);
+            if (!hasPR) {
+              console.log(`[QA-SKIP] Task ${task.id} ("${task.title}") is ${task.type} with no PR → auto-promoting to completed`);
+              await supabase
+                .from("agent_tasks")
+                .update({ status: "completed", completed_at: new Date().toISOString() })
+                .eq("id", task.id);
+              // Check parent completion for sub-tasks
+              await checkParentCompletion({ ...task, status: 'completed' });
+              return;
+            }
+          }
           console.log(`[QA] Task ${task.id} ("${task.title}") → moving to qa_testing, dispatching to beta`);
 
           try {
