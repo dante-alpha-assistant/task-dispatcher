@@ -1331,7 +1331,7 @@ curl -s -X PATCH "https://lessxkxujvcmublgwdaa.supabase.co/rest/v1/agent_tasks?i
                 // Move to qa_testing in one step (no intermediate 'qa' status)
                 await supabase
                   .from("agent_tasks")
-                  .update({ status: "qa_testing", qa_agent: "beta" })
+                  .update({ status: "qa_testing", qa_agent: "beta-worker" })
                   .eq("id", task.id);
 
                 // Trigger auto-scaler if queue is building up
@@ -1495,7 +1495,7 @@ async function taskMonitor() {
       // For qa_testing tasks, check the QA agent (Beta); for others, check assigned_agent
       const isQaTesting = task.status === "qa_testing";
       const agentName = isQaTesting
-        ? (task.qa_agent?.toLowerCase() || "beta")
+        ? (task.qa_agent?.toLowerCase() || "beta-worker")
         : task.assigned_agent?.toLowerCase();
       const agent = AGENTS[agentName];
 
