@@ -1426,10 +1426,32 @@ createServer(async (req, res) => {
           res.end(JSON.stringify({ error: "Unauthorized" }));
           return;
         }
-        const { taskId, percent, step, log } = JSON.parse(body);
-        const progressData = { percent, step, log, timestamp: new Date().toISOString() };
+        const { taskId, percent, step, log, message } = JSON.parse(body);
+        const now = new Date().toISOString();
+        const progressData = { percent, step, log, message, timestamp: now };
         latestProgress.set(taskId, progressData);
         broadcast("task:progress", { taskId, ...progressData }, taskId);
+
+        // Persist to progress_log in Supabase (append entry)
+        const logMessage = message || step || log || `${percent}%`;
+        if (taskId && logMessage) {
+          const logEntry = { message: logMessage, at: now };
+          // Use raw SQL via rpc or fetch-append pattern
+          const { data: existing } = await supabase
+            .from("agent_tasks")
+            .select("progress_log")
+            .eq("id", taskId)
+            .single();
+          const currentLog = Array.isArray(existing?.progress_log) ? existing.progress_log : [];
+          currentLog.push(logEntry);
+          // Keep last 50 entries to avoid bloat
+          const trimmed = currentLog.slice(-50);
+          await supabase
+            .from("agent_tasks")
+            .update({ progress_log: trimmed })
+            .eq("id", taskId);
+        }
+
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ ok: true }));
       } catch (e) {
