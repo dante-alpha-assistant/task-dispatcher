@@ -711,14 +711,14 @@ async function buildContextBlockWithTimeout(task) {
 
 // --- Dispatch task to agent via /hooks/agent ---
 async function dispatchToAgent(task) {
-  // Never dispatch to disabled agents — remap or reset to todo
+  // Never dispatch to disabled/degraded agents — remap or reset to todo
   if (task.assigned_agent) {
     const { data: agentCard } = await supabase
       .from('agent_cards')
       .select('status')
       .ilike('name', task.assigned_agent)
       .single();
-    if (agentCard?.status === 'disabled') {
+    if (agentCard?.status === 'disabled' || agentCard?.status === 'degraded') {
       // Try to find the -worker variant of this agent
       const workerName = task.assigned_agent.toLowerCase() + '-worker';
       const { data: workerCard } = await supabase
@@ -726,8 +726,8 @@ async function dispatchToAgent(task) {
         .select('status')
         .ilike('name', workerName)
         .single();
-      if (workerCard && workerCard.status !== 'disabled') {
-        console.log(`[REMAP] Agent ${task.assigned_agent} is disabled, remapping task ${task.id} → ${workerName}`);
+      if (workerCard && workerCard.status !== 'disabled' && workerCard.status !== 'degraded') {
+        console.log(`[REMAP] Agent ${task.assigned_agent} is disabled/degraded, remapping task ${task.id} → ${workerName}`);
         task.assigned_agent = workerName;
         await supabase
           .from('agent_tasks')
@@ -735,7 +735,7 @@ async function dispatchToAgent(task) {
           .eq('id', task.id);
       } else {
         // No worker variant available — reset to todo for scheduler to pick up
-        console.log(`[SKIP] Agent ${task.assigned_agent} is disabled, resetting task ${task.id} to todo`);
+        console.log(`[SKIP] Agent ${task.assigned_agent} is disabled/degraded, resetting task ${task.id} to todo`);
         await supabase
           .from('agent_tasks')
           .update({ status: 'todo', assigned_agent: null, started_at: null, error: null })
@@ -1793,11 +1793,11 @@ async function scheduler() {
 
     if (available.length === 0) return;
 
-    // Belt-and-suspenders: fetch disabled agents and exclude them
+    // Belt-and-suspenders: fetch disabled/degraded agents and exclude them
     const { data: disabledAgents } = await supabase
       .from('agent_cards')
       .select('name')
-      .eq('status', 'disabled');
+      .in('status', ['disabled', 'degraded']);
     const disabledNames = new Set((disabledAgents || []).map(a => a.name.toLowerCase()));
     const availableFiltered = available.filter(a => !disabledNames.has(a.name));
     if (availableFiltered.length === 0) return;
@@ -1824,18 +1824,18 @@ async function scheduler() {
     let assigned = 0;
 
     for (const task of todoTasks) {
-      // Respect assigned_agent hint — but remap disabled agents
+      // Respect assigned_agent hint — but remap disabled/degraded agents
       if (task.assigned_agent) {
         let hintAgent = task.assigned_agent.toLowerCase();
-        // If hint points to a disabled agent, try the -worker variant
+        // If hint points to a disabled/degraded agent, try the -worker variant
         if (disabledNames.has(hintAgent)) {
           const workerVariant = hintAgent + '-worker';
           if (!disabledNames.has(workerVariant)) {
-            console.log(`[SCHEDULER] Remapping disabled hint ${hintAgent} → ${workerVariant} for task ${task.id}`);
+            console.log(`[SCHEDULER] Remapping disabled/degraded hint ${hintAgent} → ${workerVariant} for task ${task.id}`);
             hintAgent = workerVariant;
           } else {
-            // Both disabled — clear hint and let capability-based routing handle it
-            console.log(`[SCHEDULER] Hint ${hintAgent} is disabled, clearing for task ${task.id}`);
+            // Both unavailable — clear hint and let capability-based routing handle it
+            console.log(`[SCHEDULER] Hint ${hintAgent} is disabled/degraded, clearing for task ${task.id}`);
             await supabase.from("agent_tasks").update({ assigned_agent: null }).eq("id", task.id);
             // Fall through to capability-based assignment below
           }
@@ -1908,29 +1908,86 @@ async function scheduler() {
   }
 }
 
-// Stale agent detection — mark agents offline if last_heartbeat > 10min ago
+// Stale agent detection — mark agents degraded if last_heartbeat > 10min, offline if > 30min
+// On degrade: requeue any in_progress tasks so they aren't stranded
 const STALE_AGENT_INTERVAL = 60_000;
+const DEGRADE_THRESHOLD_MS = 10 * 60 * 1000;  // 10 minutes → degraded
+const OFFLINE_THRESHOLD_MS = 30 * 60 * 1000;  // 30 minutes → offline
+
+async function requeueAgentTasks(agentName) {
+  // Find in_progress tasks assigned to this agent and reset to todo
+  const { data: tasks, error } = await supabase
+    .from('agent_tasks')
+    .select('id, title')
+    .eq('assigned_agent', agentName)
+    .eq('status', 'in_progress');
+  if (error) {
+    console.error(`[REQUEUE] Failed to query tasks for ${agentName}:`, error.message);
+    return 0;
+  }
+  let requeued = 0;
+  for (const task of (tasks || [])) {
+    const { error: updateErr } = await supabase
+      .from('agent_tasks')
+      .update({ status: 'todo', assigned_agent: null })
+      .eq('id', task.id);
+    if (updateErr) {
+      console.error(`[REQUEUE] Failed to requeue task ${task.id}:`, updateErr.message);
+    } else {
+      console.log(`[REQUEUE] Requeued task ${task.id} (${task.title}) from degraded agent ${agentName}`);
+      requeued++;
+    }
+  }
+  return requeued;
+}
+
 async function staleAgentDetector() {
   try {
-    const tenMinAgo = new Date(Date.now() - 10 * 60 * 1000).toISOString();
-    const { data, error } = await supabase
+    const now = Date.now();
+    const degradeThreshold = new Date(now - DEGRADE_THRESHOLD_MS).toISOString();
+    const offlineThreshold = new Date(now - OFFLINE_THRESHOLD_MS).toISOString();
+
+    // Phase 1: Mark degraded agents as offline if heartbeat > 30min stale
+    const { data: degradedStale } = await supabase
+      .from('agent_cards')
+      .select('id, name, status, last_heartbeat')
+      .eq('status', 'degraded')
+      .lt('last_heartbeat', offlineThreshold);
+    for (const agent of (degradedStale || [])) {
+      console.log(`[STALE] Marking ${agent.name} as offline (degraded for >30min, last_heartbeat: ${agent.last_heartbeat})`);
+      await supabase
+        .from('agent_cards')
+        .update({ status: 'offline', metadata: { model_health: 'offline', degraded_at: agent.metadata?.degraded_at } })
+        .eq('id', agent.id);
+    }
+
+    // Phase 2: Mark online agents as degraded if heartbeat > 10min stale
+    const { data: onlineStale, error } = await supabase
       .from('agent_cards')
       .select('id, name, status, last_heartbeat')
       .eq('status', 'online')
-      .lt('last_heartbeat', tenMinAgo);
+      .lt('last_heartbeat', degradeThreshold);
     if (error) {
       console.error('[STALE] Failed to check stale agents:', error.message);
       return;
     }
-    for (const agent of (data || [])) {
-      // Skip worker pods — they don't have heartbeat crons yet
-      if (agent.name.endsWith('-worker')) continue;
-      console.log(`[STALE] Marking ${agent.name} as offline (last_heartbeat: ${agent.last_heartbeat})`);
+    for (const agent of (onlineStale || [])) {
+      const reason = `Heartbeat stale since ${agent.last_heartbeat} — possible model API failure (403/429/timeout)`;
+      console.log(`[STALE] Marking ${agent.name} as degraded (last_heartbeat: ${agent.last_heartbeat})`);
       await supabase
         .from('agent_cards')
-        .update({ status: 'offline' })
+        .update({
+          status: 'degraded',
+          metadata: { model_health: 'degraded', degraded_at: new Date().toISOString(), reason }
+        })
         .eq('id', agent.id)
         .neq('status', 'disabled');
+
+      // CRITICAL: Requeue in_progress tasks from this agent
+      const requeued = await requeueAgentTasks(agent.name);
+      if (requeued > 0) {
+        console.log(`[STALE] Requeued ${requeued} tasks from degraded agent ${agent.name}`);
+      }
     }
   } catch (err) {
     console.error('[STALE] Error:', err.message);
