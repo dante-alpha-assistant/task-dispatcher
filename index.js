@@ -2247,19 +2247,10 @@ async function autoDeployDetector() {
           }
         }
       } else {
-        // No PR number in result — fall back to ArgoCD sync check
-        // If ArgoCD synced after task completion, the image likely includes this task's changes
-        if (devSynced && devSyncTime && devSyncTime > completedAt) {
-          isDeployed = true;
-          deployEnv = "dev";
-        }
-        if (prodSynced && prodSyncTime && prodSyncTime > completedAt) {
-          isDeployed = true;
-          deployEnv = deployEnv ? "dev+prod" : "prod";
-        }
-        if (isDeployed) {
-          console.log(`[DEPLOY-DETECT] Task ${task.id} ("${task.title.slice(0, 40)}") no PR ref, but ArgoCD synced after completion → deployed (${deployEnv})`);
-        }
+        // No PR number in result — cannot verify deployment
+        // Do NOT auto-promote based on ArgoCD sync alone (produces false positives)
+        // Tasks without PR refs stay in completed until manually promoted
+        console.log(`[DEPLOY-DETECT] Task ${task.id} ("${task.title.slice(0, 40)}") no PR ref — skipping (manual promotion required)`);
       }
 
       if (isDeployed) {
