@@ -14,49 +14,112 @@ const MAX_QA_WORKERS = 3;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
-// Agent registry: name → gateway hook URL + token
-const AGENTS = {
-  neo: {
-    url: process.env.NEO_HOOKS_URL || `http://neo.agents.svc.cluster.local:18789/hooks/agent`,
-    token: process.env.NEO_HOOKS_TOKEN,
-    gatewayToken: process.env.NEO_GATEWAY_TOKEN,
-  },
-  mu: {
-    url: process.env.MU_HOOKS_URL || `http://mu.agents.svc.cluster.local:18789/hooks/agent`,
-    token: process.env.MU_HOOKS_TOKEN,
-    gatewayToken: process.env.MU_GATEWAY_TOKEN,
-  },
-  beta: {
-    url: process.env.BETA_HOOKS_URL || `http://beta.agents.svc.cluster.local:18789/hooks/agent`,
-    token: process.env.BETA_HOOKS_TOKEN,
-    gatewayToken: process.env.BETA_GATEWAY_TOKEN,
-  },
-  flow: {
-    url: process.env.FLOW_HOOKS_URL || `http://flow.agents.svc.cluster.local:18789/hooks/agent`,
-    token: process.env.FLOW_HOOKS_TOKEN,
-    gatewayToken: process.env.FLOW_GATEWAY_TOKEN,
-  },
-  ifra: {
-    url: process.env.IFRA_HOOKS_URL || `http://ifra.agents.svc.cluster.local:18789/hooks/agent`,
-    token: process.env.IFRA_HOOKS_TOKEN,
-    gatewayToken: process.env.IFRA_GATEWAY_TOKEN,
-  },
-  "neo-worker": {
-    url: process.env.NEO_WORKER_HOOKS_URL || `http://neo-worker.agents.svc.cluster.local:18789/hooks/agent`,
-    token: process.env.NEO_WORKER_HOOKS_TOKEN,
-    gatewayToken: process.env.NEO_WORKER_GATEWAY_TOKEN,
-  },
-  "ifra-worker": {
-    url: process.env.IFRA_WORKER_HOOKS_URL || `http://ifra-worker.agents.svc.cluster.local:18789/hooks/agent`,
-    token: process.env.IFRA_WORKER_HOOKS_TOKEN,
-    gatewayToken: process.env.IFRA_WORKER_GATEWAY_TOKEN,
-  },
-  "beta-worker": {
-    url: process.env.BETA_WORKER_HOOKS_URL || `http://beta-worker.agents.svc.cluster.local:18789/hooks/agent`,
-    token: process.env.BETA_WORKER_HOOKS_TOKEN || "beta-worker-hooks-tok-2026",
-    gatewayToken: process.env.BETA_WORKER_GATEWAY_TOKEN || "beta-worker-gw-tok-2026",
-  },
-};
+// --- Dynamic Agent Registry (from agent_cards table) ---
+// Cache: agentName -> { url, token, gatewayToken, cachedAt }
+const agentConnectionCache = new Map();
+const AGENT_CACHE_TTL = 30_000; // 30 seconds
+
+async function getAgentConnection(agentName) {
+  if (!agentName) return null;
+  const name = agentName.toLowerCase();
+  const cached = agentConnectionCache.get(name);
+  if (cached && Date.now() - cached.cachedAt < AGENT_CACHE_TTL) {
+    return cached.url ? cached : null;
+  }
+  try {
+    const { data, error } = await supabase
+      .from('agent_cards')
+      .select('hooks_url, hooks_token, gateway_token')
+      .ilike('name', name)
+      .single();
+    if (error || !data) {
+      console.warn(`[AGENT-CACHE] No agent_card found for "${name}": ${error?.message || 'not found'}`);
+      agentConnectionCache.set(name, { url: null, token: null, gatewayToken: null, cachedAt: Date.now() });
+      return null;
+    }
+    const entry = {
+      url: data.hooks_url,
+      token: data.hooks_token,
+      gatewayToken: data.gateway_token,
+      cachedAt: Date.now(),
+    };
+    agentConnectionCache.set(name, entry);
+    return entry.url ? entry : null;
+  } catch (e) {
+    console.error(`[AGENT-CACHE] Error fetching agent_card for "${name}":`, e.message);
+    return null;
+  }
+}
+
+// Bulk-load all agent connections into cache
+async function refreshAgentCache() {
+  try {
+    const { data, error } = await supabase
+      .from('agent_cards')
+      .select('name, hooks_url, hooks_token, gateway_token')
+      .not('hooks_url', 'is', null);
+    if (error) {
+      console.error('[AGENT-CACHE] Bulk refresh failed:', error.message);
+      return;
+    }
+    const now = Date.now();
+    for (const row of (data || [])) {
+      agentConnectionCache.set(row.name.toLowerCase(), {
+        url: row.hooks_url,
+        token: row.hooks_token,
+        gatewayToken: row.gateway_token,
+        cachedAt: now,
+      });
+    }
+    console.log(`[AGENT-CACHE] Refreshed ${(data || []).length} agent connections`);
+  } catch (e) {
+    console.error('[AGENT-CACHE] Bulk refresh error:', e.message);
+  }
+}
+
+function invalidateAgentCache() {
+  agentConnectionCache.clear();
+  console.log('[AGENT-CACHE] Cache invalidated');
+}
+
+// Dynamic QA agent selection: pick online agent with "qa" capability and lowest load
+async function pickQaAgent() {
+  try {
+    const { data: qaAgents, error } = await supabase
+      .from('agent_cards')
+      .select('name, hooks_url, hooks_token, gateway_token, max_capacity')
+      .eq('status', 'online')
+      .not('hooks_url', 'is', null)
+      .not('hooks_token', 'is', null)
+      .contains('task_types', ['qa']);
+    if (error || !qaAgents?.length) {
+      console.warn('[QA-ROUTE] No online QA agents found');
+      return null;
+    }
+    // Get load for each QA agent
+    const { data: activeTasks_qa } = await supabase
+      .from('agent_tasks')
+      .select('assigned_agent, qa_agent')
+      .in('status', ['assigned', 'in_progress', 'qa_testing']);
+    const loadMap = {};
+    for (const t of (activeTasks_qa || [])) {
+      const agent = (t.qa_agent || t.assigned_agent || '').toLowerCase();
+      loadMap[agent] = (loadMap[agent] || 0) + 1;
+    }
+    // Pick lowest load
+    qaAgents.sort((a, b) => (loadMap[a.name.toLowerCase()] || 0) - (loadMap[b.name.toLowerCase()] || 0));
+    const picked = qaAgents[0];
+    return {
+      name: picked.name,
+      url: picked.hooks_url,
+      token: picked.hooks_token,
+      gatewayToken: picked.gateway_token,
+    };
+  } catch (e) {
+    console.error('[QA-ROUTE] Error picking QA agent:', e.message);
+    return null;
+  }
+}
 
 // Only fetch online agents — disabled agents are never auto-assigned or dispatched to
 async function getAgentCards() {
@@ -84,7 +147,7 @@ const PRIORITY_ORDER = { urgent: 0, high: 1, normal: 2, low: 3 };
 // Check if an agent is currently busy by querying their gateway's sessions_list.
 // Returns true if the agent has active sessions (Discord, hooks, sub-agents) updated recently.
 async function checkAgentBusy(agentName) {
-  const agent = AGENTS[agentName];
+  const agent = await getAgentConnection(agentName);
   if (!agent?.gatewayToken) return false; // No token = can't check = assume free
   
   const gatewayBase = agent.url.replace(/\/hooks\/agent$/, '');
@@ -179,7 +242,7 @@ async function checkAgentBusy(agentName) {
 // Verify agent gateway credentials before dispatching a task.
 // Prevents: token expires → dispatch → session can't call LLM → 10min timeout → requeue loop
 async function preflightAuthCheck(agentName) {
-  const agent = AGENTS[agentName];
+  const agent = await getAgentConnection(agentName);
   if (!agent?.gatewayToken) return { ok: true, status: 0 }; // No token configured = skip check
 
   const gatewayBase = agent.url.replace(/\/hooks\/agent$/, '');
@@ -750,7 +813,7 @@ async function dispatchToAgent(task) {
   const SESSION_THRESHOLD = 5;
   if (agentName?.endsWith('-worker')) {
     try {
-      const agent = AGENTS[agentName];
+      const agent = await getAgentConnection(agentName);
       if (agent?.gatewayToken) {
         const sessResp = await fetch(`http://${agentName}.agents.svc.cluster.local:18789/tools/invoke`, {
           method: 'POST',
@@ -803,15 +866,15 @@ async function dispatchToAgent(task) {
     console.log(`[DISPATCH] Factory fallback: dispatching coding task ${task.id} to agent`);
   }
 
-  const agent = AGENTS[agentName];
+  const agent = await getAgentConnection(agentName);
 
   if (!agent) {
-    console.error(`[SKIP] Unknown agent: ${agentName} for task ${task.id}`);
+    console.warn(`[SKIP] No connection info in agent_cards for: ${agentName} (task ${task.id})`);
     return;
   }
 
   if (!agent.token) {
-    console.error(`[SKIP] No token for agent: ${agentName}`);
+    console.error(`[SKIP] No hooks_token for agent: ${agentName}`);
     return;
   }
 
@@ -1150,7 +1213,7 @@ async function assignQueuedQATasks() {
 // --- Subscribe to Realtime changes ---
 function subscribe() {
   console.log("[BOOT] Task Dispatcher starting...");
-  console.log(`[BOOT] Agents: ${Object.keys(AGENTS).join(", ")}`);
+  console.log(`[BOOT] Agent routing: dynamic (from agent_cards table)`);
 
   const channel = supabase
     .channel("agent-tasks-changes")
@@ -1310,12 +1373,12 @@ curl -s -X PATCH "https://lessxkxujvcmublgwdaa.supabase.co/rest/v1/agent_tasks?i
   -d '{"status":"failed","completed_at":"'$(date -u +%Y-%m-%dT%H:%M:%SZ)'","qa_result":{"passed":false,"failures":["SPECIFIC ISSUE"]}}'
 \`\`\``;
 
-            const betaAgent = AGENTS.beta;
-            if (betaAgent?.token) {
-              const resp = await fetch(betaAgent.url, {
+            const qaAgent = await pickQaAgent();
+            if (qaAgent?.token) {
+              const resp = await fetch(qaAgent.url, {
                 method: "POST",
                 headers: {
-                  Authorization: `Bearer ${betaAgent.token}`,
+                  Authorization: `Bearer ${qaAgent.token}`,
                   "Content-Type": "application/json",
                 },
                 body: JSON.stringify({
@@ -1327,11 +1390,11 @@ curl -s -X PATCH "https://lessxkxujvcmublgwdaa.supabase.co/rest/v1/agent_tasks?i
               });
 
               if (resp.ok) {
-                console.log(`[QA] Dispatched task ${task.id} to beta for QA review`);
+                console.log(`[QA] Dispatched task ${task.id} to ${qaAgent.name} for QA review`);
                 // Move to qa_testing in one step (no intermediate 'qa' status)
                 await supabase
                   .from("agent_tasks")
-                  .update({ status: "qa_testing", qa_agent: "beta-worker" })
+                  .update({ status: "qa_testing", qa_agent: qaAgent.name })
                   .eq("id", task.id);
 
                 // Trigger auto-scaler if queue is building up
@@ -1420,7 +1483,8 @@ createServer(async (req, res) => {
       try {
         const auth = req.headers.authorization || "";
         const token = auth.replace("Bearer ", "");
-        const knownTokens = Object.values(AGENTS).map(a => a.token).filter(Boolean);
+        // Validate against cached agent tokens (refreshed every 30s)
+        const knownTokens = [...agentConnectionCache.values()].map(a => a.token).filter(Boolean);
         if (!token || !knownTokens.includes(token)) {
           res.writeHead(401, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: "Unauthorized" }));
@@ -1497,7 +1561,7 @@ async function taskMonitor() {
       const agentName = isQaTesting
         ? (task.qa_agent?.toLowerCase() || "beta-worker")
         : task.assigned_agent?.toLowerCase();
-      const agent = AGENTS[agentName];
+      const agent = await getAgentConnection(agentName);
 
       if (!agent) continue;
 
@@ -2071,6 +2135,22 @@ async function autoDeployDetector() {
 }
 
 // --- Start ---
+// Pre-load agent connection cache, then subscribe to changes for invalidation
+refreshAgentCache();
+
+// Subscribe to agent_cards changes to invalidate cache in real-time
+supabase
+  .channel("agent-cards-changes")
+  .on(
+    "postgres_changes",
+    { event: "*", schema: "public", table: "agent_cards" },
+    () => {
+      console.log("[AGENT-CACHE] agent_cards changed, invalidating cache");
+      invalidateAgentCache();
+    }
+  )
+  .subscribe();
+
 subscribe();
 
 // Auto-scheduler
