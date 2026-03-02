@@ -738,7 +738,7 @@ async function dispatchToAgent(task) {
         console.log(`[SKIP] Agent ${task.assigned_agent} is disabled, resetting task ${task.id} to todo`);
         await supabase
           .from('agent_tasks')
-          .update({ status: 'todo', assigned_agent: null, started_at: null })
+          .update({ status: 'todo', assigned_agent: null, started_at: null, error: null })
           .eq('id', task.id);
         return;
       }
@@ -791,7 +791,7 @@ async function dispatchToAgent(task) {
         status: 'todo',
         assigned_agent: null,
         started_at: null,
-        error: `Auth preflight failed for ${agentName} (HTTP ${authCheck.status})`,
+        error: null,
       })
       .eq('id', task.id);
     return;
@@ -1255,6 +1255,7 @@ function subscribe() {
                 status: 'todo',
                 assigned_agent: null,
                 started_at: null,
+                error: null,
               }).eq('id', task.id);
             } else {
               console.log(`[DISPATCH] Task ${task.id} → ${task.assigned_agent}`);
