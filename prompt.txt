@@ -1,13 +1,27 @@
-Add an auth preflight check to the task dispatcher in index.js.
+# Task Dispatcher — Prompt Reference
 
-Requirements:
-1. Add a preflightAuthCheck(agentName) function right after the existing checkAgentBusy function. It should POST to the agent gateway /tools/invoke with { tool: "sessions_list", parameters: { limit: 1, messageLimit: 0 } } using agent.gatewayToken as Bearer auth. Returns { ok: boolean, status: number, error?: string }. 5s AbortSignal timeout. On 200 return {ok:true, status:200}. On 401/403 return {ok:false, status: res.status}. On network error return {ok:false, status:0, error: err.message}.
+This file documents the dispatch prompt structure used by the task dispatcher.
 
-2. In dispatchToAgent(), after the disabled-agent check (the if block that checks agentCard?.status === 'disabled') and BEFORE the factory routing (the if block checking task.type === 'coding'), add preflight auth check. Resolve agentName from task.assigned_agent?.toLowerCase(). Call preflightAuthCheck(agentName). If !result.ok: log "[AUTH-PREFLIGHT] Agent ${agentName} failed auth check (HTTP ${result.status}), skipping task ${task.id}", reset the task in supabase to {status:'todo', assigned_agent:null, started_at:null, error:'Auth preflight failed for agentName (HTTP status)'}, and return early.
+## Dispatch Flow
 
-3. In checkAgentBusy(), where it currently has the log line with "gateway returned status, treating as busy", add a check: if res.status is 401 or 403, log "[BUSY-CHECK] agentName: AUTH FAILED (status), credentials invalid" instead of the generic message. Still return true.
+1. Task enters `assigned` status in Supabase
+2. Dispatcher builds the dispatch message with:
+   - JSON task payload (task_id, title, description, type, priority, etc.)
+   - Context block (institutional memory: previous results, failed tasks, online agents)
+   - Coding task section (if type=coding) — triggers the coding-task skill
+   - Status update commands (curl for success/failure)
+3. Message is POSTed to the agent's /hooks/agent endpoint
 
-After making all changes, run these git commands:
-git add -A
-git commit -m "feat: add auth preflight check before task dispatch (fixes #16)"
-git push origin feat/auth-preflight
+## Coding Task Skill Trigger
+
+For `type: "coding"` tasks, the dispatcher injects a `## Coding Task` section that instructs
+the worker agent to read `skills/coding-task/SKILL.md` and follow it step by step.
+
+The skill covers: git setup, repo prep, branching, building, testing, PR creation, and status updates.
+
+## Known Repos
+- queue-dashboard — Dashboard frontend (Vite) + Express backend
+- task-dispatcher — This service (Node.js ESM)
+- dante-gitops — K8s manifests + ArgoCD configs
+
+All under github.com/dante-alpha-assistant.

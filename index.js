@@ -826,15 +826,18 @@ async function dispatchToAgent(task) {
   const contextBlock = await buildContextBlockWithTimeout(task);
 
   // Build coding task section if applicable
+  // This section triggers the coding-task skill in worker agents.
+  // The skill is installed at skills/coding-task/SKILL.md in every worker's workspace.
   const codingTaskSection = task.type === "coding" ? `
+
 ## Coding Task
 
-**Use the coding-task skill for this work.** Read \`skills/coding-task/SKILL.md\` and follow it step by step.
+**⚠️ MANDATORY: Use the coding-task skill for this work.** Read \`skills/coding-task/SKILL.md\` and follow it step by step.
 
-- **Repo:** ${task.repo || "See task description for target repo(s)"}
-- **Branch convention:** \`feat/<short-description>\` or \`fix/<short-description>\`
-- **PR template:** Include task ID, summary of changes, and testing notes
-- **Known repos:** queue-dashboard, task-dispatcher, dante-gitops (all under dante-alpha-assistant)
+- **Repo:** ${task.repo || "Identify from the task description. Known repos: queue-dashboard, task-dispatcher, dante-gitops (all under dante-alpha-assistant)"}
+- **Branch:** \`feat/<short-description>\` or \`fix/<short-description>\`
+- **Build:** Always verify changes compile/build before committing
+- **PR:** Include task ID, summary, and testing notes in the PR body
 ` : "";
 
   const message = `\`\`\`json
