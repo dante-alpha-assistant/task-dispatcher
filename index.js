@@ -1286,11 +1286,11 @@ function subscribe() {
           }
         }
 
-        // When task transitions to qa_testing or done: clear assigned_agent
-        // The coding agent is done — assigned_agent should reflect current owner (nobody until QA picks up)
-        if (task && (task.status === 'qa_testing' || task.status === 'done') && eventType === 'UPDATE' && prev?.status !== task.status) {
+        // When task transitions to qa_testing: clear assigned_agent
+        // The coding agent is done — assigned_agent should reflect current owner (nobody until scheduler assigns QA agent)
+        if (task && task.status === 'qa_testing' && eventType === 'UPDATE' && prev?.status !== task.status) {
           if (task.assigned_agent) {
-            console.log(`[UNASSIGN] Task ${task.id} → ${task.status}, clearing assigned_agent (was: ${task.assigned_agent})`);
+            console.log(`[UNASSIGN] Task ${task.id} → qa_testing, clearing assigned_agent (was: ${task.assigned_agent})`);
             await supabase
               .from('agent_tasks')
               .update({ assigned_agent: null })
@@ -1333,32 +1333,21 @@ function subscribe() {
           }
         }
 
-        // QA routing: when task moves to "qa_testing" with no qa_agent, dispatch to Beta
-        // Agents now set qa_testing directly (no intermediate "done" status)
-        if (task?.status === "qa_testing" && eventType === "UPDATE" && prev?.status !== "qa_testing" && !task.qa_agent) {
+        // QA dispatch: when scheduler assigns a QA agent to a qa_testing task, dispatch the review
+        if (task?.status === "qa_testing" && eventType === "UPDATE" && task.assigned_agent && !prev?.assigned_agent) {
           // Don't QA tasks that were already QA'd (prevent loops)
           if (task.type === "qa") return;
 
-          console.log(`[QA] Task ${task.id} ("${task.title}") → qa_testing (unassigned), dispatching to beta`);
+          const qaAgentName = task.assigned_agent.toLowerCase();
+          const qaAgent = AGENTS[qaAgentName];
+          if (!qaAgent?.token) {
+            console.error(`[QA] No token for QA agent ${qaAgentName}, task ${task.id}`);
+            return;
+          }
+
+          console.log(`[QA] Dispatching QA review for task ${task.id} ("${task.title}") → ${qaAgentName}`);
 
           try {
-
-            // Dispatch the SAME task to Beta for review
-            const qaPayload = JSON.stringify({
-              task_id: task.id,
-              title: task.title,
-              description: task.description,
-              acceptance_criteria: task.acceptance_criteria,
-              type: task.type,
-              priority: task.priority,
-              stage: task.stage,
-              parent_task_id: task.parent_task_id,
-              dispatched_by: task.dispatched_by,
-              repo: task.repo,
-              branch: task.branch,
-              context: task.context,
-            }, null, 2);
-
             const qaContextBlock = await buildContextBlockWithTimeout(task);
             const taskType = task.type || 'general';
             const resultStr = typeof task.result === 'string' ? task.result : JSON.stringify(task.result || {});
@@ -1390,6 +1379,18 @@ DO NOT spend more than 2 minutes on this review.`;
               timeLimit = '2 minutes';
             }
 
+            const qaPayload = JSON.stringify({
+              task_id: task.id,
+              title: task.title,
+              description: task.description,
+              acceptance_criteria: task.acceptance_criteria,
+              type: task.type,
+              priority: task.priority,
+              stage: task.stage,
+              parent_task_id: task.parent_task_id,
+              dispatched_by: task.dispatched_by,
+            }, null, 2);
+
             const qaMessage = `\`\`\`json
 ${qaPayload}
 \`\`\`
@@ -1398,7 +1399,6 @@ ${qaContextBlock}## QA Review: ${task.title}
 
 **Task ID:** ${task.id}
 **Type:** ${taskType} | **Time limit:** ${timeLimit}
-**Originally assigned to:** ${task.assigned_agent}
 
 ### Description
 ${task.description || "(none)"}
@@ -1411,11 +1411,8 @@ ${qaScope}
 ### Update task status when done:
 
 **If QA passes (coding tasks — MERGE FIRST):**
-If this is a coding task with a PR, merge it BEFORE updating status:
 \`\`\`bash
-# Step 1: Merge the PR (squash merge, delete branch)
 gh pr merge <PR_NUMBER> -R <REPO> --squash --delete-branch
-# Step 2: Then update task status
 curl -s -X PATCH "https://lessxkxujvcmublgwdaa.supabase.co/rest/v1/agent_tasks?id=eq.${task.id}" \\
   -H "apikey: ${SUPABASE_KEY}" \\
   -H "Authorization: Bearer ${SUPABASE_KEY}" \\
@@ -1432,45 +1429,27 @@ curl -s -X PATCH "https://lessxkxujvcmublgwdaa.supabase.co/rest/v1/agent_tasks?i
   -d '{"status":"failed","completed_at":"'$(date -u +%Y-%m-%dT%H:%M:%SZ)'","qa_result":{"passed":false,"failures":["SPECIFIC ISSUE"]}}'
 \`\`\``;
 
-            const betaAgent = AGENTS["beta-worker"] || AGENTS.beta;
-            if (betaAgent?.token) {
-              const resp = await fetch(betaAgent.url, {
-                method: "POST",
-                headers: {
-                  Authorization: `Bearer ${betaAgent.token}`,
-                  "Content-Type": "application/json",
-                },
-                body: JSON.stringify({
-                  message: qaMessage,
-                  name: "Task Dispatcher (QA)",
-                  sessionKey: `hook:qa:${task.id}`,
-                  wakeMode: "now",
-                }),
-              });
+            const resp = await fetch(qaAgent.url, {
+              method: "POST",
+              headers: {
+                Authorization: `Bearer ${qaAgent.token}`,
+                "Content-Type": "application/json",
+              },
+              body: JSON.stringify({
+                message: qaMessage,
+                name: "Task Dispatcher (QA)",
+                sessionKey: `hook:qa:${task.id}`,
+                wakeMode: "now",
+              }),
+            });
 
-              if (resp.ok) {
-                console.log(`[QA] Dispatched task ${task.id} to beta for QA review`);
-                // Task is already qa_testing — assign the QA agent as current owner
-                await supabase
-                  .from("agent_tasks")
-                  .update({ qa_agent: "beta-worker", assigned_agent: "beta-worker" })
-                  .eq("id", task.id);
-
-                // Trigger auto-scaler if queue is building up
-                const { data: qaQueueCheck } = await supabase
-                  .from("agent_tasks")
-                  .select("id")
-                  .eq("status", "qa_testing")
-                  .is("qa_agent", null);
-                if (qaQueueCheck && qaQueueCheck.length > 1) {
-                  qaAutoScaler();
-                }
-              } else {
-                console.error(`[QA] Failed to dispatch to beta: ${resp.status}`);
-              }
+            if (resp.ok) {
+              console.log(`[QA] Dispatched task ${task.id} to ${qaAgentName} for QA review`);
+            } else {
+              console.error(`[QA] Failed to dispatch to ${qaAgentName}: ${resp.status}`);
             }
           } catch (e) {
-            console.error(`[QA] Error routing task ${task.id} to QA: ${e.message}`);
+            console.error(`[QA] Error dispatching task ${task.id} to QA: ${e.message}`);
           }
         }
       }
@@ -1831,6 +1810,7 @@ async function scheduler() {
     // The agent_load count + max_capacity + inflightCheck guard are sufficient.
     const freeAgents = availableFiltered;
 
+    // Fetch todo tasks for regular assignment
     const { data: todoTasks, error: todoErr } = await supabase
       .from("agent_tasks")
       .select("*")
@@ -1842,15 +1822,35 @@ async function scheduler() {
       return;
     }
 
-    if (!todoTasks?.length) return;
+    // Fetch qa_testing tasks that are unassigned (need QA-capable agent)
+    const { data: qaUnassigned, error: qaErr } = await supabase
+      .from("agent_tasks")
+      .select("*")
+      .eq("status", "qa_testing")
+      .is("assigned_agent", null)
+      .order("created_at", { ascending: true });
 
-    todoTasks.sort((a, b) => (PRIORITY_ORDER[a.priority] ?? 2) - (PRIORITY_ORDER[b.priority] ?? 2));
+    if (qaErr) {
+      console.error("[SCHEDULER] Error fetching qa_testing tasks:", qaErr.message);
+    }
+
+    // Merge: todo + unassigned qa_testing, sorted by priority (qa gets slight boost)
+    const allSchedulable = [...(todoTasks || []), ...(qaUnassigned || [])];
+    if (!allSchedulable.length) return;
+
+    allSchedulable.sort((a, b) => {
+      const aBoost = a.status === 'qa_testing' ? -0.5 : 0;
+      const bBoost = b.status === 'qa_testing' ? -0.5 : 0;
+      return ((PRIORITY_ORDER[a.priority] ?? 2) + aBoost) - ((PRIORITY_ORDER[b.priority] ?? 2) + bBoost);
+    });
 
     let assigned = 0;
 
-    for (const task of todoTasks) {
-      // Respect assigned_agent hint — but remap disabled/degraded agents
-      if (task.assigned_agent) {
+    for (const task of allSchedulable) {
+      const isQaTask = task.status === 'qa_testing';
+
+      // Respect assigned_agent hint — but remap disabled/degraded agents (todo tasks only)
+      if (!isQaTask && task.assigned_agent) {
         let hintAgent = task.assigned_agent.toLowerCase();
         // If hint points to a disabled/degraded agent, try the -worker variant
         if (disabledNames.has(hintAgent)) {
@@ -1879,11 +1879,12 @@ async function scheduler() {
         continue;
       }
 
-      const taskType = task.type || "general";
+      // For qa_testing tasks, require "qa" capability; for regular tasks, use task type
+      const requiredCapability = isQaTask ? "qa" : (task.type || "general");
 
-      // Score agents: must have capability, then rank by capacity + priority affinity
+      // Score agents: must have required capability, then rank by capacity + priority affinity
       const candidates = freeAgents
-        .filter(a => a.remaining > 0 && a.capabilities.includes(taskType))
+        .filter(a => a.remaining > 0 && a.capabilities.includes(requiredCapability))
         .map(a => {
           let score = a.remaining;
           const affinityMultiplier = a.priority_affinity[task.priority];
@@ -1913,20 +1914,36 @@ async function scheduler() {
           continue;
         }
 
-        console.log(`[SCHEDULER] Auto-assigning task ${task.id} ("${task.title}") \u2192 ${bestCandidate.name} (type: ${taskType}, remaining: ${originalAgent.remaining})`);
-        await supabase
-          .from("agent_tasks")
-          .update({ status: "assigned", assigned_agent: bestCandidate.name })
-          .eq("id", task.id);
+        if (isQaTask) {
+          // QA assignment: assign agent, keep status as qa_testing
+          console.log(`[SCHEDULER] Assigning QA task ${task.id} ("${task.title}") \u2192 ${bestCandidate.name} (qa)`);
+          await supabase
+            .from("agent_tasks")
+            .update({ assigned_agent: bestCandidate.name, qa_agent: bestCandidate.name })
+            .eq("id", task.id);
+        } else {
+          console.log(`[SCHEDULER] Auto-assigning task ${task.id} ("${task.title}") \u2192 ${bestCandidate.name} (type: ${requiredCapability}, remaining: ${originalAgent.remaining})`);
+          await supabase
+            .from("agent_tasks")
+            .update({ status: "assigned", assigned_agent: bestCandidate.name })
+            .eq("id", task.id);
+        }
         originalAgent.remaining--;
         assigned++;
       } else {
         const availableTypes = freeAgents.filter(a => a.remaining > 0).map(a => `${a.name}[${a.capabilities.join(',')}]`).join(', ') || 'none';
-        const errorMsg = `No capable agent for task type "${taskType}". Available agents: ${availableTypes}`;
+        const errorMsg = isQaTask
+          ? `No QA-capable agent available. Need "qa" capability. Available: ${availableTypes}`
+          : `No capable agent for task type "${requiredCapability}". Available agents: ${availableTypes}`;
         console.log(`[SCHEDULER] ${errorMsg} — task ${task.id}`);
+        // Write a visible note to the task (not just log)
+        const now = new Date().toISOString();
+        const existingNotes = task.notes || '';
+        const noteEntry = `[${now}] SCHEDULER: ${errorMsg}`;
+        const updatedNotes = existingNotes ? `${existingNotes}\n${noteEntry}` : noteEntry;
         await supabase
           .from("agent_tasks")
-          .update({ error: errorMsg })
+          .update({ error: errorMsg, notes: updatedNotes })
           .eq("id", task.id);
       }
     }
