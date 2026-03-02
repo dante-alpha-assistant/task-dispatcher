@@ -833,6 +833,18 @@ async function dispatchToAgent(task) {
 
   const contextBlock = await buildContextBlockWithTimeout(task);
 
+  // Build coding task section if applicable
+  const codingTaskSection = task.type === "coding" ? `
+## Coding Task
+
+**Use the coding-task skill for this work.** Read \`skills/coding-task/SKILL.md\` and follow it step by step.
+
+- **Repo:** ${task.repo || "See task description for target repo(s)"}
+- **Branch convention:** \`feat/<short-description>\` or \`fix/<short-description>\`
+- **PR template:** Include task ID, summary of changes, and testing notes
+- **Known repos:** queue-dashboard, task-dispatcher, dante-gitops (all under dante-alpha-assistant)
+` : "";
+
   const message = `\`\`\`json
 ${taskPayload}
 \`\`\`
@@ -841,6 +853,7 @@ ${contextBlock}## Task Assigned: ${task.title}
 
 ${task.description || ""}
 ${task.prompt ? `**Prompt:** ${task.prompt}` : ""}
+${codingTaskSection}
 
 **Task ID:** ${task.id}
 **Type:** ${task.type}
