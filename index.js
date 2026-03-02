@@ -837,12 +837,15 @@ async function dispatchToAgent(task) {
   const codingTaskSection = task.type === "coding" ? `
 ## Coding Task
 
-**Use the coding-task skill for this work.** Read \`skills/coding-task/SKILL.md\` and follow it step by step.
+**⚠️ MANDATORY: Read \`skills/coding-task/SKILL.md\` BEFORE starting any work.** Follow it step by step.
+
+The coding-task skill covers: git setup → repo clone/pull → feature branch → code changes → build/test → commit → PR creation → status update.
 
 - **Repo:** ${task.repo || "See task description for target repo(s)"}
 - **Branch convention:** \`feat/<short-description>\` or \`fix/<short-description>\`
 - **PR template:** Include task ID, summary of changes, and testing notes
 - **Known repos:** queue-dashboard, task-dispatcher, dante-gitops (all under dante-alpha-assistant)
+- **Git org:** dante-alpha-assistant
 ` : "";
 
   const message = `\`\`\`json

@@ -1,13 +1,30 @@
-Add an auth preflight check to the task dispatcher in index.js.
+# Task Dispatcher — Prompt Reference
 
-Requirements:
-1. Add a preflightAuthCheck(agentName) function right after the existing checkAgentBusy function. It should POST to the agent gateway /tools/invoke with { tool: "sessions_list", parameters: { limit: 1, messageLimit: 0 } } using agent.gatewayToken as Bearer auth. Returns { ok: boolean, status: number, error?: string }. 5s AbortSignal timeout. On 200 return {ok:true, status:200}. On 401/403 return {ok:false, status: res.status}. On network error return {ok:false, status:0, error: err.message}.
+## Coding Task Dispatch
+When dispatching a coding task (type === "coding"), the dispatcher:
+1. Attempts factory pipeline first (Dante ID)
+2. Falls back to agent dispatch if factory fails
+3. Includes a `## Coding Task` section telling the agent to read `skills/coding-task/SKILL.md`
+4. The coding-task skill guides the agent through: parse → git setup → clone/pull → branch → code → build → commit → PR → status update
 
-2. In dispatchToAgent(), after the disabled-agent check (the if block that checks agentCard?.status === 'disabled') and BEFORE the factory routing (the if block checking task.type === 'coding'), add preflight auth check. Resolve agentName from task.assigned_agent?.toLowerCase(). Call preflightAuthCheck(agentName). If !result.ok: log "[AUTH-PREFLIGHT] Agent ${agentName} failed auth check (HTTP ${result.status}), skipping task ${task.id}", reset the task in supabase to {status:'todo', assigned_agent:null, started_at:null, error:'Auth preflight failed for agentName (HTTP status)'}, and return early.
+## Skill Trigger
+The dispatcher injects this section for coding tasks:
+```
+## Coding Task
+**Use the coding-task skill for this work.** Read `skills/coding-task/SKILL.md` and follow it step by step.
+```
 
-3. In checkAgentBusy(), where it currently has the log line with "gateway returned status, treating as busy", add a check: if res.status is 401 or 403, log "[BUSY-CHECK] agentName: AUTH FAILED (status), credentials invalid" instead of the generic message. Still return true.
+All worker agents (neo-worker, ifra-worker, beta-worker, and worker-template-based agents)
+have the coding-task skill pre-installed in their workspace at `skills/coding-task/SKILL.md`.
 
-After making all changes, run these git commands:
-git add -A
-git commit -m "feat: add auth preflight check before task dispatch (fixes #16)"
-git push origin feat/auth-preflight
+## Task Types
+- `coding` → coding-task skill (clone, branch, PR workflow)
+- `ops` → direct execution (kubectl, curl, etc.)
+- `review` → code review (read PR, comment)
+- `qa` → QA testing (verify task results)
+- `research` → web search, analysis
+- `general` → flexible
+
+## Status Flow
+todo → assigned → in_progress → qa_testing → completed → deployed
+                                             → failed (on error)
