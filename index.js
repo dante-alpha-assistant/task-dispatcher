@@ -439,7 +439,7 @@ async function checkParentCompletion(task) {
 
   if (!siblings?.length) return;
 
-  const terminal = ['done', 'completed', 'failed'];
+  const terminal = ['done', 'completed', 'failed', 'deprecated'];
   const allTerminal = siblings.every(s => terminal.includes(s.status));
 
   if (!allTerminal) {
@@ -1265,7 +1265,7 @@ function subscribe() {
         }
 
         // Remove completed/failed tasks from active tracking
-        if (task?.status === 'done' || task?.status === 'failed' || task?.status === 'completed' || task?.status === 'deployed') {
+        if (task?.status === 'done' || task?.status === 'failed' || task?.status === 'completed' || task?.status === 'deployed' || task?.status === 'deprecated') {
           if (activeTasks.has(task.id)) {
             console.log(`[TRACKER] Task ${task.id} completed (${task.status}), removing from active tracking`);
             activeTasks.delete(task.id);
@@ -1591,7 +1591,7 @@ async function taskMonitor() {
         .select("status")
         .eq("id", task.id)
         .single();
-      if (freshTask && ["done", "failed", "completed"].includes(freshTask.status)) {
+      if (freshTask && ["done", "failed", "completed", "deprecated"].includes(freshTask.status)) {
         continue;
       }
 
