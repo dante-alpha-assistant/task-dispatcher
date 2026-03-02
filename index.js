@@ -747,9 +747,10 @@ async function dispatchToAgent(task) {
 
   const agentName = task.assigned_agent?.toLowerCase();
 
-  // Session cleanup: if worker pod has too many stale sessions, restart it
-  const SESSION_THRESHOLD = 5;
-  if (agentName?.endsWith('-worker')) {
+  // DISABLED: Session cleanup was restarting pods based on PVC session count,
+  // but pod restart doesn't clear PVC sessions → infinite restart loop.
+  // Agent health should be checked via heartbeat + agent_cards.status instead.
+  if (false && agentName?.endsWith('-worker')) {
     try {
       const agent = AGENTS[agentName];
       if (agent?.gatewayToken) {
@@ -762,17 +763,8 @@ async function dispatchToAgent(task) {
         if (sessResp.ok) {
           const sessData = await sessResp.json();
           const sessionCount = sessData?.result?.details?.count || sessData?.result?.details?.sessions?.length || 0;
-          if (sessionCount > SESSION_THRESHOLD) {
-            console.log(`[SESSION-CLEANUP] ${agentName} has ${sessionCount} sessions (threshold: ${SESSION_THRESHOLD}) → restarting pod`);
-            // execSync imported at top level
-            try {
-              execSync(`kubectl rollout restart deployment/${agentName} -n agents`, { timeout: 15000 });
-              // Wait for pod to come back
-              console.log(`[SESSION-CLEANUP] Waiting 30s for ${agentName} pod to restart...`);
-              await new Promise(r => setTimeout(r, 30000));
-            } catch (restartErr) {
-              console.error(`[SESSION-CLEANUP] Failed to restart ${agentName}:`, restartErr.message);
-            }
+          if (sessionCount > 5) {
+            console.log(`[SESSION-CLEANUP] ${agentName} has ${sessionCount} sessions — logging only (cleanup disabled)`);
           }
         }
       }
