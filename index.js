@@ -2074,37 +2074,59 @@ async function autoDeployDetector() {
           const { data: repo } = await supabase.from('agent_repositories').select('full_name').eq('id', task.repository_id).single();
           if (repo) repoFullName = repo.full_name;
         }
-        if (!repoFullName) repoFullName = 'dante-alpha-assistant/queue-dashboard'; // default
+        // If no repo found, try all known repos
+        const KNOWN_REPOS = ['dante-alpha-assistant/queue-dashboard', 'dante-alpha-assistant/task-dispatcher'];
+        const reposToCheck = repoFullName ? [repoFullName] : KNOWN_REPOS;
 
-        try {
-          const ghResp = await fetch(`https://api.github.com/repos/${repoFullName}/pulls/${prNumber}`, {
-            headers: { 'Authorization': `token ${process.env.GH_TOKEN}`, 'Accept': 'application/vnd.github.v3+json' },
-            signal: AbortSignal.timeout(5000),
-          });
-          if (ghResp.ok) {
-            const pr = await ghResp.json();
-            if (pr.merged && pr.merged_at) {
-              const mergedAt = new Date(pr.merged_at).getTime();
-              // PR is merged — now check if ArgoCD synced AFTER the merge
-              if (devSynced && devSyncTime && devSyncTime > mergedAt) {
-                isDeployed = true;
-                deployEnv = "dev";
+        for (const repo of reposToCheck) {
+          try {
+            const ghResp = await fetch(`https://api.github.com/repos/${repo}/pulls/${prNumber}`, {
+              headers: { 'Authorization': `token ${process.env.GH_TOKEN}`, 'Accept': 'application/vnd.github.v3+json' },
+              signal: AbortSignal.timeout(5000),
+            });
+            if (ghResp.ok) {
+              const pr = await ghResp.json();
+              if (pr.merged && pr.merged_at) {
+                repoFullName = repo;
+                const mergedAt = new Date(pr.merged_at).getTime();
+                if (devSynced && devSyncTime && devSyncTime > mergedAt) {
+                  isDeployed = true;
+                  deployEnv = "dev";
+                }
+                if (prodSynced && prodSyncTime && prodSyncTime > mergedAt) {
+                  isDeployed = true;
+                  deployEnv = deployEnv ? "dev+prod" : "prod";
+                }
+                if (!isDeployed) {
+                  console.log(`[DEPLOY-DETECT] Task ${task.id} PR #${prNumber} merged on ${repo} but ArgoCD hasn't synced since merge yet`);
+                }
+                break; // Found merged PR, stop checking other repos
+              } else if (pr.state === 'open') {
+                // PR exists but not merged — try auto-merge if task is completed (QA passed)
+                console.log(`[DEPLOY-DETECT] Task ${task.id} PR #${prNumber} on ${repo} is open — attempting auto-merge`);
+                try {
+                  const mergeResp = await fetch(`https://api.github.com/repos/${repo}/pulls/${prNumber}/merge`, {
+                    method: 'PUT',
+                    headers: { 'Authorization': `token ${process.env.GH_TOKEN}`, 'Accept': 'application/vnd.github.v3+json', 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ merge_method: 'squash', commit_title: `${pr.title} (#${prNumber})` }),
+                    signal: AbortSignal.timeout(10000),
+                  });
+                  if (mergeResp.ok) {
+                    console.log(`[DEPLOY-DETECT] Auto-merged PR #${prNumber} on ${repo} for task ${task.id}`);
+                    // Don't mark as deployed yet — wait for next cycle when ArgoCD syncs
+                  } else {
+                    const mergeErr = await mergeResp.json().catch(() => ({}));
+                    console.log(`[DEPLOY-DETECT] Auto-merge failed PR #${prNumber} on ${repo}: ${mergeResp.status} ${mergeErr.message || ''}`);
+                  }
+                } catch (mergeErr) {
+                  console.warn(`[DEPLOY-DETECT] Auto-merge error PR #${prNumber}:`, mergeErr.message);
+                }
+                break;
               }
-              if (prodSynced && prodSyncTime && prodSyncTime > mergedAt) {
-                isDeployed = true;
-                deployEnv = deployEnv ? "dev+prod" : "prod";
-              }
-              if (!isDeployed) {
-                console.log(`[DEPLOY-DETECT] Task ${task.id} PR #${prNumber} merged but ArgoCD hasn't synced since merge yet`);
-              }
-            } else {
-              console.log(`[DEPLOY-DETECT] Task ${task.id} PR #${prNumber} NOT merged yet — skipping`);
             }
-          } else {
-            console.log(`[DEPLOY-DETECT] Task ${task.id} GitHub API returned ${ghResp.status} for ${repoFullName}#${prNumber}`);
+          } catch (ghErr) {
+            console.warn(`[DEPLOY-DETECT] GitHub API error for ${repo}#${prNumber}:`, ghErr.message);
           }
-        } catch (ghErr) {
-          console.warn(`[DEPLOY-DETECT] GitHub API error for task ${task.id}:`, ghErr.message);
         }
       } else {
         // No PR number in result — fall back to ArgoCD sync check
