@@ -1126,7 +1126,63 @@ async function assignQueuedQATasks() {
       const workerUrl = `http://${worker}.agents.svc.cluster.local:18789/hooks/agent`;
       try {
         const qaContextBlock = await buildContextBlockWithTimeout(task);
-        const qaMessage = `${qaContextBlock}## QA Review: ${task.title}\n\n**Task ID:** ${task.id}\nReview this task and update status when done.`;
+        // Tiered QA prompt based on task type
+        const taskType = task.type || 'general';
+        let qaInstructions = '';
+        if (taskType === 'coding') {
+          const resultStr = typeof task.result === 'string' ? task.result : JSON.stringify(task.result || {});
+          const prMatch = resultStr.match(/PR\s*#(\d+)/i);
+          const repoMatch = resultStr.match(/(dante-alpha-assistant\/[\w-]+)/);
+          qaInstructions = `## QA Review (Coding): ${task.title}
+
+**Task ID:** ${task.id}
+**Type:** coding — do a focused code review, NOT a full test suite.
+
+### Checklist (complete in under 3 minutes):
+1. **PR exists?** ${prMatch ? `Check PR #${prMatch[1]}${repoMatch ? ` on ${repoMatch[1]}` : ''}` : 'Check task result for PR reference'}
+2. **Code scan:** Read the diff. Look for: obvious bugs, missing error handling, hardcoded secrets, broken imports
+3. **Does it match the task description?** Compare what was asked vs what was built
+4. **No regressions:** Check if the change breaks existing patterns in the codebase
+
+### DO NOT:
+- Clone the repo and try to build it
+- Run tests locally
+- Spend more than 3 minutes total
+
+### When done:
+- If acceptable: update task status to \`completed\` with a brief summary
+- If issues found: update task status to \`failed\` with specific issues listed`;
+        } else if (taskType === 'ops' || taskType === 'review') {
+          qaInstructions = `## QA Review (Ops/Config): ${task.title}
+
+**Task ID:** ${task.id}
+**Type:** ${taskType} — lightweight verification only.
+
+### Checklist (complete in under 1 minute):
+1. **Was the change applied?** Check the task result for confirmation
+2. **Any errors in the result?** Look for error messages or warnings
+3. **Makes sense?** Does the result match what was requested?
+
+### DO NOT:
+- SSH into servers to verify
+- Deep-dive into infrastructure
+- Spend more than 1 minute
+
+### When done:
+- If result looks good: update task status to \`completed\`
+- If result shows errors: update task status to \`failed\` with the error`;
+        } else {
+          qaInstructions = `## QA Review: ${task.title}
+
+**Task ID:** ${task.id}
+**Type:** ${taskType}
+
+### Quick review (under 2 minutes):
+1. Check the task result — does it match what was requested?
+2. Any obvious errors or issues?
+3. Update status to \`completed\` if acceptable, \`failed\` if not.`;
+        }
+        const qaMessage = `${qaContextBlock}\n${qaInstructions}`;
         await fetch(workerUrl, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -1266,6 +1322,36 @@ function subscribe() {
             }, null, 2);
 
             const qaContextBlock = await buildContextBlockWithTimeout(task);
+            const taskType = task.type || 'general';
+            const resultStr = typeof task.result === 'string' ? task.result : JSON.stringify(task.result || {});
+            const prMatch = resultStr.match(/PR\s*#(\d+)/i);
+            const repoMatch = resultStr.match(/(dante-alpha-assistant\/[\w-]+)/);
+
+            let qaScope = '';
+            let timeLimit = '3 minutes';
+            if (taskType === 'ops' || taskType === 'review') {
+              qaScope = `### Lightweight QA (ops/config task — complete in under 1 minute)
+1. Check the result — was the change applied successfully?
+2. Any errors in the output?
+3. Does the result match the description?
+DO NOT: SSH into servers, run commands, or deep-dive into infrastructure.`;
+              timeLimit = '1 minute';
+            } else if (taskType === 'coding') {
+              qaScope = `### Code Review QA (complete in under 3 minutes)
+1. ${prMatch ? `Check PR #${prMatch[1]}${repoMatch ? ` on ${repoMatch[1]}` : ''} — read the diff` : 'Check the task result for a PR reference'}
+2. Scan for: obvious bugs, missing error handling, broken imports, hardcoded secrets
+3. Does the code match what was requested in the description?
+4. Check for regressions — does the change break existing patterns?
+DO NOT: Clone the repo, run builds, run tests, or spend more than 3 minutes.`;
+              timeLimit = '3 minutes';
+            } else {
+              qaScope = `### Quick QA (complete in under 2 minutes)
+1. Does the result match the task description?
+2. Any obvious errors?
+DO NOT spend more than 2 minutes on this review.`;
+              timeLimit = '2 minutes';
+            }
+
             const qaMessage = `\`\`\`json
 ${qaPayload}
 \`\`\`
@@ -1273,24 +1359,18 @@ ${qaPayload}
 ${qaContextBlock}## QA Review: ${task.title}
 
 **Task ID:** ${task.id}
-**Type:** ${task.type}
+**Type:** ${taskType} | **Time limit:** ${timeLimit}
 **Originally assigned to:** ${task.assigned_agent}
-**Dispatched by:** ${task.dispatched_by}
 
 ### Description
 ${task.description || "(none)"}
 
 ### Result
-${task.result ? JSON.stringify(task.result, null, 2) : "(no result reported)"}
+${task.result ? JSON.stringify(task.result, null, 2).slice(0, 1000) : "(no result reported)"}
 
-### Acceptance Criteria
-${task.acceptance_criteria || "Verify the task was completed correctly based on the description and result."}
+${qaScope}
 
-### Your Job
-1. Review the result against the acceptance criteria
-2. If the task involved code: check the repo, run tests if possible
-3. If the task involved a URL/service: test it
-4. Update THIS task status directly:
+### Update task status when done:
 
 **If QA passes:**
 \`\`\`bash
@@ -1310,7 +1390,7 @@ curl -s -X PATCH "https://lessxkxujvcmublgwdaa.supabase.co/rest/v1/agent_tasks?i
   -d '{"status":"failed","completed_at":"'$(date -u +%Y-%m-%dT%H:%M:%SZ)'","qa_result":{"passed":false,"failures":["SPECIFIC ISSUE"]}}'
 \`\`\``;
 
-            const betaAgent = AGENTS.beta;
+            const betaAgent = AGENTS["beta-worker"] || AGENTS.beta;
             if (betaAgent?.token) {
               const resp = await fetch(betaAgent.url, {
                 method: "POST",
