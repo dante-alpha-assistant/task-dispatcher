@@ -2303,10 +2303,11 @@ setInterval(staleAgentDetector, STALE_AGENT_INTERVAL);
 setTimeout(staleAgentDetector, 10000);
 console.log("[BOOT] Stale agent detector running every 60s (threshold: 10min)");
 
-// Auto-deploy detector
-setInterval(autoDeployDetector, DEPLOY_DETECT_INTERVAL);
-setTimeout(autoDeployDetector, 15000); // Run 15s after boot
-console.log(`[BOOT] Auto-deploy detector running every ${DEPLOY_DETECT_INTERVAL / 1000}s`);
+// DISABLED: deploy-detect produces false positives (marks tasks deployed before image is live)
+// Deployment will be manual via Deploy button on dashboard. Re-enable when button is ready.
+// setInterval(autoDeployDetector, DEPLOY_DETECT_INTERVAL);
+// setTimeout(autoDeployDetector, 15000);
+console.log(`[BOOT] Auto-deploy detector DISABLED — manual deployment only`);
 
 // Graceful shutdown
 process.on("SIGTERM", () => {
