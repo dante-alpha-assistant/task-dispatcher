@@ -1135,7 +1135,7 @@ async function assignQueuedQATasks() {
 
       const { error: assignErr } = await supabase
         .from("agent_tasks")
-        .update({ qa_agent: worker })
+        .update({ qa_agent: worker, assigned_agent: worker })
         .eq("id", task.id)
         .is("qa_agent", null);
 
@@ -1283,6 +1283,18 @@ function subscribe() {
               console.log(`[DISPATCH] Task ${task.id} → ${task.assigned_agent}`);
               dispatchToAgent(task);
             }
+          }
+        }
+
+        // When task transitions to qa_testing or done: clear assigned_agent
+        // The coding agent is done — assigned_agent should reflect current owner (nobody until QA picks up)
+        if (task && (task.status === 'qa_testing' || task.status === 'done') && eventType === 'UPDATE' && prev?.status !== task.status) {
+          if (task.assigned_agent) {
+            console.log(`[UNASSIGN] Task ${task.id} → ${task.status}, clearing assigned_agent (was: ${task.assigned_agent})`);
+            await supabase
+              .from('agent_tasks')
+              .update({ assigned_agent: null })
+              .eq('id', task.id);
           }
         }
 
@@ -1438,10 +1450,10 @@ curl -s -X PATCH "https://lessxkxujvcmublgwdaa.supabase.co/rest/v1/agent_tasks?i
 
               if (resp.ok) {
                 console.log(`[QA] Dispatched task ${task.id} to beta for QA review`);
-                // Task is already qa_testing — just assign the QA agent
+                // Task is already qa_testing — assign the QA agent as current owner
                 await supabase
                   .from("agent_tasks")
-                  .update({ qa_agent: "beta-worker", assigned_agent: null })
+                  .update({ qa_agent: "beta-worker", assigned_agent: "beta-worker" })
                   .eq("id", task.id);
 
                 // Trigger auto-scaler if queue is building up
@@ -1909,7 +1921,13 @@ async function scheduler() {
         originalAgent.remaining--;
         assigned++;
       } else {
-        console.log(`[SCHEDULER] No capable agent for task ${task.id} (type: ${taskType}), keeping in queue`);
+        const availableTypes = freeAgents.filter(a => a.remaining > 0).map(a => `${a.name}[${a.capabilities.join(',')}]`).join(', ') || 'none';
+        const errorMsg = `No capable agent for task type "${taskType}". Available agents: ${availableTypes}`;
+        console.log(`[SCHEDULER] ${errorMsg} — task ${task.id}`);
+        await supabase
+          .from("agent_tasks")
+          .update({ error: errorMsg })
+          .eq("id", task.id);
       }
     }
 
