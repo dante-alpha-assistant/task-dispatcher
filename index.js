@@ -1150,8 +1150,9 @@ async function assignQueuedQATasks() {
 - Spend more than 3 minutes total
 
 ### When done:
-- If acceptable: update task status to \`completed\` with a brief summary
-- If issues found: update task status to \`failed\` with specific issues listed`;
+- If acceptable: **MERGE the PR first** (squash merge via GitHub API), then update task status to \`completed\`
+${prMatch && repoMatch ? `  Merge command: \`gh pr merge ${prMatch[1]} -R ${repoMatch[1]} --squash --delete-branch\`` : prMatch ? `  Merge command: \`gh pr merge ${prMatch[1]} --squash --delete-branch\`` : '  Find the PR number from the task result and merge it'}
+- If issues found: do NOT merge. Update task status to \`failed\` with specific issues listed`;
         } else if (taskType === 'ops' || taskType === 'review') {
           qaInstructions = `## QA Review (Ops/Config): ${task.title}
 
@@ -1372,8 +1373,12 @@ ${qaScope}
 
 ### Update task status when done:
 
-**If QA passes:**
+**If QA passes (coding tasks — MERGE FIRST):**
+If this is a coding task with a PR, merge it BEFORE updating status:
 \`\`\`bash
+# Step 1: Merge the PR (squash merge, delete branch)
+gh pr merge <PR_NUMBER> -R <REPO> --squash --delete-branch
+# Step 2: Then update task status
 curl -s -X PATCH "https://lessxkxujvcmublgwdaa.supabase.co/rest/v1/agent_tasks?id=eq.${task.id}" \\
   -H "apikey: ${SUPABASE_KEY}" \\
   -H "Authorization: Bearer ${SUPABASE_KEY}" \\
@@ -1381,7 +1386,7 @@ curl -s -X PATCH "https://lessxkxujvcmublgwdaa.supabase.co/rest/v1/agent_tasks?i
   -d '{"status":"completed","completed_at":"'$(date -u +%Y-%m-%dT%H:%M:%SZ)'","qa_result":{"passed":true,"notes":"WHAT YOU VERIFIED"}}'
 \`\`\`
 
-**If QA fails:**
+**If QA fails (do NOT merge):**
 \`\`\`bash
 curl -s -X PATCH "https://lessxkxujvcmublgwdaa.supabase.co/rest/v1/agent_tasks?id=eq.${task.id}" \\
   -H "apikey: ${SUPABASE_KEY}" \\
@@ -2102,25 +2107,7 @@ async function autoDeployDetector() {
                 }
                 break; // Found merged PR, stop checking other repos
               } else if (pr.state === 'open') {
-                // PR exists but not merged — try auto-merge if task is completed (QA passed)
-                console.log(`[DEPLOY-DETECT] Task ${task.id} PR #${prNumber} on ${repo} is open — attempting auto-merge`);
-                try {
-                  const mergeResp = await fetch(`https://api.github.com/repos/${repo}/pulls/${prNumber}/merge`, {
-                    method: 'PUT',
-                    headers: { 'Authorization': `token ${process.env.GH_TOKEN}`, 'Accept': 'application/vnd.github.v3+json', 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ merge_method: 'squash', commit_title: `${pr.title} (#${prNumber})` }),
-                    signal: AbortSignal.timeout(10000),
-                  });
-                  if (mergeResp.ok) {
-                    console.log(`[DEPLOY-DETECT] Auto-merged PR #${prNumber} on ${repo} for task ${task.id}`);
-                    // Don't mark as deployed yet — wait for next cycle when ArgoCD syncs
-                  } else {
-                    const mergeErr = await mergeResp.json().catch(() => ({}));
-                    console.log(`[DEPLOY-DETECT] Auto-merge failed PR #${prNumber} on ${repo}: ${mergeResp.status} ${mergeErr.message || ''}`);
-                  }
-                } catch (mergeErr) {
-                  console.warn(`[DEPLOY-DETECT] Auto-merge error PR #${prNumber}:`, mergeErr.message);
-                }
+                console.log(`[DEPLOY-DETECT] Task ${task.id} PR #${prNumber} on ${repo} is open — waiting for QA agent to merge`);
                 break;
               }
             }
