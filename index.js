@@ -1,5 +1,6 @@
 import { createClient } from "@supabase/supabase-js";
 import * as k8s from "@kubernetes/client-node";
+import { execSync } from "child_process";
 
 // K8s client setup
 const kc = new k8s.KubeConfig();
@@ -763,7 +764,7 @@ async function dispatchToAgent(task) {
           const sessionCount = sessData?.result?.details?.count || sessData?.result?.details?.sessions?.length || 0;
           if (sessionCount > SESSION_THRESHOLD) {
             console.log(`[SESSION-CLEANUP] ${agentName} has ${sessionCount} sessions (threshold: ${SESSION_THRESHOLD}) → restarting pod`);
-            const { execSync } = require('child_process');
+            // execSync imported at top level
             try {
               execSync(`kubectl rollout restart deployment/${agentName} -n agents`, { timeout: 15000 });
               // Wait for pod to come back
