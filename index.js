@@ -1242,6 +1242,16 @@ ${prMatch && repoMatch ? `  Merge command: \`gh pr merge ${prMatch[1]} -R ${repo
 2. Any obvious errors or issues?
 3. Update status to \`completed\` if acceptable, \`failed\` if not.`;
         }
+        // Add Gherkin acceptance criteria instructions
+        qaInstructions += `
+
+### ⚠️ MANDATORY: Write Gherkin Acceptance Criteria
+
+Before updating task status, you MUST generate Gherkin acceptance criteria (Given/When/Then scenarios) based on the task description and result. Write them to the \`acceptance_criteria\` field using a PATCH request.
+
+**DO NOT write Gherkin scenarios to the \`description\` field. The original description must NEVER be overwritten.**
+
+Generate realistic Gherkin scenarios, then PATCH the task with acceptance_criteria BEFORE updating the final task status.`;
         const qaMessage = `${qaContextBlock}\n${qaInstructions}`;
         await fetch(workerUrl, {
           method: "POST",
@@ -1415,6 +1425,25 @@ DO NOT: Clone the repo, run builds, run tests, or spend more than 3 minutes.`;
 DO NOT spend more than 2 minutes on this review.`;
               timeLimit = '2 minutes';
             }
+
+            // Add Gherkin acceptance criteria instructions to ALL QA reviews
+            qaScope += `
+
+### ⚠️ MANDATORY: Write Gherkin Acceptance Criteria
+
+Before updating task status, you MUST generate Gherkin acceptance criteria (Given/When/Then scenarios) based on the task description and result. Write them to the \`acceptance_criteria\` field using a PATCH request.
+
+**DO NOT write Gherkin scenarios to the \`description\` field. The original description must NEVER be overwritten.**
+
+\`\`\`bash
+curl -s -X PATCH "https://lessxkxujvcmublgwdaa.supabase.co/rest/v1/agent_tasks?id=eq.${task.id}" \\
+  -H "apikey: ${SUPABASE_KEY}" \\
+  -H "Authorization: Bearer ${SUPABASE_KEY}" \\
+  -H "Content-Type: application/json" \\
+  -d '{"acceptance_criteria": "YOUR_GHERKIN_SCENARIOS_HERE"}'
+\`\`\`
+
+Generate realistic Gherkin scenarios that cover the task requirements, then PATCH them BEFORE updating the final task status.`;
 
             const qaPayload = JSON.stringify({
               task_id: task.id,
