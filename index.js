@@ -1876,7 +1876,7 @@ async function scheduler() {
 
       // Score agents: must have required capability, then rank by capacity + priority affinity
       const candidates = freeAgents
-        .filter(a => a.remaining > 0 && a.capabilities.includes(requiredCapability))
+        .filter(a => a.remaining > 0 && a.capabilities.includes(requiredCapability) && a.name !== task.last_failed_agent)
         .map(a => {
           let score = a.remaining;
           const affinityMultiplier = a.priority_affinity[task.priority];
