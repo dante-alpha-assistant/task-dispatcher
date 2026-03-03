@@ -2032,6 +2032,7 @@ async function staleAgentDetector() {
       .eq('status', 'degraded')
       .lt('last_heartbeat', offlineThreshold);
     for (const agent of (degradedStale || [])) {
+      if (agent.name.endsWith('-worker')) continue;
       console.log(`[STALE] Marking ${agent.name} as offline (degraded for >30min, last_heartbeat: ${agent.last_heartbeat})`);
       await supabase
         .from('agent_cards')
@@ -2050,6 +2051,8 @@ async function staleAgentDetector() {
       return;
     }
     for (const agent of (onlineStale || [])) {
+      // Skip headless workers — they don't have heartbeat crons
+      if (agent.name.endsWith('-worker')) continue;
       const reason = `Heartbeat stale since ${agent.last_heartbeat} — possible model API failure (403/429/timeout)`;
       console.log(`[STALE] Marking ${agent.name} as degraded (last_heartbeat: ${agent.last_heartbeat})`);
       await supabase
