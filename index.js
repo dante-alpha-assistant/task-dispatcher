@@ -125,7 +125,7 @@ async function checkAgentBusy(agentName) {
         .select('id, status')
         .in('id', hookTaskIds);
       for (const t of (tasks || [])) {
-        if (!['assigned', 'in_progress', 'qa_testing'].includes(t.status)) {
+        if (!['in_progress', 'qa_testing'].includes(t.status)) {
           zombieTaskIds.add(t.id);
         }
       }
@@ -629,7 +629,7 @@ async function buildContextBlock(task) {
         // Get active task counts per agent
         const { data: activeTasks } = await supabase.from('agent_tasks')
           .select('assigned_agent')
-          .in('status', ['assigned', 'in_progress'])
+          .in('status', ['in_progress'])
           .limit(100);
         const taskCounts = {};
         for (const t of (activeTasks || [])) {
@@ -1282,32 +1282,29 @@ function subscribe() {
 
         // Dispatch when:
         // 1. Task has assigned_agent set and status is todo (scheduler assigned it)
-        // 2. Task updated to 'assigned' status (legacy / manual kanban drag)
+        // Dispatch condition: assigned_agent just set (was null → agent name)
         const agentJustAssigned = task?.assigned_agent && eventType === "UPDATE" && !prev?.assigned_agent;
-        const legacyAssigned = task?.status === "assigned" && task?.assigned_agent && eventType === "UPDATE" && prev?.status !== "assigned";
         // Skip qa_testing tasks here — they're handled by the QA dispatch block below
-        if ((agentJustAssigned || legacyAssigned) && task?.assigned_agent && task?.status !== "qa_testing") {
-          if (true) {
-            // Concurrency guard: check if this agent already has an in-progress task
-            const agentName = task.assigned_agent.toLowerCase();
-            const { data: inFlight } = await supabase
-              .from('agent_tasks')
-              .select('id')
-              .eq('assigned_agent', task.assigned_agent)
-              .in('status', ['in_progress'])
-              .neq('id', task.id);
-            if (inFlight && inFlight.length > 0) {
-              const reason = `Agent ${agentName} busy (${inFlight.length} in-progress task), unassigning for re-dispatch`;
-              console.log(`[DISPATCH] ${reason}`);
-              await supabase.from('agent_tasks').update({
-                assigned_agent: null,
-                last_failed_agent: agentName,
-                error: reason,
-              }).eq('id', task.id);
-            } else {
-              console.log(`[DISPATCH] Task ${task.id} → ${task.assigned_agent}`);
-              dispatchToAgent(task);
-            }
+        if (agentJustAssigned && task?.assigned_agent && task?.status !== "qa_testing") {
+          // Concurrency guard: check if this agent already has an in-progress task
+          const agentName = task.assigned_agent.toLowerCase();
+          const { data: inFlight } = await supabase
+            .from('agent_tasks')
+            .select('id')
+            .eq('assigned_agent', task.assigned_agent)
+            .in('status', ['in_progress'])
+            .neq('id', task.id);
+          if (inFlight && inFlight.length > 0) {
+            const reason = `Agent ${agentName} busy (${inFlight.length} in-progress task), unassigning for re-dispatch`;
+            console.log(`[DISPATCH] ${reason}`);
+            await supabase.from('agent_tasks').update({
+              assigned_agent: null,
+              last_failed_agent: agentName,
+              error: reason,
+            }).eq('id', task.id);
+          } else {
+            console.log(`[DISPATCH] Task ${task.id} → ${task.assigned_agent}`);
+            dispatchToAgent(task);
           }
         }
 
