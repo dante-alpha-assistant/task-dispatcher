@@ -1341,7 +1341,8 @@ function subscribe() {
               console.log(`[STAGE] Task ${task.id} ("${task.title}"): ${task.stage} → ${nextStage}`);
               await supabase.from("agent_tasks").update({
                 stage: nextStage,
-                status: "assigned",
+                status: "todo",
+                assigned_agent: null,
                 started_at: null,
                 completed_at: null,
               }).eq("id", task.id);
@@ -1493,7 +1494,7 @@ createServer(async (req, res) => {
     let capacity = {};
     try {
       const [{ data }, cards] = await Promise.all([
-        supabase.from("agent_tasks").select("assigned_agent").in("status", ["assigned", "in_progress"]),
+        supabase.from("agent_tasks").select("assigned_agent, status").or("status.eq.in_progress,assigned_agent.not.is.null"),
         getAgentCards(),
       ]);
       for (const card of cards) {
@@ -1591,7 +1592,7 @@ async function taskMonitor() {
     const { data: activeTasks_db, error } = await supabase
       .from("agent_tasks")
       .select("id, title, status, assigned_agent, qa_agent, started_at, created_at")
-      .in("status", ["in_progress", "assigned", "qa_testing"]);
+      .in("status", ["in_progress", "qa_testing"]);
 
     if (error) {
       console.error("[MONITOR] Query error:", error.message);
@@ -1792,14 +1793,14 @@ async function scheduler() {
     const { data: activeTasks_db, error: activeErr } = await supabase
       .from("agent_tasks")
       .select("assigned_agent")
-      .in("status", ["assigned", "in_progress"]);
+      .or("status.eq.in_progress,assigned_agent.not.is.null");
 
     if (activeErr) {
       console.error("[SCHEDULER] Error fetching active tasks:", activeErr.message);
       return;
     }
 
-    // Build load map from active tasks
+    // Build load map from active tasks (in_progress OR assigned but not yet started)
     const agentLoad = {};
     for (const card of cards) agentLoad[card.name] = 0;
     for (const t of activeTasks_db || []) {
@@ -1930,7 +1931,7 @@ async function scheduler() {
           .from("agent_tasks")
           .select("id")
           .eq("assigned_agent", bestCandidate.name)
-          .in("status", ["assigned", "in_progress"])
+          .or("status.eq.in_progress,assigned_agent.not.is.null")
           .limit(5);
         const inflightCount = inflightCheck?.length || 0;
         if (inflightCount >= originalAgent.max_concurrent) {
