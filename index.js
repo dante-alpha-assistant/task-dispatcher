@@ -710,6 +710,29 @@ async function buildContextBlockWithTimeout(task) {
 }
 
 // --- Dispatch task to agent via /hooks/agent ---
+// Fetch task comments to include in dispatch (for retries / context)
+async function fetchTaskComments(taskId) {
+  try {
+    const { data, error } = await supabase
+      .from('task_comments')
+      .select('author, author_type, body, created_at')
+      .eq('task_id', taskId)
+      .order('created_at', { ascending: true })
+      .limit(20);
+    if (error || !data?.length) return '';
+    const lines = ['## 💬 Comments Thread\n'];
+    for (const c of data) {
+      const time = new Date(c.created_at).toISOString().replace('T', ' ').slice(0, 16);
+      lines.push(`**${c.author}** (${c.author_type}) — ${time}:`);
+      lines.push(`> ${c.body.replace(/\n/g, '\n> ')}\n`);
+    }
+    return lines.join('\n');
+  } catch (e) {
+    console.error(`[COMMENTS] Failed to fetch comments for task ${taskId}:`, e.message);
+    return '';
+  }
+}
+
 async function dispatchToAgent(task) {
   // Never dispatch to disabled/degraded agents — remap or reset to todo
   if (task.assigned_agent) {
@@ -824,6 +847,7 @@ async function dispatchToAgent(task) {
   }, null, 2);
 
   const contextBlock = await buildContextBlockWithTimeout(task);
+  const commentsBlock = await fetchTaskComments(task.id);
 
   // Build coding task section if applicable
   const codingTaskSection = task.type === "coding" ? `
@@ -851,7 +875,7 @@ ${codingTaskSection}
 **Type:** ${task.type}
 **Priority:** ${task.priority}
 **Dispatched by:** ${task.dispatched_by}${task.parent_task_id ? `\n\n**Parent Task:** ${task.parent_task_id}\n**Sub-task:** This is a sub-task of a larger task. Complete your portion and update status.` : ""}
-
+${commentsBlock ? `\n${commentsBlock}` : ""}
 ${contextBlock}---
 ## ⚠️ MANDATORY: Update task status when done
 
