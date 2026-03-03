@@ -1274,11 +1274,12 @@ function subscribe() {
         }
 
         // Dispatch when:
-        // 1. New task inserted with status 'assigned' and an assigned_agent
-        // 2. Task updated to 'assigned' status (e.g., dragged in kanban)
-        if (task?.status === "assigned" && task?.assigned_agent) {
-          // Only dispatch if status actually changed to 'assigned'
-          if (eventType === "INSERT" || (eventType === "UPDATE" && prev?.status !== "assigned")) {
+        // 1. Task has assigned_agent set and status is todo (scheduler assigned it)
+        // 2. Task updated to 'assigned' status (legacy / manual kanban drag)
+        const agentJustAssigned = task?.assigned_agent && eventType === "UPDATE" && !prev?.assigned_agent;
+        const legacyAssigned = task?.status === "assigned" && task?.assigned_agent && eventType === "UPDATE" && prev?.status !== "assigned";
+        if ((agentJustAssigned || legacyAssigned) && task?.assigned_agent) {
+          if (true) {
             // Concurrency guard: check if this agent already has an in-progress task
             const agentName = task.assigned_agent.toLowerCase();
             const { data: inFlight } = await supabase
@@ -1288,11 +1289,10 @@ function subscribe() {
               .in('status', ['in_progress'])
               .neq('id', task.id);
             if (inFlight && inFlight.length > 0) {
-              console.log(`[DISPATCH] Agent ${agentName} already has ${inFlight.length} in-progress task(s) — resetting ${task.id} to todo for scheduler`);
+              console.log(`[DISPATCH] Agent ${agentName} already has ${inFlight.length} in-progress task(s) — clearing assignment on ${task.id} for scheduler`);
               await supabase.from('agent_tasks').update({
-                status: 'todo',
                 assigned_agent: null,
-                started_at: null,
+                last_failed_agent: agentName,
                 error: null,
               }).eq('id', task.id);
             } else {
@@ -1826,11 +1826,12 @@ async function scheduler() {
     // The agent_load count + max_capacity + inflightCheck guard are sufficient.
     const freeAgents = availableFiltered;
 
-    // Fetch todo tasks for regular assignment
+    // Fetch todo tasks that don't have an agent assigned yet
     const { data: todoTasks, error: todoErr } = await supabase
       .from("agent_tasks")
       .select("*")
       .eq("status", "todo")
+      .is("assigned_agent", null)
       .order("created_at", { ascending: true });
 
     if (todoErr) {
@@ -1886,7 +1887,7 @@ async function scheduler() {
           console.log(`[SCHEDULER] Assigning task ${task.id} ("${task.title}") → ${hintAgent} (hint)`);
           await supabase
             .from("agent_tasks")
-            .update({ status: "assigned", assigned_agent: hintAgent })
+            .update({ assigned_agent: hintAgent })
             .eq("id", task.id);
           agentSlot.remaining--;
           assigned++;
@@ -1941,7 +1942,7 @@ async function scheduler() {
           console.log(`[SCHEDULER] Auto-assigning task ${task.id} ("${task.title}") \u2192 ${bestCandidate.name} (type: ${requiredCapability}, remaining: ${originalAgent.remaining})`);
           await supabase
             .from("agent_tasks")
-            .update({ status: "assigned", assigned_agent: bestCandidate.name })
+            .update({ assigned_agent: bestCandidate.name })
             .eq("id", task.id);
         }
         originalAgent.remaining--;
