@@ -757,11 +757,12 @@ async function dispatchToAgent(task) {
           .update({ assigned_agent: workerName })
           .eq('id', task.id);
       } else {
-        // No worker variant available — reset to todo for scheduler to pick up
-        console.log(`[SKIP] Agent ${task.assigned_agent} is disabled/degraded, resetting task ${task.id} to todo`);
+        // No worker variant available — reset for scheduler to pick up
+        const skipReason = `Agent ${task.assigned_agent} is disabled/degraded — unassigning for re-dispatch`;
+        console.log(`[SKIP] ${skipReason}`);
         await supabase
           .from('agent_tasks')
-          .update({ status: 'todo', assigned_agent: null, started_at: null, error: null })
+          .update({ assigned_agent: null, started_at: null, error: skipReason, last_failed_agent: task.assigned_agent })
           .eq('id', task.id);
         return;
       }
@@ -799,14 +800,15 @@ async function dispatchToAgent(task) {
   // Auth preflight: verify gateway credentials before dispatching
   const authCheck = await preflightAuthCheck(agentName);
   if (!authCheck.ok) {
-    console.log(`[AUTH-PREFLIGHT] Agent ${agentName} failed auth check (HTTP ${authCheck.status}), skipping task ${task.id}`);
+    const authReason = `Auth preflight failed for ${agentName} (HTTP ${authCheck.status}) — agent may have expired credentials`;
+    console.log(`[AUTH-PREFLIGHT] ${authReason}`);
     await supabase
       .from('agent_tasks')
       .update({
-        status: 'todo',
         assigned_agent: null,
         started_at: null,
-        error: null,
+        error: authReason,
+        last_failed_agent: agentName,
       })
       .eq('id', task.id);
     return;
@@ -1295,11 +1297,12 @@ function subscribe() {
               .in('status', ['in_progress'])
               .neq('id', task.id);
             if (inFlight && inFlight.length > 0) {
-              console.log(`[DISPATCH] Agent ${agentName} already has ${inFlight.length} in-progress task(s) — clearing assignment on ${task.id} for scheduler`);
+              const reason = `Agent ${agentName} busy (${inFlight.length} in-progress task), unassigning for re-dispatch`;
+              console.log(`[DISPATCH] ${reason}`);
               await supabase.from('agent_tasks').update({
                 assigned_agent: null,
                 last_failed_agent: agentName,
-                error: null,
+                error: reason,
               }).eq('id', task.id);
             } else {
               console.log(`[DISPATCH] Task ${task.id} → ${task.assigned_agent}`);
