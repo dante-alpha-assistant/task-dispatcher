@@ -1704,7 +1704,7 @@ async function taskMonitor() {
               started_at: null,
               idle_retries: idleRetries,
               blocked_reason: `Timed out ${idleRetries} times — agent may be down or task needs manual intervention`,
-              error: null,
+              error: `Idle timeout: ${agentName} unresponsive after ${idleRetries} retries — moved to blocked`,
             }).eq("id", task.id);
           } else {
             console.log(`[MONITOR] Idle timeout: task ${task.id} ("${task.title.slice(0,40)}") → ${agentName} idle ${Math.floor(idleMs/60000)}min (retry ${idleRetries}/${MAX_IDLE_RETRIES}) → resetting to todo`);
@@ -1713,7 +1713,7 @@ async function taskMonitor() {
               assigned_agent: null,
               started_at: null,
               idle_retries: idleRetries,
-              error: null,
+              error: `Idle timeout: ${agentName} session idle >${Math.floor(idleMs/60000)}min — re-queued (retry ${idleRetries}/${MAX_IDLE_RETRIES})`,
             }).eq("id", task.id);
           }
           activeTasks.delete(task.id);
@@ -1891,7 +1891,7 @@ async function scheduler() {
           } else {
             // Both unavailable — clear hint and let capability-based routing handle it
             console.log(`[SCHEDULER] Hint ${hintAgent} is disabled/degraded, clearing for task ${task.id}`);
-            await supabase.from("agent_tasks").update({ assigned_agent: null }).eq("id", task.id);
+            await supabase.from("agent_tasks").update({ assigned_agent: null, error: `Hint agent ${hintAgent} is disabled/degraded — cleared for re-routing` }).eq("id", task.id);
             // Fall through to capability-based assignment below
           }
         }
@@ -2008,7 +2008,7 @@ async function requeueAgentTasks(agentName) {
   for (const task of (tasks || [])) {
     const { error: updateErr } = await supabase
       .from('agent_tasks')
-      .update({ status: 'todo', assigned_agent: null })
+      .update({ status: 'todo', assigned_agent: null, error: `Agent ${agentName} degraded (stale heartbeat) — re-queued for re-dispatch` })
       .eq('id', task.id);
     if (updateErr) {
       console.error(`[REQUEUE] Failed to requeue task ${task.id}:`, updateErr.message);
