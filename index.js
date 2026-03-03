@@ -829,12 +829,16 @@ async function dispatchToAgent(task) {
   const codingTaskSection = task.type === "coding" ? `
 ## Coding Task
 
-**Use the coding-task skill for this work.** Read \`skills/coding-task/SKILL.md\` and follow it step by step.
+**⚠️ MANDATORY: Read \`skills/coding-task/SKILL.md\` and follow it step by step.**
 
-- **Repo:** ${task.repo || "See task description for target repo(s)"}
-- **Branch convention:** \`feat/<short-description>\` or \`fix/<short-description>\`
-- **PR template:** Include task ID, summary of changes, and testing notes
-- **Known repos:** queue-dashboard, task-dispatcher, dante-gitops (all under dante-alpha-assistant)
+This is a coding task. The coding-task skill defines your entire workflow:
+1. Parse the task → 2. Setup git → 3. Clone/update repo → 4. Feature branch → 5. Make changes → 6. Commit & push → 7. Create PR → 8. Update task status
+
+- **Repo:** ${task.repo || "Identify from task description. Known repos: queue-dashboard, task-dispatcher, dante-gitops (all under dante-alpha-assistant)"}
+- **Branch:** \`feat/<short-description>\` or \`fix/<short-description>\`
+- **PR:** Include task ID, summary of changes, and what to verify
+- **NEVER** edit files without cloning the repo first
+- **NEVER** commit to main directly
 ` : "";
 
   const message = `\`\`\`json
