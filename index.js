@@ -802,6 +802,12 @@ async function dispatchToAgent(task) {
   if (!authCheck.ok) {
     const authReason = `Auth preflight failed for ${agentName} (HTTP ${authCheck.status}) — agent may have expired credentials`;
     console.log(`[AUTH-PREFLIGHT] ${authReason}`);
+    // If task was in_progress with a result, move to qa_testing (work was done)
+    // If in_progress without result, move back to todo for re-dispatch
+    const statusFix = task.status === 'in_progress'
+      ? (task.result ? { status: 'qa_testing', completed_at: new Date().toISOString() }
+         : { status: 'todo' })
+      : {};
     await supabase
       .from('agent_tasks')
       .update({
@@ -809,8 +815,10 @@ async function dispatchToAgent(task) {
         started_at: null,
         error: authReason,
         last_failed_agent: agentName,
+        ...statusFix,
       })
       .eq('id', task.id);
+    if (statusFix.status) console.log(`[AUTH-PREFLIGHT] Task ${task.id} was ${task.status} → ${statusFix.status} (had result: ${!!task.result})`);
     return;
   }
 
