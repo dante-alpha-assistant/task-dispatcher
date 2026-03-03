@@ -1318,7 +1318,7 @@ function subscribe() {
 
         // When task transitions to qa_testing: clear assigned_agent
         // The coding agent is done — assigned_agent should reflect current owner (nobody until scheduler assigns QA agent)
-        if (task && task.status === 'qa_testing' && eventType === 'UPDATE' && prev?.status !== task.status) {
+        if (task && task.status === 'qa_testing' && eventType === 'UPDATE' && prev?.status && prev.status !== task.status) {
           if (task.assigned_agent) {
             const unassignReason = `Unassigned from ${task.assigned_agent}: task moved to qa_testing`;
             console.log(`[UNASSIGN] Task ${task.id} → qa_testing, clearing assigned_agent (was: ${task.assigned_agent})`);
@@ -1341,7 +1341,7 @@ function subscribe() {
 
         // Factory pipeline stage transitions: auto-advance to next stage
         // Note: factory tasks still use "done" internally for stage transitions before final QA
-        if (task?.status === "qa_testing" && eventType === "UPDATE" && prev?.status !== task?.status && task.stage) {
+        if (task?.status === "qa_testing" && eventType === "UPDATE" && prev?.status && prev.status !== task.status && task.stage) {
           const nextStage = getNextStage(task.stage);
           if (nextStage) {
             // Guard: only advance forward (check current stage is valid and not final)
