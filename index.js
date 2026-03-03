@@ -1928,11 +1928,12 @@ async function scheduler() {
         if (!originalAgent || originalAgent.remaining <= 0) continue;
         
         // Double-check: re-query DB for in-flight tasks this agent has RIGHT NOW
+        // Only count tasks in active statuses (not completed/deployed/failed/deprecated)
         const { data: inflightCheck } = await supabase
           .from("agent_tasks")
           .select("id")
           .eq("assigned_agent", bestCandidate.name)
-          .or("status.eq.in_progress,assigned_agent.not.is.null")
+          .in("status", ["todo", "in_progress", "qa_testing", "blocked"])
           .limit(5);
         const inflightCount = inflightCheck?.length || 0;
         if (inflightCount >= originalAgent.max_concurrent) {
@@ -2324,9 +2325,10 @@ setInterval(taskMonitor, MONITOR_INTERVAL);
 setTimeout(taskMonitor, 5000); // Run 5s after boot (let realtime connect first)
 console.log(`[BOOT] Task monitor running every ${MONITOR_INTERVAL / 1000}s (hard timeout: ${TASK_HARD_TIMEOUT / 60000}min, grace: ${SESSION_GONE_GRACE / 1000}s)`);
 
-// QA Auto-Scaler
-setInterval(qaAutoScaler, 30000);
-console.log("[BOOT] QA auto-scaler running every 30s");
+// QA Auto-Scaler — DISABLED: scheduler handles QA assignment via agent_cards
+// The QA scaler used K8s pod names instead of agent names, causing dispatch failures.
+// setInterval(qaAutoScaler, 30000);
+console.log("[BOOT] QA auto-scaler DISABLED — scheduler handles QA assignment");
 
 // Stale agent detector
 setInterval(staleAgentDetector, STALE_AGENT_INTERVAL);
