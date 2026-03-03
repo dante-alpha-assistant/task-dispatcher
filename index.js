@@ -1827,11 +1827,14 @@ async function scheduler() {
     const freeAgents = availableFiltered;
 
     // Fetch todo tasks that don't have an agent assigned yet
+    // Cooldown: skip tasks updated in last 30s to prevent assign/clear loops
+    const cooldownTime = new Date(Date.now() - 30000).toISOString();
     const { data: todoTasks, error: todoErr } = await supabase
       .from("agent_tasks")
       .select("*")
       .eq("status", "todo")
       .is("assigned_agent", null)
+      .lt("updated_at", cooldownTime)
       .order("created_at", { ascending: true });
 
     if (todoErr) {
