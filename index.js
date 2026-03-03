@@ -754,7 +754,7 @@ async function dispatchToAgent(task) {
         task.assigned_agent = workerName;
         await supabase
           .from('agent_tasks')
-          .update({ assigned_agent: workerName })
+          .update({ assigned_agent: workerName, error: null })
           .eq('id', task.id);
       } else {
         // No worker variant available — reset for scheduler to pick up
@@ -1900,7 +1900,7 @@ async function scheduler() {
           console.log(`[SCHEDULER] Assigning task ${task.id} ("${task.title}") → ${hintAgent} (hint)`);
           await supabase
             .from("agent_tasks")
-            .update({ assigned_agent: hintAgent })
+            .update({ assigned_agent: hintAgent, error: null })
             .eq("id", task.id);
           agentSlot.remaining--;
           assigned++;
@@ -1950,13 +1950,13 @@ async function scheduler() {
           console.log(`[SCHEDULER] Assigning QA task ${task.id} ("${task.title}") \u2192 ${bestCandidate.name} (qa)`);
           await supabase
             .from("agent_tasks")
-            .update({ assigned_agent: bestCandidate.name, qa_agent: bestCandidate.name })
+            .update({ assigned_agent: bestCandidate.name, qa_agent: bestCandidate.name, error: null })
             .eq("id", task.id);
         } else {
           console.log(`[SCHEDULER] Auto-assigning task ${task.id} ("${task.title}") \u2192 ${bestCandidate.name} (type: ${requiredCapability}, remaining: ${originalAgent.remaining})`);
           await supabase
             .from("agent_tasks")
-            .update({ assigned_agent: bestCandidate.name })
+            .update({ assigned_agent: bestCandidate.name, error: null })
             .eq("id", task.id);
         }
         originalAgent.remaining--;
