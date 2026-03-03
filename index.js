@@ -52,6 +52,11 @@ const AGENTS = {
     token: process.env.IFRA_WORKER_HOOKS_TOKEN,
     gatewayToken: process.env.IFRA_WORKER_GATEWAY_TOKEN,
   },
+  "research-worker": {
+    url: process.env.RESEARCH_WORKER_HOOKS_URL || `http://research-worker.agents.svc.cluster.local:18789/hooks/agent`,
+    token: process.env.RESEARCH_WORKER_HOOKS_TOKEN || "research-worker-hooks-tok-2026",
+    gatewayToken: process.env.RESEARCH_WORKER_GATEWAY_TOKEN || "research-worker-gw-tok-2026",
+  },
   "beta-worker": {
     url: process.env.BETA_WORKER_HOOKS_URL || `http://beta-worker.agents.svc.cluster.local:18789/hooks/agent`,
     token: process.env.BETA_WORKER_HOOKS_TOKEN || "beta-worker-hooks-tok-2026",
