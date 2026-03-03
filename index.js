@@ -1798,6 +1798,7 @@ async function scheduler() {
   try {
     console.log("[SCHEDULER] Cycle starting...");
     const cards = await getAgentCards();
+    console.log(`[SCHEDULER] Got ${cards.length} agent cards`);
     if (!cards.length) {
       console.log("[SCHEDULER] No online agents found — skipping cycle");
       return;
@@ -1830,7 +1831,7 @@ async function scheduler() {
       }
     }
 
-    if (available.length === 0) return;
+    if (available.length === 0) { console.log("[SCHEDULER] No agents with capacity"); return; }
 
     // Belt-and-suspenders: fetch disabled/degraded agents and exclude them
     const { data: disabledAgents } = await supabase
@@ -1874,6 +1875,7 @@ async function scheduler() {
     }
 
     // Merge: todo + unassigned qa_testing, sorted by priority (qa gets slight boost)
+    console.log(`[SCHEDULER] Found ${(todoTasks||[]).length} todo + ${(qaUnassigned||[]).length} qa tasks, ${freeAgents.length} free agents`);
     const allSchedulable = [...(todoTasks || []), ...(qaUnassigned || [])];
     if (!allSchedulable.length) { console.log("[SCHEDULER] No schedulable tasks found"); return; }
 
