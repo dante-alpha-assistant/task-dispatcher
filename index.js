@@ -1283,7 +1283,8 @@ function subscribe() {
         // 2. Task updated to 'assigned' status (legacy / manual kanban drag)
         const agentJustAssigned = task?.assigned_agent && eventType === "UPDATE" && !prev?.assigned_agent;
         const legacyAssigned = task?.status === "assigned" && task?.assigned_agent && eventType === "UPDATE" && prev?.status !== "assigned";
-        if ((agentJustAssigned || legacyAssigned) && task?.assigned_agent) {
+        // Skip qa_testing tasks here — they're handled by the QA dispatch block below
+        if ((agentJustAssigned || legacyAssigned) && task?.assigned_agent && task?.status !== "qa_testing") {
           if (true) {
             // Concurrency guard: check if this agent already has an in-progress task
             const agentName = task.assigned_agent.toLowerCase();
