@@ -1838,7 +1838,7 @@ async function scheduler() {
       .in('status', ['disabled', 'degraded']);
     const disabledNames = new Set((disabledAgents || []).map(a => a.name.toLowerCase()));
     const availableFiltered = available.filter(a => !disabledNames.has(a.name));
-    if (availableFiltered.length === 0) return;
+    if (availableFiltered.length === 0) { console.log("[SCHEDULER] No available agents after filtering disabled"); return; }
 
     // DB is the source of truth for agent availability — no gateway session checks.
     // The agent_load count + max_capacity + inflightCheck guard are sufficient.
@@ -1874,7 +1874,7 @@ async function scheduler() {
 
     // Merge: todo + unassigned qa_testing, sorted by priority (qa gets slight boost)
     const allSchedulable = [...(todoTasks || []), ...(qaUnassigned || [])];
-    if (!allSchedulable.length) return;
+    if (!allSchedulable.length) { console.log("[SCHEDULER] No schedulable tasks found"); return; }
 
     allSchedulable.sort((a, b) => {
       const aBoost = a.status === 'qa_testing' ? -0.5 : 0;
@@ -1932,6 +1932,9 @@ async function scheduler() {
         .sort((a, b) => b.score - a.score);
 
       const bestCandidate = candidates[0];
+      if (!bestCandidate && !isQaTask) {
+        console.log(`[SCHEDULER] No candidate for task ${task.id} ("${task.title.substring(0,30)}") type=${task.type} required=${requiredCapability} last_failed=${task.last_failed_agent} agents=${freeAgents.map(a=>a.name+":"+a.capabilities.join(",")).join("|")}`);
+      }
 
       if (bestCandidate) {
         // Decrement the ORIGINAL agent in freeAgents (not the spread copy)
