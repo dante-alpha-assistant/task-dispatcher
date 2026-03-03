@@ -1312,10 +1312,11 @@ function subscribe() {
         // The coding agent is done — assigned_agent should reflect current owner (nobody until scheduler assigns QA agent)
         if (task && task.status === 'qa_testing' && eventType === 'UPDATE' && prev?.status !== task.status) {
           if (task.assigned_agent) {
+            const unassignReason = `Unassigned from ${task.assigned_agent}: task moved to qa_testing`;
             console.log(`[UNASSIGN] Task ${task.id} → qa_testing, clearing assigned_agent (was: ${task.assigned_agent})`);
             await supabase
               .from('agent_tasks')
-              .update({ assigned_agent: null })
+              .update({ assigned_agent: null, error: unassignReason })
               .eq('id', task.id);
           }
         }
@@ -1747,9 +1748,11 @@ async function taskMonitor() {
 
           if (isQaTesting) {
             // QA session crashed — clear qa_agent so qaAutoScaler re-dispatches (stays in qa_testing)
+            const qaGoneReason = `QA agent session lost — re-queued for re-dispatch`;
             console.log(`[MONITOR] QA session gone for task ${task.id} ("${task.title}") → clearing qa_agent for re-dispatch`);
             await supabase.from("agent_tasks").update({
               qa_agent: null,
+              error: qaGoneReason,
             }).eq("id", task.id);
           } else if (elapsed > timeout) {
             console.log(`[MONITOR] Timeout + session gone: task ${task.id} ("${task.title}") → failed (${Math.round(elapsed / 60000)}min)`);
