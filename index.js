@@ -1804,10 +1804,12 @@ async function scheduler() {
       return;
     }
 
+    // Only count tasks in active statuses as load (not deployed/failed/completed/deprecated)
     const { data: activeTasks_db, error: activeErr } = await supabase
       .from("agent_tasks")
       .select("assigned_agent")
-      .or("status.eq.in_progress,assigned_agent.not.is.null");
+      .not("assigned_agent", "is", null)
+      .in("status", ["todo", "in_progress", "qa_testing", "blocked"]);
 
     if (activeErr) {
       console.error("[SCHEDULER] Error fetching active tasks:", activeErr.message);
