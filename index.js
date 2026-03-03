@@ -1796,6 +1796,7 @@ async function taskMonitor() {
 // --- Auto-scheduler: assign todo tasks to available agents ---
 async function scheduler() {
   try {
+    console.log("[SCHEDULER] Cycle starting...");
     const cards = await getAgentCards();
     if (!cards.length) {
       console.log("[SCHEDULER] No online agents found — skipping cycle");
