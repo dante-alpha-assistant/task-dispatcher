@@ -863,7 +863,7 @@ curl -s -X PATCH "https://lessxkxujvcmublgwdaa.supabase.co/rest/v1/agent_tasks?i
   -H "apikey: ${SUPABASE_KEY}" \\
   -H "Authorization: Bearer ${SUPABASE_KEY}" \\
   -H "Content-Type: application/json" \\
-  -d '{"status":"qa_testing","assigned_agent":null,"completed_at":"'$(date -u +%Y-%m-%dT%H:%M:%SZ)'","pr_ref":"https://github.com/OWNER/REPO/pull/NUMBER","result":{"summary":"DESCRIBE WHAT YOU DID","artifacts":[],"test_results":null}}'
+  -d '{"status":"qa_testing","assigned_agent":null,"completed_at":"'$(date -u +%Y-%m-%dT%H:%M:%SZ)'","pull_request_url":"https://github.com/OWNER/REPO/pull/NUMBER","result":{"summary":"DESCRIBE WHAT YOU DID","artifacts":[],"test_results":null}}'
 \`\`\`
 
 **On success (ops/review tasks WITHOUT a PR — skip QA):**
