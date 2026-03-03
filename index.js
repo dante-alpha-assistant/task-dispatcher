@@ -2336,7 +2336,8 @@ subscribe();
 
 // Auto-scheduler
 setInterval(scheduler, SCHEDULER_INTERVAL);
-scheduler();
+// Delay initial scheduler cycle by 5s to ensure Realtime subscription is ready
+setTimeout(scheduler, 5000);
 console.log(`[BOOT] Auto-scheduler running every ${SCHEDULER_INTERVAL / 1000}s`);
 
 // Unified task monitor (replaces watchdog + session checker)
