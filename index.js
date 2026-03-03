@@ -942,10 +942,15 @@ Do NOT skip this step. The task board at tasks.dante.id must reflect your work.`
         .eq("id", task.id);
     } else {
       const err = await resp.text();
-      console.error(`[ERR] ${agentName} returned ${resp.status}: ${err}`);
+      const errMsg = `Dispatch to ${agentName} failed: HTTP ${resp.status} — ${err.slice(0, 200)}`;
+      console.error(`[ERR] ${errMsg}`);
+      // Write error to task so it shows in Activity log
+      await supabase.from("agent_tasks").update({ error: errMsg, assigned_agent: null }).eq("id", task.id);
     }
   } catch (e) {
-    console.error(`[ERR] Failed to dispatch to ${agentName}: ${e.message}`);
+    const errMsg = `Dispatch to ${agentName} failed: ${e.message}`;
+    console.error(`[ERR] ${errMsg}`);
+    await supabase.from("agent_tasks").update({ error: errMsg, assigned_agent: null }).eq("id", task.id);
   }
 }
 
