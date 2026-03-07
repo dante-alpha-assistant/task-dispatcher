@@ -1355,6 +1355,39 @@ function subscribe() {
           await checkParentCompletion(task);
         }
 
+        // Auto-comment: when an agent writes a result, post it as a comment in the task thread
+        if (eventType === 'UPDATE' && task?.result && !prev?.result) {
+          try {
+            const agent = task.assigned_agent || prev?.assigned_agent || 'system';
+            const result = typeof task.result === 'object' ? task.result : (() => { try { return JSON.parse(task.result); } catch { return null; } })();
+            let commentBody = '📋 **Task Result**\n\n';
+            if (result?.summary) {
+              commentBody += result.summary;
+            } else {
+              commentBody += typeof task.result === 'string' ? task.result : JSON.stringify(task.result, null, 2);
+            }
+            if (result?.artifacts?.length) {
+              commentBody += '\n\n📎 **Artifacts:** ' + result.artifacts.join(', ');
+            }
+            if (result?.test_results) {
+              commentBody += '\n\n🧪 **Test Results:** ' + (typeof result.test_results === 'string' ? result.test_results : JSON.stringify(result.test_results));
+            }
+            if (task.pull_request_url?.length) {
+              commentBody += '\n\n🔗 **PR:** ' + task.pull_request_url.join(', ');
+            }
+            const { error: commentErr } = await supabase
+              .from('task_comments')
+              .insert({ task_id: task.id, author: agent, author_type: 'agent', body: commentBody });
+            if (commentErr) {
+              console.error(`[AUTO-COMMENT] Failed to post comment for task ${task.id}: ${commentErr.message}`);
+            } else {
+              console.log(`[AUTO-COMMENT] Posted result as comment for task ${task.id} by ${agent}`);
+            }
+          } catch (e) {
+            console.error(`[AUTO-COMMENT] Error: ${e.message}`);
+          }
+        }
+
         // Factory pipeline stage transitions: auto-advance to next stage
         // Note: factory tasks still use "done" internally for stage transitions before final QA
         if (task?.status === "qa_testing" && eventType === "UPDATE" && prev?.status && prev.status !== task.status && task.stage) {
