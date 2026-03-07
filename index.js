@@ -924,31 +924,29 @@ curl -s -X PATCH "https://lessxkxujvcmublgwdaa.supabase.co/rest/v1/agent_tasks?i
 \`\`\`
 
 
-
 **On blocked (you CANNOT complete the task):**
-```bash
-curl -s -X PATCH "https://lessxkxujvcmublgwdaa.supabase.co/rest/v1/agent_tasks?id=eq.${task.id}" \
-  -H "apikey: ${SUPABASE_KEY}" \
-  -H "Authorization: Bearer ${SUPABASE_KEY}" \
-  -H "Content-Type: application/json" \
-  -d '{"status":"blocked","blocked_reason":"EXPLAIN what you cannot do and why — e.g. missing DB password, need manual DNS config, etc."}'
-```
+\`\`\`bash
+curl -s -X PATCH "https://lessxkxujvcmublgwdaa.supabase.co/rest/v1/agent_tasks?id=eq.${task.id}" \\
+  -H "apikey: ${SUPABASE_KEY}" \\
+  -H "Authorization: Bearer ${SUPABASE_KEY}" \\
+  -H "Content-Type: application/json" \\
+  -d '{"status":"blocked","blocked_reason":"EXPLAIN what you cannot do and why"}'
+\`\`\`
 
-## 🚫 BLOCKED DETECTION RULES
+## BLOCKED DETECTION RULES
 
-**NEVER mark a task as done/completed if:**
-- It requires manual steps you couldn't perform (SQL migrations, external config, DNS changes)
+NEVER mark a task as done/completed if:
+- It requires manual steps you could not perform (SQL migrations, external config, DNS changes)
 - You wrote "apply this manually" or "run this in the dashboard" anywhere
 - Part of the deliverable is deferred to someone else
-- You couldn't verify the change actually works end-to-end
+- You could not verify the change actually works end-to-end
 
-**If ANY of the above apply → set status to `blocked` with a clear `blocked_reason`.**
+If ANY of the above apply, set status to blocked with a clear blocked_reason.
 
-**Use your capabilities FIRST before blocking:**
-- `curl` for API calls (Supabase REST, GitHub API, ArgoCD API)
-- `kubectl` for K8s operations
-- `gh` CLI for GitHub operations
-- Browser automation for web dashboards
+Use your capabilities FIRST before blocking:
+- curl for API calls (Supabase REST, GitHub API, ArgoCD API)
+- kubectl for K8s operations
+- gh CLI for GitHub operations
 Only block if you genuinely CANNOT do it after trying.
 
 Do NOT skip this step. The task board at tasks.dante.id must reflect your work.`;
