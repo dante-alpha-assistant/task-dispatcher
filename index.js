@@ -923,6 +923,34 @@ curl -s -X PATCH "https://lessxkxujvcmublgwdaa.supabase.co/rest/v1/agent_tasks?i
   -d '{"status":"failed","completed_at":"'$(date -u +%Y-%m-%dT%H:%M:%SZ)'","error":"DESCRIBE WHAT WENT WRONG"}'
 \`\`\`
 
+
+
+**On blocked (you CANNOT complete the task):**
+```bash
+curl -s -X PATCH "https://lessxkxujvcmublgwdaa.supabase.co/rest/v1/agent_tasks?id=eq.${task.id}" \
+  -H "apikey: ${SUPABASE_KEY}" \
+  -H "Authorization: Bearer ${SUPABASE_KEY}" \
+  -H "Content-Type: application/json" \
+  -d '{"status":"blocked","blocked_reason":"EXPLAIN what you cannot do and why — e.g. missing DB password, need manual DNS config, etc."}'
+```
+
+## 🚫 BLOCKED DETECTION RULES
+
+**NEVER mark a task as done/completed if:**
+- It requires manual steps you couldn't perform (SQL migrations, external config, DNS changes)
+- You wrote "apply this manually" or "run this in the dashboard" anywhere
+- Part of the deliverable is deferred to someone else
+- You couldn't verify the change actually works end-to-end
+
+**If ANY of the above apply → set status to `blocked` with a clear `blocked_reason`.**
+
+**Use your capabilities FIRST before blocking:**
+- `curl` for API calls (Supabase REST, GitHub API, ArgoCD API)
+- `kubectl` for K8s operations
+- `gh` CLI for GitHub operations
+- Browser automation for web dashboards
+Only block if you genuinely CANNOT do it after trying.
+
 Do NOT skip this step. The task board at tasks.dante.id must reflect your work.`;
 
   try {
@@ -1204,10 +1232,16 @@ async function assignQueuedQATasks() {
 3. **Does it match the task description?** Compare what was asked vs what was built
 4. **No regressions:** Check if the change breaks existing patterns in the codebase
 
+### VERIFY (not just code review):
+- For DB changes (triggers, functions, migrations): verify the change EXISTS in the database by querying Supabase REST API
+- For API changes: verify the endpoint responds correctly with a test curl
+- For UI changes: check the PR diff matches what the task asked for
+- If the agent wrote "apply manually" or deferred work → REJECT immediately
+
 ### DO NOT:
 - Clone the repo and try to build it
 - Run tests locally
-- Spend more than 3 minutes total
+- Spend more than 5 minutes total
 
 ### When done:
 - If acceptable: **MERGE the PR first** (squash merge via GitHub API), then update task status to \`completed\`
