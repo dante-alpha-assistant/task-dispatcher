@@ -990,10 +990,11 @@ async function qaStaleDetector() {
         // Track QA retries to prevent infinite loops
         const retryCount = (task.qa_retries || 0) + 1;
         if (retryCount > MAX_QA_RETRIES) {
-          console.log(`[QA-STALE] Task ${task.id} ("${task.title.slice(0, 40)}") exceeded ${MAX_QA_RETRIES} QA retries → marking failed`);
+          // Move to blocked instead of failed — work is done, just QA couldn't complete
+          console.log(`[QA-STALE] Task ${task.id} ("${task.title.slice(0, 40)}") exceeded ${MAX_QA_RETRIES} QA retries → marking BLOCKED (preserving completed work)`);
           await supabase
             .from("agent_tasks")
-            .update({ status: "failed", qa_agent: null, result: `QA failed: timed out ${retryCount} times` })
+            .update({ status: "blocked", qa_agent: null, blocked_reason: `QA failed: timed out ${retryCount} times — work is complete but QA could not verify. Needs manual review or re-dispatch.` })
             .eq("id", task.id);
         } else {
           console.log(`[QA-STALE] Task ${task.id} ("${task.title.slice(0, 40)}") stuck in qa_testing for ${Math.floor(age / 60000)}min → retry ${retryCount}/${MAX_QA_RETRIES}`);
@@ -1730,23 +1731,37 @@ async function taskMonitor() {
       }
 
       if (sessionAlive) {
-        // Idle timeout: session exists but hasn't been updated in 5 minutes
-        // This catches orphaned hook sessions where the LLM never started working
-        const IDLE_TIMEOUT = 5 * 60 * 1000; // 5 minutes
+        // Idle timeout: QA tasks get longer timeout since they need to clone, build, and test
+        const IDLE_TIMEOUT = isQaTesting ? 15 * 60 * 1000 : 5 * 60 * 1000; // 15min QA, 5min coding
         const hookSession = sessions?.find(s => s.key === (isQaTesting ? `agent:main:hook:qa:${task.id}` : `agent:main:hook:task:${task.id}`));
         const idleMs = hookSession ? Date.now() - (hookSession.updatedAt || 0) : 0;
         if (idleMs > IDLE_TIMEOUT) {
           const idleRetries = (task.idle_retries || 0) + 1;
           const MAX_IDLE_RETRIES = 3;
+          const hasCompletedWork = !!(task.result || (task.pull_request_url && task.pull_request_url.length > 0));
+
           if (idleRetries >= MAX_IDLE_RETRIES) {
-            console.log(`[MONITOR] Idle timeout: task ${task.id} ("${task.title.slice(0,40)}") → ${agentName} idle ${idleRetries} times → moving to BLOCKED`);
+            // Always go to blocked after max retries — preserve completed work context
+            const reason = hasCompletedWork
+              ? `QA timed out ${idleRetries} times but work is done (has result/PR) — needs manual QA or re-dispatch`
+              : `Timed out ${idleRetries} times — agent may be down or task needs manual intervention`;
+            console.log(`[MONITOR] Idle timeout: task ${task.id} ("${task.title.slice(0,40)}") → ${agentName} idle ${idleRetries} times → moving to BLOCKED (hasWork: ${hasCompletedWork})`);
             await supabase.from("agent_tasks").update({
               status: "blocked",
               assigned_agent: null,
               started_at: null,
               idle_retries: idleRetries,
-              blocked_reason: `Timed out ${idleRetries} times — agent may be down or task needs manual intervention`,
+              blocked_reason: reason,
               error: `Idle timeout: ${agentName} unresponsive after ${idleRetries} retries — moved to blocked`,
+            }).eq("id", task.id);
+          } else if (hasCompletedWork && isQaTesting) {
+            // QA idle but work is done — stay in qa_testing, just clear QA agent for re-dispatch
+            // Don't reset to todo — that loses the completed coding work
+            console.log(`[MONITOR] QA idle timeout: task ${task.id} ("${task.title.slice(0,40)}") → QA agent idle ${Math.floor(idleMs/60000)}min but work is done — clearing QA agent for re-dispatch (retry ${idleRetries}/${MAX_IDLE_RETRIES})`);
+            await supabase.from("agent_tasks").update({
+              qa_agent: null,
+              idle_retries: idleRetries,
+              error: `QA idle timeout: ${agentName} session idle >${Math.floor(idleMs/60000)}min — re-queued QA (retry ${idleRetries}/${MAX_IDLE_RETRIES})`,
             }).eq("id", task.id);
           } else {
             console.log(`[MONITOR] Idle timeout: task ${task.id} ("${task.title.slice(0,40)}") → ${agentName} idle ${Math.floor(idleMs/60000)}min (retry ${idleRetries}/${MAX_IDLE_RETRIES}) → resetting to todo`);
