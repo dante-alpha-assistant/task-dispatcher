@@ -104,6 +104,44 @@ function recordTransition(taskId) {
 }
 
 
+// --- Discord Webhook for Blocked Task Alerts ---
+const DISCORD_WEBHOOK_URL = process.env.DISCORD_BLOCKED_WEBHOOK_URL;
+const DANTE_DISCORD_ID = process.env.DANTE_DISCORD_ID || "185059032531206146";
+
+async function notifyBlockedTask(task) {
+  if (!DISCORD_WEBHOOK_URL) {
+    console.log(`[BLOCKED-ALERT] No DISCORD_BLOCKED_WEBHOOK_URL configured, skipping notification for task ${task.id}`);
+    return;
+  }
+  const reason = task.blocked_reason || task.error || "No reason provided";
+  const taskUrl = `https://tasks.dante.id/task/${task.id}`;
+  const agent = task.assigned_agent || "unknown";
+  const content = `🚫 **Task Blocked — Manual Intervention Required** <@${DANTE_DISCORD_ID}>
+
+**Task:** [${task.title}](${taskUrl})
+**Agent:** ${agent}
+**Priority:** ${task.priority || "normal"}
+**Blocked Reason:** ${reason}
+
+_Task ID: \`${task.id}\`_`;
+
+  try {
+    const resp = await fetch(DISCORD_WEBHOOK_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ content }),
+      signal: AbortSignal.timeout(10000),
+    });
+    if (resp.ok) {
+      console.log(`[BLOCKED-ALERT] Discord notification sent for task ${task.id}`);
+    } else {
+      console.error(`[BLOCKED-ALERT] Discord webhook returned ${resp.status} for task ${task.id}`);
+    }
+  } catch (e) {
+    console.error(`[BLOCKED-ALERT] Failed to send Discord notification for task ${task.id}:`, e.message);
+  }
+}
+
 // --- Gateway Concurrency Check ---
 // Check if an agent is currently busy by querying their gateway's sessions_list.
 // Returns true if the agent has active sessions (Discord, hooks, sub-agents) updated recently.
@@ -985,6 +1023,24 @@ ${!rebaseSection ? codingTaskSection : ""}
 **Dispatched by:** ${task.dispatched_by}${task.parent_task_id ? `\n\n**Parent Task:** ${task.parent_task_id}\n**Sub-task:** This is a sub-task of a larger task. Complete your portion and update status.` : ""}
 ${commentsBlock ? `\n${commentsBlock}` : ""}
 ${contextBlock}---
+## 🚫 BLOCKED: When you CANNOT fully complete a task
+
+If a task requires steps you cannot perform autonomously (SQL migrations in Supabase Dashboard, DNS changes, external API config, secrets rotation, manual approval), you MUST:
+1. Set the task status to \`blocked\` with a clear \`blocked_reason\` — do NOT mark it done/deployed
+2. NEVER write "apply manually" or "run this in the dashboard" as part of a completed task
+3. First try to do it yourself — you have: exec, curl, psql (if DB access is configured), GitHub API, browser automation, K8s kubectl
+4. Only block if you genuinely cannot perform the action with your available tools
+
+**On blocked (requires manual intervention):**
+\`\`\`bash
+curl -s -X PATCH "https://lessxkxujvcmublgwdaa.supabase.co/rest/v1/agent_tasks?id=eq.${task.id}" \\
+  -H "apikey: ${SUPABASE_KEY}" \\
+  -H "Authorization: Bearer ${SUPABASE_KEY}" \\
+  -H "Content-Type: application/json" \\
+  -d '{"status":"blocked","blocked_reason":"DESCRIBE WHAT NEEDS MANUAL INTERVENTION AND WHY YOU CANNOT DO IT","error":"Blocked: requires manual intervention"}'
+\`\`\`
+
+---
 ## ⚠️ MANDATORY: Update task status when done
 
 When you finish this task, you MUST update its status. Run this command:
@@ -1678,7 +1734,20 @@ initLangfuse();
           }
         }
 
-                // Remove completed/failed tasks from active tracking
+
+        // Blocked task alert: notify Dante via Discord when a task moves to blocked
+        if (task?.status === 'blocked' && eventType === 'UPDATE' && prev?.status !== 'blocked') {
+          console.log(`[BLOCKED] Task ${task.id} ("${task.title}") moved to blocked by ${task.assigned_agent || 'unknown'}`);
+          await notifyBlockedTask(task);
+          // Also remove from active tracking
+          if (activeTasks.has(task.id)) {
+            console.log(`[TRACKER] Task ${task.id} blocked, removing from active tracking`);
+            activeTasks.delete(task.id);
+          }
+        }
+
+
+        // Remove completed/failed tasks from active tracking
         if (task?.status === 'qa_testing' || task?.status === 'failed' || task?.status === 'completed' || task?.status === 'deployed') {
           if (activeTasks.has(task.id)) {
             console.log(`[TRACKER] Task ${task.id} completed (${task.status}), removing from active tracking`);
@@ -1819,7 +1888,9 @@ initLangfuse();
 1. Check the result — was the change applied successfully?
 2. Any errors in the output?
 3. Does the result match the description?
-DO NOT: SSH into servers, run commands, or deep-dive into infrastructure.`;
+4. **Verify the ACTUAL outcome** — if the task claims a DB change was made, verify it exists (query Supabase API). If a deployment was made, verify the pod/service is running. Do NOT just trust the agent's summary.
+5. If the agent's result says "apply manually" or "run this in the dashboard", REJECT and set status back to \`blocked\` — agents must either do it themselves or properly block the task.
+DO NOT: SSH into servers or deep-dive into infrastructure.`;
               timeLimit = '1 minute';
             } else if (taskType === 'coding') {
               qaScope = `### Code Review QA (complete in under 3 minutes)
@@ -1827,6 +1898,8 @@ DO NOT: SSH into servers, run commands, or deep-dive into infrastructure.`;
 2. Scan for: obvious bugs, missing error handling, broken imports, hardcoded secrets
 3. Does the code match what was requested in the description?
 4. Check for regressions — does the change break existing patterns?
+5. **Verify actual outcomes** — for DB changes, verify the trigger/function/table exists via Supabase API. For deployments, verify the feature works end-to-end (not just that a pod restarted). Do NOT just trust that merged code = working feature.
+6. If the result contains "apply manually" or "run this in the dashboard", REJECT — set task back to \ with reason explaining what the agent failed to do autonomously.
 DO NOT: Clone the repo, run builds, run tests, or spend more than 3 minutes.
 
 ### ⛔ ATOMIC RULE: ONE status update only
