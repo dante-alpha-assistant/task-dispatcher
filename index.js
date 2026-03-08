@@ -1330,7 +1330,7 @@ async function assignQueuedQATasks() {
     // Only consider pods running for > 45s (gateway needs time to start)
     const readyPods = (podList.items || []).filter(p => {
       const startTime = p.status?.startTime ? new Date(p.status.startTime).getTime() : Date.now();
-      return (Date.now() - startTime) > 45000;
+      return (Date.now() - startTime) > 150000;
     });
     const runningWorkers = readyPods.map((p) => p.metadata.name);
     const podIpMap = {};
@@ -1338,7 +1338,7 @@ async function assignQueuedQATasks() {
       if (p.status?.podIP) podIpMap[p.metadata.name] = p.status.podIP;
     }
     if (!runningWorkers.length) {
-      console.log('[QA-SCALER] No ready workers (all < 45s old) — will retry next cycle');
+      console.log('[QA-SCALER] No ready workers (all < 150s old) — will retry next cycle');
       return;
     }
 
