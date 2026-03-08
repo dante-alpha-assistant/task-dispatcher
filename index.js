@@ -1766,7 +1766,7 @@ curl -s -X PATCH "https://lessxkxujvcmublgwdaa.supabase.co/rest/v1/agent_tasks?i
             const resp = await fetch(qaAgent.url, {
               method: "POST",
               headers: {
-                Authorization: `Bearer ${qaAgent.gatewayToken || qaAgent.token}`,
+                Authorization: `Bearer ${qaAgent.token}`,
                 "Content-Type": "application/json",
               },
               body: JSON.stringify({
