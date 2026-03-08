@@ -2470,3 +2470,333 @@ process.on("SIGTERM", () => {
   console.log("[SHUTDOWN] Received SIGTERM");
   process.exit(0);
 });
+
+// ==========================================
+// Coding Worker Auto-Scaler
+// Spawns ephemeral K8s Jobs when todo coding queue exceeds capacity
+// ==========================================
+
+const MAX_CODING_WORKERS = 5;
+const CODING_SCALER_INTERVAL = 30000; // 30 seconds
+const CODING_WORKER_HOOKS_TOKEN = "ephemeral-coding-worker-tok-2026";
+
+async function codingAutoScaler() {
+  try {
+    // 1. Count unassigned todo coding tasks waiting > 2 min
+    const twoMinAgo = new Date(Date.now() - 2 * 60 * 1000).toISOString();
+    const { data: todoTasks, error } = await supabase
+      .from("agent_tasks")
+      .select("id, title, type, created_at")
+      .eq("status", "todo")
+      .in("type", ["coding", "ops", "general"])
+      .is("assigned_agent", null)
+      .lt("created_at", twoMinAgo);
+
+    if (error) {
+      console.error("[CODING-SCALER] Error querying queue:", error.message);
+      return;
+    }
+
+    const queueDepth = todoTasks?.length || 0;
+
+    // 2. Count active ephemeral coding worker jobs
+    const jobListResp = await batchApi.listNamespacedJob({
+      namespace: "agents",
+      labelSelector: "role=coding-worker,managed-by=task-dispatcher",
+    });
+    const jobList = jobListResp?.body || jobListResp || {};
+    const activeJobs = (jobList.items || []).filter(
+      (j) => !j.status?.succeeded && !j.status?.failed
+    );
+    const activeWorkers = activeJobs.length;
+
+    if (queueDepth > 0 || activeWorkers > 0) {
+      console.log(`[CODING-SCALER] Queue: ${queueDepth} todo tasks, Active ephemeral workers: ${activeWorkers}`);
+    }
+
+    // 3. Spawn workers if needed
+    if (queueDepth > 0 && activeWorkers < MAX_CODING_WORKERS) {
+      const toSpawn = Math.min(queueDepth, MAX_CODING_WORKERS - activeWorkers);
+      for (let i = 0; i < toSpawn; i++) {
+        const task = todoTasks[i];
+        if (task) {
+          await spawnCodingWorker(task);
+        }
+      }
+    }
+
+    // 4. Clean up completed/failed jobs older than 5 min
+    for (const job of jobList.items || []) {
+      if (job.status?.succeeded || job.status?.failed) {
+        const finishTime = job.status.completionTime || job.status.conditions?.[0]?.lastTransitionTime;
+        if (finishTime && Date.now() - new Date(finishTime).getTime() > 5 * 60 * 1000) {
+          try {
+            await batchApi.deleteNamespacedJob({
+              name: job.metadata.name,
+              namespace: "agents",
+              propagationPolicy: "Background",
+            });
+            console.log(`[CODING-SCALER] Cleaned up job ${job.metadata.name}`);
+          } catch (e) {
+            console.error(`[CODING-SCALER] Failed to clean up job ${job.metadata.name}:`, e.message);
+          }
+        }
+      }
+    }
+  } catch (e) {
+    console.error("[CODING-SCALER] Error:", e.message);
+  }
+}
+
+async function spawnCodingWorker(task) {
+  const workerName = `coding-worker-${Date.now().toString(36)}`;
+  const hooksToken = CODING_WORKER_HOOKS_TOKEN;
+  console.log(`[CODING-SCALER] Spawning ${workerName} for task ${task.id.slice(0,8)} ("${task.title.slice(0,40)}")`);
+
+  // The init-config script generates openclaw.json inline
+  const initConfigScript = `
+const fs = require('fs');
+const e = process.env;
+const config = {
+  gateway: {
+    port: 18789,
+    mode: "local",
+    bind: "lan",
+    auth: { mode: "token", token: e.OPENCLAW_GATEWAY_TOKEN || "ephemeral-gw-tok" },
+    tools: { allow: ["sessions_spawn","sessions_send","sessions_list","sessions_history","session_status"] },
+  },
+  models: {
+    providers: {
+      anthropic: {
+        baseUrl: "https://api.anthropic.com",
+        models: [{ id: "claude-opus-4-6", name: "claude-opus-4-6", api: "anthropic-messages", reasoning: true, input: ["text","image"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 200000, maxTokens: 16384 }]
+      },
+      openrouter: {
+        baseUrl: "https://openrouter.ai/api/v1",
+        apiKey: e.OPENROUTER_API_KEY || "",
+        models: [
+          { id: "moonshotai/kimi-k2.5", name: "kimi-k2.5", api: "openai-completions", reasoning: true, input: ["text","image"], cost: { input: 0.45, output: 2.25, cacheRead: 0.07, cacheWrite: 0 }, contextWindow: 262144, maxTokens: 8192 },
+        ]
+      }
+    }
+  },
+  agents: {
+    defaults: {
+      model: { primary: "anthropic/claude-opus-4-6" },
+      workspace: "/root/.openclaw/workspace",
+      compaction: { mode: "safeguard" },
+      maxConcurrent: 2,
+      subagents: { maxConcurrent: 4 },
+    }
+  },
+  hooks: { enabled: true, token: "${hooksToken}", allowRequestSessionKey: true, defaultSessionKey: "hook:default", allowedSessionKeyPrefixes: ["hook:"] },
+  tools: { sessions: { visibility: "all" } }
+};
+fs.mkdirSync('/root/.openclaw/workspace/skills/task-worker', { recursive: true });
+fs.mkdirSync('/root/.openclaw/workspace/skills/coding-task', { recursive: true });
+fs.writeFileSync('/root/.openclaw/openclaw.json', JSON.stringify(config, null, 2));
+
+// Write task-worker skill
+fs.writeFileSync('/root/.openclaw/workspace/skills/task-worker/SKILL.md', \`# task-worker — Dispatched Task Execution Skill
+
+## When to Use
+This skill applies to EVERY message from "Task Dispatcher" that contains a JSON task payload.
+
+## Git Workflow
+1. Clone the repo to /tmp/<repo-name> (ephemeral worker — no persistent workspace)
+2. git checkout main && git pull origin main
+3. git checkout -b task/<task-id-first-8-chars>
+4. Make your changes
+5. git add -A && git commit -m "<type>: <description> [task:<id>]"
+6. git push origin HEAD
+7. Create PR: gh pr create --title "<title>" --body "Task: <id>" --base main
+
+## GitHub Auth
+Use GH_TOKEN env var: git clone https://x-access-token:\\\${GH_TOKEN}@github.com/<owner>/<repo>.git
+
+## MANDATORY: Blocked Detection
+- NEVER mark done if manual steps remain
+- NEVER write "apply this manually" — block the task instead
+- Use curl, kubectl, gh CLI FIRST before blocking
+\`);
+
+// Write coding-task skill  
+fs.writeFileSync('/root/.openclaw/workspace/skills/coding-task/SKILL.md', \`# coding-task Skill
+
+## Steps
+1. Parse the task (extract task_id, title, description, repo)
+2. Setup git: git config user.email "neo-ephemeral@openclaw.ai" && git config user.name "Neo (ephemeral)"
+3. Clone repo to /tmp: cd /tmp && git clone https://x-access-token:\\\${GH_TOKEN}@github.com/{owner}/{repo}.git
+4. Create branch: git checkout -b task/{short-task-id}
+5. Make changes — keep focused on what the task asks
+6. Commit and push: git add -A && git commit -m "{type}: {description} [task:{id}]" && git push -u origin HEAD
+7. Create PR: gh pr create --title "{task title}" --body "Task: {task_id}" --base main
+8. Update task status with the curl command from the dispatch payload
+
+## NEVER:
+- Edit files without cloning the repo first
+- Commit to main directly
+- Mark done if manual steps remain — set status to blocked instead
+\`);
+
+// Write AGENTS.md
+fs.writeFileSync('/root/.openclaw/workspace/AGENTS.md', \`# Ephemeral Coding Worker
+You are a temporary coding agent. Complete the assigned task, push a PR, update status, then exit.
+Do NOT create memory files or heartbeats. You are ephemeral.
+\`);
+
+console.log("Config + skills written for ephemeral coding worker");
+`;
+
+  const job = {
+    apiVersion: "batch/v1",
+    kind: "Job",
+    metadata: {
+      name: workerName,
+      namespace: "agents",
+      labels: {
+        app: "coding-worker",
+        role: "coding-worker",
+        "managed-by": "task-dispatcher",
+        "task-id": task.id.slice(0, 8),
+      },
+    },
+    spec: {
+      backoffLimit: 0,
+      ttlSecondsAfterFinished: 300,
+      activeDeadlineSeconds: 1800, // 30 min max
+      template: {
+        metadata: {
+          labels: {
+            app: "coding-worker",
+            role: "coding-worker",
+            "managed-by": "task-dispatcher",
+          },
+        },
+        spec: {
+          restartPolicy: "Never",
+          initContainers: [
+            {
+              name: "init-tools",
+              image: "debian:bookworm-slim",
+              command: ["/bin/bash", "-c"],
+              args: [
+                "apt-get update -qq && apt-get install -y -qq curl ca-certificates > /dev/null 2>&1 && " +
+                "KUBE_VER=v1.31.0 && curl -sL \"https://dl.k8s.io/release/${KUBE_VER}/bin/linux/amd64/kubectl\" -o /tools/kubectl && " +
+                "chmod +x /tools/kubectl && echo 'kubectl ready'"
+              ],
+              volumeMounts: [{ name: "tools-bin", mountPath: "/tools" }],
+            },
+            {
+              name: "init-config",
+              image: "node:22-bookworm-slim",
+              command: ["node", "-e"],
+              args: [initConfigScript],
+              envFrom: [{ secretRef: { name: "neo-worker-env" } }],
+              volumeMounts: [{ name: "workspace", mountPath: "/root/.openclaw" }],
+            },
+          ],
+          containers: [
+            {
+              name: "openclaw",
+              image: process.env.QA_WORKER_IMAGE || "ghcr.io/dante-alpha-assistant/openclaw-agent:latest",
+              env: [
+                { name: "PATH", value: "/tools:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" },
+              ],
+              envFrom: [{ secretRef: { name: "neo-worker-env" } }],
+              ports: [{ containerPort: 18789 }],
+              resources: {
+                requests: { cpu: "200m", memory: "512Mi" },
+                limits: { cpu: "2", memory: "2Gi" },
+              },
+              volumeMounts: [
+                { name: "workspace", mountPath: "/root/.openclaw" },
+                { name: "tools-bin", mountPath: "/tools" },
+              ],
+            },
+          ],
+          volumes: [
+            { name: "workspace", emptyDir: {} },
+            { name: "tools-bin", emptyDir: {} },
+          ],
+        },
+      },
+    },
+  };
+
+  try {
+    await batchApi.createNamespacedJob({ namespace: "agents", body: job });
+    console.log(`[CODING-SCALER] Spawned job: ${workerName}`);
+
+    // Pre-assign task to prevent other agents from picking it up
+    await supabase.from("agent_tasks").update({
+      assigned_agent: workerName,
+      status: "assigned",
+    }).eq("id", task.id);
+
+    // Wait for pod to get an IP (poll for up to 60s)
+    let podIp = null;
+    for (let i = 0; i < 12; i++) {
+      await new Promise(r => setTimeout(r, 5000));
+      try {
+        const podsResp = await coreApi.listNamespacedPod({
+          namespace: "agents",
+          labelSelector: `job-name=${workerName}`,
+        });
+        const pods = podsResp?.body?.items || podsResp?.items || [];
+        const runningPod = pods.find(p => p.status?.phase === "Running" && p.status?.podIP);
+        if (runningPod) {
+          podIp = runningPod.status.podIP;
+          break;
+        }
+      } catch (e) {
+        console.warn(`[CODING-SCALER] Pod poll error: ${e.message}`);
+      }
+    }
+
+    if (!podIp) {
+      console.error(`[CODING-SCALER] ${workerName} pod did not get IP within 60s — task ${task.id.slice(0,8)} will be re-queued`);
+      await supabase.from("agent_tasks").update({
+        assigned_agent: null,
+        status: "todo",
+        error: `Ephemeral worker ${workerName} failed to start`,
+      }).eq("id", task.id);
+      return;
+    }
+
+    console.log(`[CODING-SCALER] ${workerName} running at ${podIp} — dispatching task ${task.id.slice(0,8)}`);
+
+    // Register as temporary agent for dispatch
+    AGENTS[workerName] = {
+      url: `http://${podIp}:18789/hooks/agent`,
+      token: hooksToken,
+      gatewayToken: "ephemeral-gw-tok",
+    };
+
+    // Dispatch the task
+    const taskToDispatch = { ...task, status: "assigned", assigned_agent: workerName };
+    const fullTask = await supabase.from("agent_tasks").select("*").eq("id", task.id).single();
+    if (fullTask.data) {
+      await dispatchToAgent({ ...fullTask.data, assigned_agent: workerName });
+    }
+
+    // Clean up AGENTS entry after 35 min (job TTL is 30 min)
+    setTimeout(() => {
+      delete AGENTS[workerName];
+      console.log(`[CODING-SCALER] Cleaned up AGENTS entry for ${workerName}`);
+    }, 35 * 60 * 1000);
+
+  } catch (e) {
+    console.error(`[CODING-SCALER] Failed to spawn ${workerName}: ${e.message}`);
+    // Reset task
+    await supabase.from("agent_tasks").update({
+      assigned_agent: null,
+      status: "todo",
+    }).eq("id", task.id);
+  }
+}
+
+// Start coding auto-scaler
+setInterval(codingAutoScaler, CODING_SCALER_INTERVAL);
+console.log(`[BOOT] Coding auto-scaler running every ${CODING_SCALER_INTERVAL / 1000}s (max ${MAX_CODING_WORKERS} ephemeral workers)`);
+
