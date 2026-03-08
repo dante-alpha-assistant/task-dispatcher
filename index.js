@@ -1216,7 +1216,7 @@ const config = {
         baseUrl: "https://openrouter.ai/api/v1",
         apiKey: process.env.OPENROUTER_API_KEY || "",
         models: [
-          { id: "moonshotai/kimi-k2.5", name: "kimi-k2.5", api: "openai-completions", reasoning: true, input: ["text","image"], cost: { input: 0.45, output: 2.25 }, contextWindow: 262144, maxTokens: 4096 },
+          { id: "moonshotai/kimi-k2.5", name: "kimi-k2.5", api: "openai-completions", reasoning: true, input: ["text","image"], cost: { input: 0.45, output: 2.25 }, contextWindow: 262144, maxTokens: 16384 },
         ]
       }
     }
