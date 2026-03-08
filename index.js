@@ -1606,6 +1606,8 @@ function subscribe() {
             }
             if (task.pull_request_url?.length) {
               commentBody += '\n\n🔗 **PR:** ' + task.pull_request_url.join(', ');
+            } else if (task.repository_url) {
+              commentBody += '\n\n📦 **Repository:** ' + task.repository_url;
             }
             const { error: commentErr } = await supabase
               .from('task_comments')
