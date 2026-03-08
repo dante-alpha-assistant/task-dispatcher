@@ -2564,6 +2564,7 @@ const config = {
     bind: "lan",
     auth: { mode: "token", token: e.OPENCLAW_GATEWAY_TOKEN || "ephemeral-gw-tok" },
     tools: { allow: ["sessions_spawn","sessions_send","sessions_list","sessions_history","session_status"] },
+    controlUi: { dangerouslyAllowHostHeaderOriginFallback: true },
   },
   models: {
     providers: {
