@@ -2141,7 +2141,7 @@ async function scheduler() {
       .from("agent_tasks")
       .select("assigned_agent")
       .not("assigned_agent", "is", null)
-      .in("status", ["todo", "in_progress", "qa_testing", "blocked"]);
+      .in("status", ["in_progress", "qa_testing"]);
 
     if (activeErr) {
       console.error("[SCHEDULER] Error fetching active tasks:", activeErr.message);
@@ -2302,7 +2302,7 @@ async function scheduler() {
           .from("agent_tasks")
           .select("id")
           .eq("assigned_agent", bestCandidate.name)
-          .in("status", ["todo", "in_progress", "qa_testing", "blocked"])
+          .in("status", ["in_progress", "qa_testing"])
           .limit(5);
         const inflightCount = inflightCheck?.length || 0;
         if (inflightCount >= originalAgent.max_concurrent) {
