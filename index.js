@@ -933,6 +933,27 @@ async function dispatchToAgent(task) {
   const contextBlock = await buildContextBlockWithTimeout(task);
   const commentsBlock = await fetchTaskComments(task.id);
 
+  // Build rebase section if metadata indicates rebase requested
+  const rebaseSection = task.metadata?.rebase_requested && task.metadata?.rebase_pr ? (() => {
+    const rp = task.metadata.rebase_pr;
+    return `
+## 🔄 Rebase Required
+
+**This task is being re-dispatched to resolve merge conflicts on PR #${rp.number}.**
+
+### Instructions:
+1. Clone the repo: \`git clone https://x-access-token:\${GH_TOKEN}@github.com/${rp.repo}.git /tmp/${rp.repo.split('/')[1]}\`
+2. Checkout the PR branch: \`cd /tmp/${rp.repo.split('/')[1]} && git checkout ${rp.branch}\`
+3. Rebase against ${rp.base}: \`git rebase origin/${rp.base}\`
+4. Resolve any merge conflicts (edit files, \`git add\`, \`git rebase --continue\`)
+5. Force push: \`git push --force-with-lease origin ${rp.branch}\`
+6. Verify the PR is now mergeable: \`gh pr view ${rp.number} -R ${rp.repo} --json mergeable\`
+7. Update task status when done
+
+**If conflicts are too complex to resolve automatically, set the task to blocked with an explanation of which files conflict and why.**
+`;
+  })() : "";
+
   // Build coding task section if applicable
   const codingTaskSection = task.type === "coding" ? `
 ## Coding Task
@@ -951,9 +972,9 @@ ${taskPayload}
 
 ${contextBlock}## Task Assigned: ${task.title}
 
-${task.description || ""}
-${task.prompt ? `**Prompt:** ${task.prompt}` : ""}
-${codingTaskSection}
+${rebaseSection || (task.description || "")}
+${!rebaseSection && task.prompt ? `**Prompt:** ${task.prompt}` : ""}
+${!rebaseSection ? codingTaskSection : ""}
 
 **Task ID:** ${task.id}
 **Type:** ${task.type}
