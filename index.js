@@ -3112,6 +3112,7 @@ console.log("Config + skills written for ephemeral coding worker");
 }
 
 // Start coding auto-scaler
-setInterval(codingAutoScaler, CODING_SCALER_INTERVAL);
+// DISABLED: persistent worker replicas replace ephemeral pods
+// setInterval(codingAutoScaler, CODING_SCALER_INTERVAL);
 console.log(`[BOOT] Coding auto-scaler running every ${CODING_SCALER_INTERVAL / 1000}s (max ${MAX_CODING_WORKERS} ephemeral workers)`);
 
