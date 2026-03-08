@@ -1209,6 +1209,7 @@ const config = {
     bind: "lan",
     auth: { mode: "token", token: "ephemeral-qa-gw-tok-2026" },
     controlUi: { dangerouslyAllowHostHeaderOriginFallback: true },
+    tools: { allow: ["Read", "Write", "Edit", "exec", "web_fetch"] },
   },
   models: {
     providers: {
