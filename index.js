@@ -1324,6 +1324,10 @@ async function assignQueuedQATasks() {
     const podList = podListResp?.body || podListResp || {};
 
     const runningWorkers = (podList.items || []).map((p) => p.metadata.name);
+    const podIpMap = {};
+    for (const p of (podList.items || [])) {
+      if (p.status?.podIP) podIpMap[p.metadata.name] = p.status.podIP;
+    }
     if (!runningWorkers.length) return;
 
     const { data: assignedTasks } = await supabase
@@ -1352,7 +1356,9 @@ async function assignQueuedQATasks() {
 
       console.log(`[QA-SCALER] Assigned task ${task.id} ("${task.title}") to ${worker}`);
 
-      const workerUrl = `http://${worker}.agents.svc.cluster.local:18789/hooks/agent`;
+      const podIp = podIpMap[worker];
+      if (!podIp) { console.warn(`[QA-SCALER] No pod IP for ${worker}, skipping dispatch`); continue; }
+      const workerUrl = `http://${podIp}:18789/hooks/agent`;
       try {
         const qaContextBlock = await buildContextBlockWithTimeout(task);
         // Tiered QA prompt based on task type
@@ -1431,7 +1437,7 @@ Generate realistic Gherkin scenarios, then PATCH the task with acceptance_criter
         const qaMessage = `${qaContextBlock}\n${qaInstructions}`;
         await fetch(workerUrl, {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: { "Content-Type": "application/json", "Authorization": "Bearer ephemeral-qa-worker-tok-2026" },
           body: JSON.stringify({
             message: qaMessage,
             name: "Task Dispatcher (QA Auto-Scaler)",
