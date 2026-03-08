@@ -2259,6 +2259,7 @@ async function scheduler() {
       .select("*")
       .eq("status", "todo")
       .is("assigned_agent", null)
+      .neq("paused", true)
       .lt("updated_at", cooldownTime)
       .order("created_at", { ascending: true });
 
@@ -2804,6 +2805,7 @@ async function codingAutoScaler() {
       .eq("status", "todo")
       .in("type", ["coding", "ops", "general"])
       .is("assigned_agent", null)
+      .neq("paused", true)
       .lt("created_at", twoMinAgo);
 
     if (error) {
