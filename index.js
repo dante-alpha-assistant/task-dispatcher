@@ -1766,7 +1766,7 @@ curl -s -X PATCH "https://lessxkxujvcmublgwdaa.supabase.co/rest/v1/agent_tasks?i
             const resp = await fetch(qaAgent.url, {
               method: "POST",
               headers: {
-                Authorization: `Bearer ${qaAgent.token}`,
+                Authorization: `Bearer ${qaAgent.gatewayToken || qaAgent.token}`,
                 "Content-Type": "application/json",
               },
               body: JSON.stringify({
@@ -2232,10 +2232,17 @@ async function scheduler() {
       trulyTodoTasks.push(t);
     }
 
-    // QA tasks are handled by the QA auto-scaler (ephemeral workers) — skip them here
-    // This prevents the scheduler from assigning all QA to beta-worker serially
-    console.log(`[SCHEDULER] Found ${(todoTasks||[]).length} todo tasks, ${freeAgents.length} free agents (QA handled by scaler)`);
-    const allSchedulable = [...trulyTodoTasks];
+    // Fetch unassigned QA tasks for scheduling
+    const { data: qaTasks } = await supabase
+      .from('agent_tasks')
+      .select('*')
+      .eq('status', 'qa_testing')
+      .is('assigned_agent', null)
+      .lt('updated_at', cooldownTime)
+      .order('created_at', { ascending: true });
+    const qaTaskList = (qaTasks || []).filter(t => canTransition(t.id));
+    console.log(`[SCHEDULER] Found ${(todoTasks||[]).length} todo + ${qaTaskList.length} QA tasks, ${freeAgents.length} free agents`);
+    const allSchedulable = [...qaTaskList, ...trulyTodoTasks];
     if (!allSchedulable.length) { console.log("[SCHEDULER] No schedulable tasks found"); return; }
 
     allSchedulable.sort((a, b) => {
@@ -2705,7 +2712,7 @@ console.log(`[BOOT] Task monitor running every ${MONITOR_INTERVAL / 1000}s (hard
 
 // QA Auto-Scaler — DISABLED: scheduler handles QA assignment via agent_cards
 // The QA scaler used K8s pod names instead of agent names, causing dispatch failures.
-setInterval(qaAutoScaler, 30000);
+// setInterval(qaAutoScaler, 30000); // Disabled — using persistent beta-worker replicas
 console.log(`[BOOT] QA auto-scaler ENABLED — spawns ephemeral workers when QA queue > 1 (max ${MAX_QA_WORKERS})`);
 
 // Stale agent detector
