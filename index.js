@@ -1171,7 +1171,7 @@ const config = {
     port: 18789,
     mode: "local",
     bind: "lan",
-    auth: { mode: "token", token: "${hooksToken}" },
+    auth: { mode: "token", token: "ephemeral-qa-gw-tok-2026" },
     controlUi: { dangerouslyAllowHostHeaderOriginFallback: true },
   },
   models: {
