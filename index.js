@@ -232,6 +232,58 @@ function isFinalStage(stage) {
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
+// Log an event to the task's activity log (visible in dashboard Activity tab)
+async function logTaskActivity(taskId, field, oldValue, newValue, changedBy = 'dispatcher') {
+  try {
+    await supabase.from('task_activity_log').insert({
+      task_id: taskId,
+      field,
+      old_value: oldValue,
+      new_value: newValue,
+      changed_by: changedBy,
+      changed_at: new Date().toISOString(),
+    });
+  } catch (e) {
+    console.error('[ACTIVITY-LOG] Failed to log activity for task', taskId, ':', e.message);
+  }
+}
+
+// Boot-time: detect orphaned tasks (assigned but never dispatched due to restart)
+async function detectOrphanedTasks() {
+  try {
+    const fiveMinAgo = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+    const { data: orphaned, error } = await supabase
+      .from('agent_tasks')
+      .select('id, title, assigned_agent, status, updated_at')
+      .eq('status', 'todo')
+      .not('assigned_agent', 'is', null)
+      .lt('updated_at', fiveMinAgo);
+
+    if (error || !orphaned?.length) return;
+
+    console.log('[BOOT-ORPHAN] Found ' + orphaned.length + ' orphaned tasks (assigned but stuck in todo)');
+    for (const task of orphaned) {
+      const agent = task.assigned_agent;
+      console.log('[BOOT-ORPHAN] Re-dispatching ' + task.id.slice(0,8) + ' ("' + task.title.slice(0,40) + '") — was assigned to ' + agent);
+      
+      // Log the error to activity
+      await logTaskActivity(task.id, 'dispatch_error', null,
+        'Task was assigned to ' + agent + ' but dispatch was lost (dispatcher restarted). Auto-recovering — clearing assignment for re-dispatch.',
+        'dispatcher');
+
+      // Clear assignment so scheduler picks it up fresh
+      await supabase.from('agent_tasks').update({
+        assigned_agent: null,
+        error: 'Dispatch lost during restart — re-queued automatically',
+        updated_at: new Date().toISOString(),
+      }).eq('id', task.id);
+    }
+  } catch (e) {
+    console.error('[BOOT-ORPHAN] Error:', e.message);
+  }
+}
+
+
 // Map project status → task stage
 const STATUS_TO_STAGE = {
   new: "refinery",
@@ -807,6 +859,7 @@ async function dispatchToAgent(task) {
   if (!authCheck.ok) {
     const authReason = `Auth preflight failed for ${agentName} (HTTP ${authCheck.status}) — agent may have expired credentials`;
     console.log(`[AUTH-PREFLIGHT] ${authReason}`);
+    await logTaskActivity(task.id, 'dispatch_error', null, authReason, 'dispatcher');
     // If task was in_progress with a result, move to qa_testing (work was done)
     // If in_progress without result, move back to todo for re-dispatch
     const statusFix = task.status === 'in_progress'
@@ -1012,6 +1065,7 @@ async function qaStaleDetector() {
             .from("agent_tasks")
             .update({ status: "blocked", qa_agent: null, blocked_reason: `QA failed: timed out ${retryCount} times — work is complete but QA could not verify. Needs manual review or re-dispatch.` })
             .eq("id", task.id);
+          await logTaskActivity(task.id, 'qa_error', null, `QA timed out ${retryCount} times — moved to blocked for manual review`, 'dispatcher');
         } else {
           console.log(`[QA-STALE] Task ${task.id} ("${task.title.slice(0, 40)}") stuck in qa_testing for ${Math.floor(age / 60000)}min → retry ${retryCount}/${MAX_QA_RETRIES}`);
           await supabase
@@ -1809,6 +1863,7 @@ async function taskMonitor() {
               blocked_reason: reason,
               error: `Idle timeout: ${agentName} unresponsive after ${idleRetries} retries — moved to blocked`,
             }).eq("id", task.id);
+            await logTaskActivity(task.id, 'dispatch_error', null, `Idle timeout: ${agentName} unresponsive after ${idleRetries} retries. HasCompletedWork: ${hasCompletedWork}. Moved to blocked.`, 'dispatcher');
           } else if (hasCompletedWork && isQaTesting) {
             // QA idle but work is done — stay in qa_testing, just clear QA agent for re-dispatch
             // Don't reset to todo — that loses the completed coding work
@@ -1818,6 +1873,7 @@ async function taskMonitor() {
               idle_retries: idleRetries,
               error: `QA idle timeout: ${agentName} session idle >${Math.floor(idleMs/60000)}min — re-queued QA (retry ${idleRetries}/${MAX_IDLE_RETRIES})`,
             }).eq("id", task.id);
+            await logTaskActivity(task.id, 'dispatch_error', null, `QA agent ${agentName} idle for ${Math.floor(idleMs/60000)}min — re-queued QA (retry ${idleRetries}/${MAX_IDLE_RETRIES})`, 'dispatcher');
           } else {
             console.log(`[MONITOR] Idle timeout: task ${task.id} ("${task.title.slice(0,40)}") → ${agentName} idle ${Math.floor(idleMs/60000)}min (retry ${idleRetries}/${MAX_IDLE_RETRIES}) → resetting to todo`);
             await supabase.from("agent_tasks").update({
@@ -1827,6 +1883,7 @@ async function taskMonitor() {
               idle_retries: idleRetries,
               error: `Idle timeout: ${agentName} session idle >${Math.floor(idleMs/60000)}min — re-queued (retry ${idleRetries}/${MAX_IDLE_RETRIES})`,
             }).eq("id", task.id);
+            await logTaskActivity(task.id, 'dispatch_error', null, `Agent ${agentName} idle for ${Math.floor(idleMs/60000)}min — re-queued (retry ${idleRetries}/${MAX_IDLE_RETRIES})`, 'dispatcher');
           }
           activeTasks.delete(task.id);
           continue;
@@ -2446,7 +2503,8 @@ console.log(`[BOOT] Auto-scheduler running every ${SCHEDULER_INTERVAL / 1000}s`)
 
 // Unified task monitor (replaces watchdog + session checker)
 setInterval(taskMonitor, MONITOR_INTERVAL);
-setTimeout(taskMonitor, 5000); // Run 5s after boot (let realtime connect first)
+setTimeout(taskMonitor, 5000);
+setTimeout(detectOrphanedTasks, 3000); // Detect tasks orphaned by previous restart // Run 5s after boot (let realtime connect first)
 console.log(`[BOOT] Task monitor running every ${MONITOR_INTERVAL / 1000}s (hard timeout: ${TASK_HARD_TIMEOUT / 60000}min, grace: ${SESSION_GONE_GRACE / 1000}s)`);
 
 // QA Auto-Scaler — DISABLED: scheduler handles QA assignment via agent_cards
