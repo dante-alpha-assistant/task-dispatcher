@@ -1688,7 +1688,13 @@ DO NOT: SSH into servers, run commands, or deep-dive into infrastructure.`;
 2. Scan for: obvious bugs, missing error handling, broken imports, hardcoded secrets
 3. Does the code match what was requested in the description?
 4. Check for regressions — does the change break existing patterns?
-DO NOT: Clone the repo, run builds, run tests, or spend more than 3 minutes.`;
+DO NOT: Clone the repo, run builds, run tests, or spend more than 3 minutes.
+
+### ⛔ HARD RULE: Coding tasks MUST have a PR
+If you cannot find a Pull Request URL (in the result, pull_request_url field, or task comments), you MUST **FAIL** the task immediately with:
+- status: "failed"
+- qa_result: { passed: false, failures: ["No PR URL found — cannot perform code review"] }
+Do NOT pass a coding task without reviewing actual code changes in a PR.`;
               timeLimit = '3 minutes';
             } else {
               qaScope = `### Quick QA (complete in under 2 minutes)
