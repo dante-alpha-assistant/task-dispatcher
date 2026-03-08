@@ -1281,6 +1281,9 @@ console.log("Config written for ephemeral QA worker");
               envFrom: [{ secretRef: { name: "beta-worker-env" } }],
               env: [
                 { name: "WORKER_NAME", value: workerName },
+                { name: "CHOKIDAR_USEPOLLING", value: "false" },
+                { name: "OPENCLAW_NO_WATCH", value: "1" },
+                { name: "NODE_OPTIONS", value: "--max-old-space-size=1536" },
               ],
               resources: {
                 requests: { cpu: "100m", memory: "1Gi" },
