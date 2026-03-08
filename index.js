@@ -1429,10 +1429,10 @@ function subscribe() {
         if (task && task.status === 'qa_testing' && eventType === 'UPDATE' && prev?.status && prev.status !== task.status) {
           if (task.assigned_agent) {
             const unassignReason = `Unassigned from ${task.assigned_agent}: task moved to qa_testing`;
-            console.log(`[UNASSIGN] Task ${task.id} → qa_testing, clearing assigned_agent (was: ${task.assigned_agent})`);
+            console.log(`[UNASSIGN] Task ${task.id} → qa_testing, clearing assigned_agent (was: ${task.assigned_agent}), resetting started_at for QA timeout`);
             await supabase
               .from('agent_tasks')
-              .update({ assigned_agent: null, error: unassignReason })
+              .update({ assigned_agent: null, started_at: null, error: unassignReason })
               .eq('id', task.id);
           }
         }
@@ -1519,6 +1519,9 @@ function subscribe() {
           }
 
           console.log(`[QA] Dispatching QA review for task ${task.id} ("${task.title}") → ${qaAgentName}`);
+
+          // Set started_at to QA start time so absolute timeout counts from here
+          await supabase.from('agent_tasks').update({ started_at: new Date().toISOString() }).eq('id', task.id);
 
           try {
             const qaContextBlock = await buildContextBlockWithTimeout(task);
@@ -1908,16 +1911,30 @@ async function taskMonitor() {
 
         // Session is active — only hard-timeout if REALLY old (safety net)
         const startTime = task.started_at || task.created_at;
-        const timeout = task.type === "qa" ? QA_HARD_TIMEOUT : task.type === "coding" ? CODING_HARD_TIMEOUT : TASK_HARD_TIMEOUT;
+        // Use status-based timeout: QA tasks get QA timeout even if task.type is 'coding'
+        const isInQa = task.status === 'qa_testing';
+        const timeout = isInQa ? QA_HARD_TIMEOUT : (task.type === 'qa' ? QA_HARD_TIMEOUT : task.type === 'coding' ? CODING_HARD_TIMEOUT : TASK_HARD_TIMEOUT);
         const elapsed = startTime ? Date.now() - new Date(startTime).getTime() : 0;
         // Even with active session, kill after 2x the timeout (absolute safety)
         if (elapsed > timeout * 2) {
           console.log(`[MONITOR] Absolute timeout: task ${task.id} ("${task.title}") → ${agentName} (${Math.round(elapsed / 60000)}min, session still alive but too old)`);
-          await supabase.from("agent_tasks").update({
-            status: "failed",
-            error: `Absolute timeout: task ran for ${Math.round(elapsed / 60000)} minutes`,
-            completed_at: new Date().toISOString(),
-          }).eq("id", task.id);
+          // If task has completed work (result/PR) or is in QA, block instead of fail
+          const hasWork = !!(task.result || (task.pull_request_url && task.pull_request_url.length > 0));
+          if (hasWork || task.status === 'qa_testing') {
+            await supabase.from("agent_tasks").update({
+              status: "blocked",
+              assigned_agent: null,
+              started_at: null,
+              blocked_reason: `Absolute timeout after ${Math.round(elapsed / 60000)}min — work is complete but ${task.status === 'qa_testing' ? 'QA' : 'processing'} timed out`,
+              error: `Absolute timeout: task ran for ${Math.round(elapsed / 60000)} minutes — moved to blocked (has work)`,
+            }).eq("id", task.id);
+          } else {
+            await supabase.from("agent_tasks").update({
+              status: "failed",
+              error: `Absolute timeout: task ran for ${Math.round(elapsed / 60000)} minutes`,
+              completed_at: new Date().toISOString(),
+            }).eq("id", task.id);
+          }
           sessionGoneAt.delete(task.id);
           activeTasks.delete(task.id);
         }
