@@ -2083,16 +2083,19 @@ async function taskMonitor() {
             }).eq("id", task.id);
             await logTaskActivity(task.id, 'dispatch_error', null, `QA agent ${agentName} idle for ${Math.floor(idleMs/60000)}min — re-queued QA (retry ${idleRetries}/${MAX_IDLE_RETRIES})`, 'dispatcher');
           } else {
-            console.log(`[MONITOR] Idle timeout: task ${task.id} ("${task.title.slice(0,40)}") → ${agentName} idle ${Math.floor(idleMs/60000)}min (retry ${idleRetries}/${MAX_IDLE_RETRIES}) → resetting to todo`);
+            const hasCompletedWork = !!(task.result || (task.pull_request_url && task.pull_request_url.length > 0));
+            const targetStatus = hasCompletedWork ? 'blocked' : 'todo';
+            console.log(`[MONITOR] Idle timeout: task ${task.id} ("${task.title.slice(0,40)}") → ${agentName} idle ${Math.floor(idleMs/60000)}min (retry ${idleRetries}/${MAX_IDLE_RETRIES}) → ${targetStatus} (hasWork: ${hasCompletedWork})`);
             recordTransition(task.id);
             await supabase.from("agent_tasks").update({
-              status: "todo",
+              status: targetStatus,
               assigned_agent: null,
               started_at: null,
               idle_retries: idleRetries,
-              error: `Idle timeout: ${agentName} session idle >${Math.floor(idleMs/60000)}min — re-queued (retry ${idleRetries}/${MAX_IDLE_RETRIES})`,
+              blocked_reason: hasCompletedWork ? `Idle timeout: ${agentName} idle >${Math.floor(idleMs/60000)}min — task has completed work (PR/result) but QA agent couldn't process. Needs manual review or re-dispatch.` : null,
+              error: `Idle timeout: ${agentName} session idle >${Math.floor(idleMs/60000)}min — ${hasCompletedWork ? 'blocked (has work)' : 're-queued'} (retry ${idleRetries}/${MAX_IDLE_RETRIES})`,
             }).eq("id", task.id);
-            await logTaskActivity(task.id, 'dispatch_error', null, `Agent ${agentName} idle for ${Math.floor(idleMs/60000)}min — re-queued (retry ${idleRetries}/${MAX_IDLE_RETRIES})`, 'dispatcher');
+            await logTaskActivity(task.id, 'dispatch_error', null, `Agent ${agentName} idle for ${Math.floor(idleMs/60000)}min — ${targetStatus} (retry ${idleRetries}/${MAX_IDLE_RETRIES})`, 'dispatcher');
           }
           activeTasks.delete(task.id);
           continue;
