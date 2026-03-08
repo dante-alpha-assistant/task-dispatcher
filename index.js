@@ -1447,6 +1447,44 @@ function subscribe() {
           await checkParentCompletion(task);
         }
 
+        // Auto-cleanup QA sessions: when task leaves qa_testing, delete the QA session on the agent
+        if (prev?.status === 'qa_testing' && task?.status !== 'qa_testing') {
+          const qaAgentName = prev.assigned_agent || task.assigned_agent;
+          const qaAgentConfig = qaAgentName ? AGENTS[qaAgentName.toLowerCase()] : null;
+          if (qaAgentConfig?.url && qaAgentConfig?.token) {
+            const sessionKey = `hook:qa:${task.id}`;
+            try {
+              const deleteUrl = qaAgentConfig.url.replace('/hooks/agent', '/sessions/') + encodeURIComponent(sessionKey);
+              const delResp = await fetch(deleteUrl, {
+                method: 'DELETE',
+                headers: { Authorization: `Bearer ${qaAgentConfig.token}` },
+              });
+              console.log(`[QA-CLEANUP] Deleted QA session ${sessionKey} on ${qaAgentName}: ${delResp.status}`);
+            } catch (e) {
+              console.warn(`[QA-CLEANUP] Failed to delete QA session on ${qaAgentName}: ${e.message}`);
+            }
+          }
+        }
+
+
+        // Auto-cleanup coding sessions: when task leaves in_progress, delete the task session
+        if (prev?.status === 'in_progress' && task?.status !== 'in_progress') {
+          const codingAgent = prev.assigned_agent || task.assigned_agent;
+          const codingConfig = codingAgent ? AGENTS[codingAgent.toLowerCase()] : null;
+          if (codingConfig?.url && codingConfig?.token) {
+            const sessionKey = `hook:task:${task.id}`;
+            try {
+              const deleteUrl = codingConfig.url.replace('/hooks/agent', '/sessions/') + encodeURIComponent(sessionKey);
+              const delResp = await fetch(deleteUrl, {
+                method: 'DELETE',
+                headers: { Authorization: `Bearer ${codingConfig.token}` },
+              });
+              console.log(`[TASK-CLEANUP] Deleted task session ${sessionKey} on ${codingAgent}: ${delResp.status}`);
+            } catch (e) {
+              console.warn(`[TASK-CLEANUP] Failed to delete task session on ${codingAgent}: ${e.message}`);
+            }
+          }
+        }
         // Auto-comment: when an agent writes a result, post it as a comment in the task thread
         if (eventType === 'UPDATE' && task?.result && !prev?.result) {
           try {
