@@ -1323,9 +1323,14 @@ async function assignQueuedQATasks() {
     });
     const podList = podListResp?.body || podListResp || {};
 
-    const runningWorkers = (podList.items || []).map((p) => p.metadata.name);
+    // Only consider pods running for > 60s (gateway needs time to start)
+    const readyPods = (podList.items || []).filter(p => {
+      const startTime = p.status?.startTime ? new Date(p.status.startTime).getTime() : Date.now();
+      return (Date.now() - startTime) > 60000;
+    });
+    const runningWorkers = readyPods.map((p) => p.metadata.name);
     const podIpMap = {};
-    for (const p of (podList.items || [])) {
+    for (const p of readyPods) {
       if (p.status?.podIP) podIpMap[p.metadata.name] = p.status.podIP;
     }
     if (!runningWorkers.length) return;
