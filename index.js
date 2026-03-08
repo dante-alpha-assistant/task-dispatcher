@@ -1449,7 +1449,7 @@ Generate realistic Gherkin scenarios, then PATCH the task with acceptance_criter
         const qaMessage = `${qaContextBlock}\n${qaInstructions}`;
         await fetch(workerUrl, {
           method: "POST",
-          headers: { "Content-Type": "application/json", "Authorization": "Bearer ephemeral-qa-worker-tok-2026" },
+          headers: { "Content-Type": "application/json", "Authorization": "Bearer ephemeral-qa-gw-tok-2026" },
           body: JSON.stringify({
             message: qaMessage,
             name: "Task Dispatcher (QA Auto-Scaler)",
