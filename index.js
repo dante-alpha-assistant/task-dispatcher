@@ -85,6 +85,22 @@ async function getAgentCards() {
 
 const DANTE_ID_API_URL = process.env.DANTE_ID_API_URL || "https://api.dante.id";
 const PRIORITY_ORDER = { urgent: 0, high: 1, normal: 2, low: 3 };
+// === GUARD: State transition cooldown (prevents rapid cycling) ===
+const taskLastTransition = new Map();
+const TRANSITION_COOLDOWN_MS = 60_000;
+function canTransition(taskId) {
+  const last = taskLastTransition.get(taskId);
+  if (!last) return true;
+  return (Date.now() - last) >= TRANSITION_COOLDOWN_MS;
+}
+function recordTransition(taskId) {
+  taskLastTransition.set(taskId, Date.now());
+  if (taskLastTransition.size > 200) {
+    const cutoff = Date.now() - 600000;
+    for (const [k, v] of taskLastTransition) { if (v < cutoff) taskLastTransition.delete(k); }
+  }
+}
+
 
 // --- Gateway Concurrency Check ---
 // Check if an agent is currently busy by querying their gateway's sessions_list.
@@ -1876,6 +1892,7 @@ async function taskMonitor() {
             await logTaskActivity(task.id, 'dispatch_error', null, `QA agent ${agentName} idle for ${Math.floor(idleMs/60000)}min — re-queued QA (retry ${idleRetries}/${MAX_IDLE_RETRIES})`, 'dispatcher');
           } else {
             console.log(`[MONITOR] Idle timeout: task ${task.id} ("${task.title.slice(0,40)}") → ${agentName} idle ${Math.floor(idleMs/60000)}min (retry ${idleRetries}/${MAX_IDLE_RETRIES}) → resetting to todo`);
+            recordTransition(task.id);
             await supabase.from("agent_tasks").update({
               status: "todo",
               assigned_agent: null,
@@ -1916,13 +1933,29 @@ async function taskMonitor() {
           const elapsed = startTime ? Date.now() - new Date(startTime).getTime() : 0;
 
           if (isQaTesting) {
-            // QA session crashed — clear qa_agent so qaAutoScaler re-dispatches (stays in qa_testing)
-            const qaGoneReason = `QA agent session lost — re-queued for re-dispatch`;
-            console.log(`[MONITOR] QA session gone for task ${task.id} ("${task.title}") → clearing qa_agent for re-dispatch`);
-            await supabase.from("agent_tasks").update({
-              qa_agent: null,
-              error: qaGoneReason,
-            }).eq("id", task.id);
+            // QA session crashed — track retries, block after 3
+            const qaRetryCount = (task.qa_retries || 0) + 1;
+            if (qaRetryCount > 3) {
+              const blockReason = `QA session died ${qaRetryCount} times — moved to blocked. Work is complete but QA cannot verify. Manual review needed.`;
+              console.log(`[MONITOR] QA session died ${qaRetryCount}x for task ${task.id} → BLOCKED`);
+              await supabase.from("agent_tasks").update({
+                status: "blocked",
+                qa_agent: null,
+                blocked_reason: blockReason,
+                error: blockReason,
+              }).eq("id", task.id);
+              await logTaskActivity(task.id, 'qa_error', null, blockReason, 'dispatcher');
+            } else {
+              const qaGoneReason = `QA agent session lost (attempt ${qaRetryCount}/3) — re-queued for re-dispatch`;
+              console.log(`[MONITOR] QA session gone for task ${task.id} → retry ${qaRetryCount}/3`);
+              await supabase.from("agent_tasks").update({
+                qa_agent: null,
+                qa_retries: qaRetryCount,
+                error: qaGoneReason,
+              }).eq("id", task.id);
+              await logTaskActivity(task.id, 'qa_error', null, qaGoneReason, 'dispatcher');
+            }
+            recordTransition(task.id);
           } else if (elapsed > timeout) {
             console.log(`[MONITOR] Timeout + session gone: task ${task.id} ("${task.title}") → failed (${Math.round(elapsed / 60000)}min)`);
             await supabase.from("agent_tasks").update({
@@ -2025,6 +2058,24 @@ async function scheduler() {
       return;
     }
 
+    // === GUARD: Skip todo tasks that already have completed work (result/PR) ===
+    const trulyTodoTasks = [];
+    for (const t of (todoTasks || [])) {
+      if (t.type === "manual") continue;
+      const hasWork = !!(t.result || (t.pull_request_url && t.pull_request_url.length > 0));
+      if (hasWork) {
+        console.log("[SCHEDULER] Task " + t.id + " has completed work but is todo — routing to qa_testing");
+        await supabase.from("agent_tasks").update({ status: "qa_testing", assigned_agent: null }).eq("id", t.id);
+        recordTransition(t.id);
+        continue;
+      }
+      if (!canTransition(t.id)) {
+        console.log("[SCHEDULER] Cooldown active for task " + t.id + " — skipping this cycle");
+        continue;
+      }
+      trulyTodoTasks.push(t);
+    }
+
     // Fetch qa_testing tasks that are unassigned (need QA-capable agent)
     const { data: qaUnassigned, error: qaErr } = await supabase
       .from("agent_tasks")
@@ -2039,7 +2090,7 @@ async function scheduler() {
 
     // Merge: todo + unassigned qa_testing, sorted by priority (qa gets slight boost)
     console.log(`[SCHEDULER] Found ${(todoTasks||[]).length} todo + ${(qaUnassigned||[]).length} qa tasks, ${freeAgents.length} free agents`);
-    const allSchedulable = [...(todoTasks || []), ...(qaUnassigned || [])];
+    const allSchedulable = [...trulyTodoTasks, ...(qaUnassigned || [])];
     if (!allSchedulable.length) { console.log("[SCHEDULER] No schedulable tasks found"); return; }
 
     allSchedulable.sort((a, b) => {
