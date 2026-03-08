@@ -1137,10 +1137,28 @@ async function qaAutoScaler() {
       labelSelector: "role=beta-worker",
     });
     const jobList = jobListResp?.body || jobListResp || {};
+    // Count truly active jobs (have active pods, not just 'not yet marked failed')
     const activeJobs = (jobList.items || []).filter(
-      (j) => !j.status?.succeeded && !j.status?.failed
+      (j) => !j.status?.succeeded && !j.status?.failed && (j.status?.active || 0) > 0
     );
     const activeWorkers = activeJobs.length;
+
+    // Immediately clean up jobs with no active pods (errored/crashed)
+    for (const job of (jobList.items || [])) {
+      if (!job.status?.succeeded && !job.status?.failed && (job.status?.active || 0) === 0) {
+        const age = Date.now() - new Date(job.metadata.creationTimestamp).getTime();
+        if (age > 60000) { // Give 60s grace for init containers
+          try {
+            await batchApi.deleteNamespacedJob({
+              name: job.metadata.name,
+              namespace: 'agents',
+              propagationPolicy: 'Background',
+            });
+            console.log(`[QA-SCALER] Cleaned up dead job ${job.metadata.name} (no active pods)`);
+          } catch (e) { /* ignore */ }
+        }
+      }
+    }
 
     console.log(`[QA-SCALER] Queue: ${qaQueue}, Active workers: ${activeWorkers}`);
 
