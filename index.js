@@ -1160,8 +1160,46 @@ async function qaAutoScaler() {
 }
 
 async function spawnBetaWorker() {
-  const workerName = `beta-worker-${Date.now().toString(36)}`;
-  console.log(`[QA-SCALER] Spawning worker: ${workerName}`);
+  const workerName = `qa-worker-${Date.now().toString(36)}`;
+  const hooksToken = "ephemeral-qa-worker-tok-2026";
+  console.log(`[QA-SCALER] Spawning ephemeral QA worker: ${workerName}`);
+
+  const initConfigScript = `
+const fs = require('fs');
+const config = {
+  gateway: {
+    port: 18789,
+    mode: "local",
+    bind: "lan",
+    auth: { mode: "token", token: "${hooksToken}" },
+    controlUi: { dangerouslyAllowHostHeaderOriginFallback: true },
+  },
+  models: {
+    providers: {
+      openrouter: {
+        baseUrl: "https://openrouter.ai/api/v1",
+        apiKey: process.env.OPENROUTER_API_KEY || "",
+        models: [
+          { id: "moonshotai/kimi-k2.5", name: "kimi-k2.5", api: "openai-completions", reasoning: true, input: ["text","image"], cost: { input: 0.45, output: 2.25 }, contextWindow: 262144, maxTokens: 4096 },
+        ]
+      }
+    }
+  },
+  agents: {
+    defaults: {
+      model: { primary: "openrouter/moonshotai/kimi-k2.5" },
+      workspace: "/root/.openclaw/workspace",
+      compaction: { mode: "safeguard" },
+      maxConcurrent: 1,
+    }
+  },
+  hooks: { enabled: true, token: "${hooksToken}", allowRequestSessionKey: true, defaultSessionKey: "hook:default", allowedSessionKeyPrefixes: ["hook:"] },
+};
+fs.mkdirSync('/root/.openclaw/workspace', { recursive: true });
+fs.writeFileSync('/root/.openclaw/openclaw.json', JSON.stringify(config, null, 2));
+fs.writeFileSync('/root/.openclaw/workspace/AGENTS.md', '# Ephemeral QA Worker\\nYou are a temporary QA agent. Review the task, verify the work, update status, then exit.\\nDo NOT create memory files. You are ephemeral.\\n');
+console.log("Config written for ephemeral QA worker");
+`;
 
   const job = {
     apiVersion: "batch/v1",
@@ -1170,7 +1208,7 @@ async function spawnBetaWorker() {
       name: workerName,
       namespace: "agents",
       labels: {
-        app: "beta-worker",
+        app: "qa-worker",
         role: "beta-worker",
         "managed-by": "task-dispatcher",
       },
@@ -1178,36 +1216,44 @@ async function spawnBetaWorker() {
     spec: {
       backoffLimit: 0,
       ttlSecondsAfterFinished: 300,
-      activeDeadlineSeconds: 1200,
+      activeDeadlineSeconds: 1200, // 20 min max
       template: {
         metadata: {
           labels: {
-            app: "beta-worker",
+            app: "qa-worker",
             role: "beta-worker",
             "managed-by": "task-dispatcher",
           },
         },
         spec: {
           restartPolicy: "Never",
+          initContainers: [
+            {
+              name: "init-config",
+              image: "node:22-bookworm-slim",
+              command: ["node", "-e"],
+              args: [initConfigScript],
+              envFrom: [{ secretRef: { name: "beta-worker-env" } }],
+              volumeMounts: [{ name: "workspace", mountPath: "/root/.openclaw" }],
+            },
+          ],
           containers: [
             {
-              name: "worker",
+              name: "openclaw",
               image: process.env.QA_WORKER_IMAGE || "ghcr.io/dante-alpha-assistant/openclaw-agent:latest",
+              envFrom: [{ secretRef: { name: "beta-worker-env" } }],
               env: [
-                { name: "SUPABASE_URL", value: process.env.SUPABASE_URL },
-                { name: "SUPABASE_SERVICE_ROLE_KEY", value: process.env.SUPABASE_SERVICE_ROLE_KEY },
-                {
-                  name: "OPENROUTER_API_KEY",
-                  valueFrom: { secretKeyRef: { name: "beta-env", key: "OPENROUTER_API_KEY" } },
-                },
                 { name: "WORKER_NAME", value: workerName },
-                { name: "WORKER_MODE", value: "qa" },
               ],
               resources: {
                 requests: { cpu: "100m", memory: "256Mi" },
                 limits: { cpu: "500m", memory: "512Mi" },
               },
+              volumeMounts: [{ name: "workspace", mountPath: "/root/.openclaw" }],
             },
+          ],
+          volumes: [
+            { name: "workspace", emptyDir: {} },
           ],
         },
       },
@@ -1216,11 +1262,12 @@ async function spawnBetaWorker() {
 
   try {
     await batchApi.createNamespacedJob({ namespace: "agents", body: job });
-    console.log(`[QA-SCALER] Spawned worker job: ${workerName}`);
+    console.log(`[QA-SCALER] Spawned ephemeral QA worker: ${workerName}`);
   } catch (e) {
-    console.error(`[QA-SCALER] Failed to spawn worker: ${e.message}`);
+    console.error(`[QA-SCALER] Failed to spawn QA worker: ${e.message}`);
   }
 }
+
 
 async function assignQueuedQATasks() {
   try {
@@ -2615,8 +2662,8 @@ console.log(`[BOOT] Task monitor running every ${MONITOR_INTERVAL / 1000}s (hard
 
 // QA Auto-Scaler — DISABLED: scheduler handles QA assignment via agent_cards
 // The QA scaler used K8s pod names instead of agent names, causing dispatch failures.
-// setInterval(qaAutoScaler, 30000);
-console.log("[BOOT] QA auto-scaler DISABLED — scheduler handles QA assignment");
+setInterval(qaAutoScaler, 30000);
+console.log(`[BOOT] QA auto-scaler ENABLED — spawns ephemeral workers when QA queue > 1 (max ${MAX_QA_WORKERS})`);
 
 // Stale agent detector
 setInterval(staleAgentDetector, STALE_AGENT_INTERVAL);
