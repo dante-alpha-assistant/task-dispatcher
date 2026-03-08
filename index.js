@@ -1539,7 +1539,36 @@ function subscribe() {
           }
         }
 
-        // Remove completed/failed tasks from active tracking
+        // ===== QA COMPLETION VALIDATOR =====
+        // When a coding task moves to 'completed', verify the QA actually reviewed code.
+        // Revert to qa_testing if the QA agent rubber-stamped without PR review.
+        if (task?.status === 'completed' && eventType === 'UPDATE' && prev?.status === 'qa_testing' && task.type === 'coding') {
+          const qaResult = task.qa_result;
+          const hasPR = task.pull_request_url && task.pull_request_url.length > 0;
+          const qaNotesLower = (qaResult?.notes || '').toLowerCase();
+          const rubberStamped = !hasPR && (
+            qaNotesLower.includes('no pr') || 
+            qaNotesLower.includes('unable to perform code') ||
+            qaNotesLower.includes('cannot perform code') ||
+            qaNotesLower.includes('no pull request')
+          );
+          
+          if (rubberStamped) {
+            console.log(`[QA-GUARD] Task ${task.id} ("${task.title.slice(0,40)}") was rubber-stamped without PR review — reverting to qa_testing`);
+            await supabase.from('agent_tasks').update({ 
+              status: 'qa_testing', 
+              assigned_agent: null, 
+              qa_agent: null, 
+              qa_result: null,
+              qa_retries: (task.qa_retries || 0) + 1,
+              error: 'QA rejected: coding task completed without PR code review. QA must verify actual code changes.',
+              started_at: null
+            }).eq('id', task.id);
+            return; // Don't process further
+          }
+        }
+
+                // Remove completed/failed tasks from active tracking
         if (task?.status === 'qa_testing' || task?.status === 'failed' || task?.status === 'completed' || task?.status === 'deployed') {
           if (activeTasks.has(task.id)) {
             console.log(`[TRACKER] Task ${task.id} completed (${task.status}), removing from active tracking`);
@@ -1935,6 +1964,16 @@ async function taskMonitor() {
         .eq("id", task.id)
         .single();
       if (freshTask && ["done", "failed", "completed"].includes(freshTask.status)) {
+        continue;
+      }
+
+      // Skip unassigned qa_testing tasks — they are waiting for the scheduler to assign them
+      if (task.status === "qa_testing" && !task.assigned_agent && !task.qa_agent) {
+        continue;
+      }
+
+      // Skip tasks without started_at — they have not been dispatched yet
+      if (!task.started_at) {
         continue;
       }
 
