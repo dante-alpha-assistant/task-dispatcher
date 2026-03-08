@@ -1246,8 +1246,8 @@ console.log("Config written for ephemeral QA worker");
                 { name: "WORKER_NAME", value: workerName },
               ],
               resources: {
-                requests: { cpu: "100m", memory: "256Mi" },
-                limits: { cpu: "500m", memory: "512Mi" },
+                requests: { cpu: "100m", memory: "512Mi" },
+                limits: { cpu: "500m", memory: "1Gi" },
               },
               volumeMounts: [{ name: "workspace", mountPath: "/root/.openclaw" }],
             },
