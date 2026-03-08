@@ -8,7 +8,7 @@ kc.loadFromCluster();
 const batchApi = kc.makeApiClient(k8s.BatchV1Api);
 const coreApi = kc.makeApiClient(k8s.CoreV1Api);
 const customApi = kc.makeApiClient(k8s.CustomObjectsApi);
-const MAX_QA_WORKERS = 3;
+const MAX_QA_WORKERS = 2;
 
 
 // --- Config ---
@@ -1282,8 +1282,8 @@ console.log("Config written for ephemeral QA worker");
                 { name: "WORKER_NAME", value: workerName },
               ],
               resources: {
-                requests: { cpu: "100m", memory: "512Mi" },
-                limits: { cpu: "500m", memory: "1Gi" },
+                requests: { cpu: "100m", memory: "1Gi" },
+                limits: { cpu: "500m", memory: "2Gi" },
               },
               volumeMounts: [{ name: "workspace", mountPath: "/root/.openclaw" }],
             },
