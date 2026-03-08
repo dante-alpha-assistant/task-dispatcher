@@ -2214,21 +2214,10 @@ async function scheduler() {
       trulyTodoTasks.push(t);
     }
 
-    // Fetch qa_testing tasks that are unassigned (need QA-capable agent)
-    const { data: qaUnassigned, error: qaErr } = await supabase
-      .from("agent_tasks")
-      .select("*")
-      .eq("status", "qa_testing")
-      .is("assigned_agent", null)
-      .order("created_at", { ascending: true });
-
-    if (qaErr) {
-      console.error("[SCHEDULER] Error fetching qa_testing tasks:", qaErr.message);
-    }
-
-    // Merge: todo + unassigned qa_testing, sorted by priority (qa gets slight boost)
-    console.log(`[SCHEDULER] Found ${(todoTasks||[]).length} todo + ${(qaUnassigned||[]).length} qa tasks, ${freeAgents.length} free agents`);
-    const allSchedulable = [...trulyTodoTasks, ...(qaUnassigned || [])];
+    // QA tasks are handled by the QA auto-scaler (ephemeral workers) — skip them here
+    // This prevents the scheduler from assigning all QA to beta-worker serially
+    console.log(`[SCHEDULER] Found ${(todoTasks||[]).length} todo tasks, ${freeAgents.length} free agents (QA handled by scaler)`);
+    const allSchedulable = [...trulyTodoTasks];
     if (!allSchedulable.length) { console.log("[SCHEDULER] No schedulable tasks found"); return; }
 
     allSchedulable.sort((a, b) => {
