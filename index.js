@@ -1057,6 +1057,22 @@ Do NOT skip this step. The task board at tasks.dante.id must reflect your work.`
 
 // --- QA Auto-Scaler ---
 // QA Stale Detection: re-dispatch QA tasks that have been sitting > 20 min with no progress
+// Helper: clean up a session on an agent
+async function cleanupAgentSession(agentName, sessionKey) {
+  const agentConfig = agentName ? AGENTS[agentName.toLowerCase()] : null;
+  if (!agentConfig?.url || !agentConfig?.token) return;
+  try {
+    const deleteUrl = agentConfig.url.replace('/hooks/agent', '/sessions/') + encodeURIComponent(sessionKey);
+    const resp = await fetch(deleteUrl, {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${agentConfig.token}` },
+    });
+    console.log(`[SESSION-CLEANUP] Deleted ${sessionKey} on ${agentName}: ${resp.status}`);
+  } catch (e) {
+    console.warn(`[SESSION-CLEANUP] Failed to delete ${sessionKey} on ${agentName}: ${e.message}`);
+  }
+}
+
 async function qaStaleDetector() {
   try {
     const { data: staleTasks, error } = await supabase
@@ -1082,12 +1098,14 @@ async function qaStaleDetector() {
             .update({ status: "blocked", qa_agent: null, blocked_reason: `QA failed: timed out ${retryCount} times — work is complete but QA could not verify. Needs manual review or re-dispatch.` })
             .eq("id", task.id);
           await logTaskActivity(task.id, 'qa_error', null, `QA timed out ${retryCount} times — moved to blocked for manual review`, 'dispatcher');
+          await cleanupAgentSession(task.qa_agent, `hook:qa:${task.id}`);
         } else {
           console.log(`[QA-STALE] Task ${task.id} ("${task.title.slice(0, 40)}") stuck in qa_testing for ${Math.floor(age / 60000)}min → retry ${retryCount}/${MAX_QA_RETRIES}`);
           await supabase
             .from("agent_tasks")
             .update({ qa_agent: null, qa_retries: retryCount })
             .eq("id", task.id);
+          await cleanupAgentSession(task.qa_agent, `hook:qa:${task.id}`);
         }
       }
     }
@@ -2794,7 +2812,7 @@ const config = {
   },
   agents: {
     defaults: {
-      model: { primary: "anthropic/claude-opus-4-6" },
+      model: { primary: "openrouter/moonshotai/kimi-k2.5" },
       workspace: "/root/.openclaw/workspace",
       compaction: { mode: "safeguard" },
       maxConcurrent: 2,
