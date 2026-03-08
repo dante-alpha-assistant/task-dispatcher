@@ -1373,6 +1373,7 @@ async function assignQueuedQATasks() {
       const workerUrl = `http://${podIp}:18789/hooks/agent`;
       try {
         const qaContextBlock = await buildContextBlockWithTimeout(task);
+        const qaCommentsBlock = await fetchTaskComments(task.id);
         // Tiered QA prompt based on task type
         const taskType = task.type || 'general';
         let qaInstructions = '';
@@ -1446,7 +1447,7 @@ Before updating task status, you MUST generate Gherkin acceptance criteria (Give
 **DO NOT write Gherkin scenarios to the \`description\` field. The original description must NEVER be overwritten.**
 
 Generate realistic Gherkin scenarios, then PATCH the task with acceptance_criteria BEFORE updating the final task status.`;
-        const qaMessage = `${qaContextBlock}\n${qaInstructions}`;
+        const qaMessage = `${qaContextBlock}\n${qaInstructions}\n${qaCommentsBlock ? qaCommentsBlock : ""}`;
         await fetch(workerUrl, {
           method: "POST",
           headers: { "Content-Type": "application/json", "Authorization": "Bearer ephemeral-qa-gw-tok-2026" },
@@ -1664,6 +1665,7 @@ function subscribe() {
 
           try {
             const qaContextBlock = await buildContextBlockWithTimeout(task);
+            const qaCommentsBlock = await fetchTaskComments(task.id);
             const taskType = task.type || 'general';
             const resultStr = typeof task.result === 'string' ? task.result : JSON.stringify(task.result || {});
             const prMatch = resultStr.match(/PR\s*#(\d+)/i);
@@ -1741,6 +1743,7 @@ ${task.description || "(none)"}
 ${task.result ? JSON.stringify(task.result, null, 2).slice(0, 1000) : "(no result reported)"}
 
 ${qaScope}
+${qaCommentsBlock ? qaCommentsBlock : ""}
 
 ### Update task status when done:
 
