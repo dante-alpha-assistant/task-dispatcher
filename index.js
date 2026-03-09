@@ -2596,9 +2596,17 @@ async function scheduler() {
       // For qa_testing tasks, require "qa" capability; for regular tasks, use task type
       const requiredCapability = isQaTask ? "qa" : (task.type || "general");
 
+      // Capability aliasing: some task types map to multiple valid capabilities
+      const CAPABILITY_ALIASES = {
+        research: ["research", "web_search"],
+        ops: ["ops", "kubernetes", "coding"],
+        general: ["coding", "general", "ops"],
+      };
+      const validCaps = CAPABILITY_ALIASES[requiredCapability] || [requiredCapability];
+
       // Score agents: must have required capability, then rank by capacity + priority affinity
       const candidates = freeAgents
-        .filter(a => a.remaining > 0 && a.capabilities.includes(requiredCapability) )
+        .filter(a => a.remaining > 0 && a.capabilities.some(c => validCaps.includes(c)) )
         .map(a => {
           let score = a.remaining;
           const affinityMultiplier = a.priority_affinity[task.priority];
