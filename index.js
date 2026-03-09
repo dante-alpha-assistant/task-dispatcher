@@ -304,6 +304,14 @@ async function logTaskActivity(taskId, field, oldValue, newValue, changedBy = 'd
   }
 }
 
+// Log a transient error to activity log instead of the error field.
+// Transient errors are recoverable issues (session lost, timeout, idle retry, dispatch failure).
+// Only TERMINAL errors (max retries, permanent failure) should set the error field.
+async function logTransientError(taskId, message, changedBy = 'dispatcher') {
+  console.log(`[TRANSIENT-ERROR] Task ${taskId}: ${message}`);
+  await logTaskActivity(taskId, 'error', null, message, changedBy);
+}
+
 // Boot-time: detect orphaned tasks (assigned but never dispatched due to restart)
 async function detectOrphanedTasks() {
   try {
@@ -330,9 +338,9 @@ async function detectOrphanedTasks() {
       // Clear assignment so scheduler picks it up fresh
       await supabase.from('agent_tasks').update({
         assigned_agent: null,
-        error: 'Dispatch lost during restart — re-queued automatically',
         updated_at: new Date().toISOString(),
       }).eq('id', task.id);
+      await logTransientError(task.id, 'Dispatch lost during restart — re-queued automatically');
     }
   } catch (e) {
     console.error('[BOOT-ORPHAN] Error:', e.message);
@@ -875,8 +883,9 @@ async function dispatchToAgent(task) {
         console.log(`[SKIP] ${skipReason}`);
         await supabase
           .from('agent_tasks')
-          .update({ assigned_agent: null, started_at: null, error: skipReason, last_failed_agent: task.assigned_agent })
+          .update({ assigned_agent: null, started_at: null, last_failed_agent: task.assigned_agent })
           .eq('id', task.id);
+        await logTransientError(task.id, skipReason);
         return;
       }
     }
@@ -927,11 +936,11 @@ async function dispatchToAgent(task) {
       .update({
         assigned_agent: null,
         started_at: null,
-        error: authReason,
         last_failed_agent: agentName,
         ...statusFix,
       })
       .eq('id', task.id);
+    await logTransientError(task.id, authReason);
     if (statusFix.status) console.log(`[AUTH-PREFLIGHT] Task ${task.id} was ${task.status} → ${statusFix.status} (had result: ${!!task.result})`);
     return;
   }
@@ -1135,13 +1144,14 @@ Do NOT skip this step. The task board at tasks.dante.id must reflect your work.`
       const err = await resp.text();
       const errMsg = `Dispatch to ${agentName} failed: HTTP ${resp.status} — ${err.slice(0, 200)}`;
       console.error(`[ERR] ${errMsg}`);
-      // Write error to task so it shows in Activity log
-      await supabase.from("agent_tasks").update({ error: errMsg, assigned_agent: null }).eq("id", task.id);
+      await supabase.from("agent_tasks").update({ assigned_agent: null }).eq("id", task.id);
+      await logTransientError(task.id, errMsg);
     }
   } catch (e) {
     const errMsg = `Dispatch to ${agentName} failed: ${e.message}`;
     console.error(`[ERR] ${errMsg}`);
-    await supabase.from("agent_tasks").update({ error: errMsg, assigned_agent: null }).eq("id", task.id);
+    await supabase.from("agent_tasks").update({ assigned_agent: null }).eq("id", task.id);
+    await logTransientError(task.id, errMsg);
   }
 }
 
@@ -1196,6 +1206,7 @@ async function qaStaleDetector() {
             .from("agent_tasks")
             .update({ qa_agent: null, qa_retries: retryCount })
             .eq("id", task.id);
+          await logTransientError(task.id, `QA stale: stuck in qa_testing for ${Math.floor(age / 60000)}min — re-queued (retry ${retryCount}/${MAX_QA_RETRIES})`);
           await cleanupAgentSession(task.qa_agent, `hook:qa:${task.id}`);
         }
       }
@@ -1612,8 +1623,9 @@ initLangfuse();
                     qa_result: null,
                     last_failed_agent: task.assigned_agent || task.last_failed_agent,
                     qa_retries: qaRetries + 1,
-                    error: `QA failed (attempt ${qaRetries + 1}): ${qaFeedback.slice(0, 500)}`,
+                    error: null,
                   }).eq('id', task.id).then(() => {
+                    logTransientError(task.id, `QA failed (attempt ${qaRetries + 1}): ${qaFeedback.slice(0, 500)}`);
                     logTaskActivity(task.id, 'qa_retry', null, `QA failed — auto-retrying (attempt ${qaRetries + 1}/2): ${qaFeedback.slice(0, 200)}`, 'dispatcher');
                   }).catch(e => console.error(`[QA-RETRY] Failed to retry task ${task.id}:`, e.message));
                 } else {
@@ -1673,8 +1685,8 @@ initLangfuse();
             await supabase.from('agent_tasks').update({
               assigned_agent: null,
               last_failed_agent: agentName,
-              error: reason,
             }).eq('id', task.id);
+            await logTransientError(task.id, reason);
           } else {
             console.log(`[DISPATCH] Task ${task.id} → ${task.assigned_agent}`);
             dispatchToAgent(task);
@@ -1685,24 +1697,21 @@ initLangfuse();
         // The coding agent is done — assigned_agent should reflect current owner (nobody until scheduler assigns QA agent)
         if (task && task.status === 'qa_testing' && eventType === 'UPDATE' && prev?.status && prev.status !== task.status) {
           if (task.assigned_agent) {
-            const unassignReason = `Unassigned from ${task.assigned_agent}: task moved to qa_testing`;
             console.log(`[UNASSIGN] Task ${task.id} → qa_testing, clearing assigned_agent (was: ${task.assigned_agent}), resetting started_at for QA timeout`);
             await supabase
               .from('agent_tasks')
-              .update({ assigned_agent: null, started_at: null, error: unassignReason })
+              .update({ assigned_agent: null, started_at: null, error: null })
               .eq('id', task.id);
           }
         }
 
-        // === COMPLETED LOCK: When task reaches completed, clear QA agent to prevent post-completion changes ===
+        // === COMPLETED LOCK: When task reaches completed, clear QA agent and error to prevent post-completion changes ===
         if (task && task.status === 'completed' && eventType === 'UPDATE' && prev?.status !== 'completed') {
-          const lockUpdates = {};
+          const lockUpdates = { error: null }; // Clear transient errors — task is done
           if (task.qa_agent) lockUpdates.qa_agent = null;
           // Don't clear assigned_agent here — deploy needs to know who worked on it
-          if (Object.keys(lockUpdates).length > 0) {
-            console.log(`[COMPLETED-LOCK] Task ${task.id} reached completed — clearing qa_agent to prevent post-completion changes`);
-            await supabase.from('agent_tasks').update(lockUpdates).eq('id', task.id);
-          }
+          console.log(`[COMPLETED-LOCK] Task ${task.id} reached completed — clearing qa_agent + error`);
+          await supabase.from('agent_tasks').update(lockUpdates).eq('id', task.id);
         }
 
         // ===== QA COMPLETION VALIDATOR =====
@@ -1727,9 +1736,10 @@ initLangfuse();
               qa_agent: null, 
               qa_result: null,
               qa_retries: (task.qa_retries || 0) + 1,
-              error: 'QA rejected: coding task completed without PR code review. QA must verify actual code changes.',
+              error: null,
               started_at: null
             }).eq('id', task.id);
+            await logTransientError(task.id, 'QA rejected: coding task completed without PR code review. QA must verify actual code changes.');
             return; // Don't process further
           }
         }
@@ -2271,9 +2281,8 @@ async function taskMonitor() {
             await supabase.from("agent_tasks").update({
               qa_agent: null,
               idle_retries: idleRetries,
-              error: `QA idle timeout: ${agentName} session idle >${Math.floor(idleMs/60000)}min — re-queued QA (retry ${idleRetries}/${MAX_IDLE_RETRIES})`,
             }).eq("id", task.id);
-            await logTaskActivity(task.id, 'dispatch_error', null, `QA agent ${agentName} idle for ${Math.floor(idleMs/60000)}min — re-queued QA (retry ${idleRetries}/${MAX_IDLE_RETRIES})`, 'dispatcher');
+            await logTransientError(task.id, `QA idle timeout: ${agentName} session idle >${Math.floor(idleMs/60000)}min — re-queued QA (retry ${idleRetries}/${MAX_IDLE_RETRIES})`);
           } else {
             const hasCompletedWork = !!(task.result || (task.pull_request_url && task.pull_request_url.length > 0));
             const targetStatus = hasCompletedWork ? 'blocked' : 'todo';
@@ -2285,9 +2294,8 @@ async function taskMonitor() {
               started_at: null,
               idle_retries: idleRetries,
               blocked_reason: hasCompletedWork ? `Idle timeout: ${agentName} idle >${Math.floor(idleMs/60000)}min — task has completed work (PR/result) but QA agent couldn't process. Needs manual review or re-dispatch.` : null,
-              error: `Idle timeout: ${agentName} session idle >${Math.floor(idleMs/60000)}min — ${hasCompletedWork ? 'blocked (has work)' : 're-queued'} (retry ${idleRetries}/${MAX_IDLE_RETRIES})`,
             }).eq("id", task.id);
-            await logTaskActivity(task.id, 'dispatch_error', null, `Agent ${agentName} idle for ${Math.floor(idleMs/60000)}min — ${targetStatus} (retry ${idleRetries}/${MAX_IDLE_RETRIES})`, 'dispatcher');
+            await logTransientError(task.id, `Idle timeout: ${agentName} session idle >${Math.floor(idleMs/60000)}min — ${hasCompletedWork ? 'blocked (has work)' : 're-queued'} (retry ${idleRetries}/${MAX_IDLE_RETRIES})`);
           }
           activeTasks.delete(task.id);
           continue;
@@ -2352,9 +2360,8 @@ async function taskMonitor() {
               await supabase.from("agent_tasks").update({
                 qa_agent: null,
                 qa_retries: qaRetryCount,
-                error: qaGoneReason,
               }).eq("id", task.id);
-              await logTaskActivity(task.id, 'qa_error', null, qaGoneReason, 'dispatcher');
+              await logTransientError(task.id, qaGoneReason);
             }
             recordTransition(task.id);
           } else if (elapsed > timeout) {
@@ -2549,7 +2556,8 @@ async function scheduler() {
           } else {
             // Both unavailable — clear hint and let capability-based routing handle it
             console.log(`[SCHEDULER] Hint ${hintAgent} is disabled/degraded, clearing for task ${task.id}`);
-            await supabase.from("agent_tasks").update({ assigned_agent: null, error: `Hint agent ${hintAgent} is disabled/degraded — cleared for re-routing` }).eq("id", task.id);
+            await supabase.from("agent_tasks").update({ assigned_agent: null }).eq("id", task.id);
+            await logTransientError(task.id, `Hint agent ${hintAgent} is disabled/degraded — cleared for re-routing`);
             // Fall through to capability-based assignment below
           }
         }
@@ -2669,8 +2677,9 @@ async function requeueAgentTasks(agentName) {
   for (const task of (tasks || [])) {
     const { error: updateErr } = await supabase
       .from('agent_tasks')
-      .update({ status: 'todo', assigned_agent: null, error: `Agent ${agentName} degraded (stale heartbeat) — re-queued for re-dispatch` })
+      .update({ status: 'todo', assigned_agent: null })
       .eq('id', task.id);
+    await logTransientError(task.id, `Agent ${agentName} degraded (stale heartbeat) — re-queued for re-dispatch`);
     if (updateErr) {
       console.error(`[REQUEUE] Failed to requeue task ${task.id}:`, updateErr.message);
     } else {
@@ -2869,6 +2878,7 @@ async function autoDeployDetector() {
         console.log(`[DEPLOY-DETECT] Task ${task.id} ("${task.title.slice(0, 40)}") is non-coding (${task.type}) → deployed`);
         await supabase.from("agent_tasks").update({
           status: "deployed",
+          error: null,
         }).eq("id", task.id);
         deployed++;
         continue;
@@ -2952,6 +2962,7 @@ async function autoDeployDetector() {
         console.log(`[DEPLOY-DETECT] Task ${task.id} ("${task.title.slice(0, 40)}") → deployed (${deployEnv}${commitRef ? `, ref: ${commitRef}` : ""})`);
         await supabase.from("agent_tasks").update({
           status: "deployed",
+          error: null,
         }).eq("id", task.id);
         deployed++;
 

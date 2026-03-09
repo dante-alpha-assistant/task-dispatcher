@@ -124,7 +124,7 @@ async function mergeTask(supabase, logTaskActivity, task) {
     console.log(`[MERGE-QUEUE] PR #${prNumber} already ${pr.merged ? "merged" : "closed"} — marking task deployed`);
     await supabase.from("agent_tasks").update({
       status: pr.merged ? "deployed" : "failed",
-      ...(pr.merged ? {} : { error: "PR was closed without merging" }),
+      error: pr.merged ? null : "PR was closed without merging",
     }).eq("id", id);
     await logTaskActivity(id, "merge_complete", null, `PR #${prNumber} was already ${pr.merged ? "merged" : "closed"}`, "merge-queue");
     return;
@@ -217,10 +217,11 @@ async function mergeTask(supabase, logTaskActivity, task) {
       headers,
     }).catch(() => {});
 
-    // Update task to deployed
+    // Update task to deployed — clear error since merge succeeded
     await supabase.from("agent_tasks").update({
       status: "deployed",
       deployment_url: prUrl,
+      error: null,
     }).eq("id", id);
 
     await logTaskActivity(id, "merge_complete", null, `PR #${prNumber} squash-merged and branch deleted`, "merge-queue");
