@@ -4,6 +4,7 @@ import { execSync } from "child_process";
 import { startMergeQueue } from "./merge-queue.js";
 import { initLangfuse, traceTaskPhase, logGeneration, recordPhaseCost, flushLangfuse } from "./langfuse.js";
 import { detectBlockerPattern, buildBlockerMetadata } from "./blocker-patterns.js";
+import { classifyError, getErrorCategories } from "./error-classifier.js";
 
 // K8s client setup
 const kc = new k8s.KubeConfig();
@@ -292,14 +293,20 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 // Log an event to the task's activity log (visible in dashboard Activity tab)
 async function logTaskActivity(taskId, field, oldValue, newValue, changedBy = 'dispatcher') {
   try {
-    await supabase.from('task_activity_log').insert({
+    const entry = {
       task_id: taskId,
       field,
       old_value: oldValue,
       new_value: newValue,
       changed_by: changedBy,
       changed_at: new Date().toISOString(),
-    });
+    };
+    // Auto-classify errors
+    if ((field === 'error' || field === 'dispatch_error') && newValue) {
+      const classification = classifyError(newValue);
+      entry.error_category = classification.category;
+    }
+    await supabase.from('task_activity_log').insert(entry);
   } catch (e) {
     console.error('[ACTIVITY-LOG] Failed to log activity for task', taskId, ':', e.message);
   }
@@ -309,7 +316,8 @@ async function logTaskActivity(taskId, field, oldValue, newValue, changedBy = 'd
 // Transient errors are recoverable issues (session lost, timeout, idle retry, dispatch failure).
 // Only TERMINAL errors (max retries, permanent failure) should set the error field.
 async function logTransientError(taskId, message, changedBy = 'dispatcher') {
-  console.log(`[TRANSIENT-ERROR] Task ${taskId}: ${message}`);
+  const classification = classifyError(message);
+  console.log(`[TRANSIENT-ERROR] Task ${taskId} [${classification.category}]: ${message}`);
   await logTaskActivity(taskId, 'error', null, message, changedBy);
 }
 
@@ -1650,6 +1658,30 @@ initLangfuse();
                   console.log(`[QA-RETRY] Task ${task.id} QA failed ${qaRetries + 1} times — staying failed for manual review`);
                 }
               }
+
+              // Auto-triage: classify the error and auto-retry retriable categories (timeout, session_lost)
+              const errorText = task.error || '';
+              const errorClassification = classifyError(errorText);
+              if (errorClassification.retriable && errorClassification.action === 'auto_retry') {
+                const retryCount = (task.metadata?.auto_retries || 0);
+                if (retryCount < 3) {
+                  console.log(`[AUTO-TRIAGE] Task ${task.id} error classified as ${errorClassification.category} (retry ${retryCount + 1}/3) — auto-retrying`);
+                  supabase.from('agent_tasks').update({
+                    status: 'todo',
+                    assigned_agent: null,
+                    started_at: null,
+                    completed_at: null,
+                    error: null,
+                    last_failed_agent: task.assigned_agent || task.last_failed_agent,
+                    metadata: { ...(task.metadata || {}), auto_retries: retryCount + 1, last_error_category: errorClassification.category },
+                  }).eq('id', task.id).then(() => {
+                    logTaskActivity(task.id, 'auto_triage', null, `Error classified as ${errorClassification.category} — auto-retrying (attempt ${retryCount + 1}/3)`, 'dispatcher');
+                  }).catch(e => console.error(`[AUTO-TRIAGE] Failed to retry task ${task.id}:`, e.message));
+                } else {
+                  console.log(`[AUTO-TRIAGE] Task ${task.id} ${errorClassification.category} — max retries (3) reached, staying failed`);
+                  logTaskActivity(task.id, 'auto_triage', null, `Error classified as ${errorClassification.category} — max retries (3) exhausted`, 'dispatcher').catch(() => {});
+                }
+              }
             }
             const agent = task.assigned_agent || task.qa_agent || 'system';
             traceTaskPhase(task, phase, agent);
@@ -2132,6 +2164,45 @@ createServer(async (req, res) => {
         res.end(JSON.stringify({ error: e.message }));
       }
     });
+  } else if (pathname === "/api/error-stats" && req.method === "GET") {
+    // Error category breakdown stats
+    try {
+      const period = url.searchParams.get("period") || "7d";
+      const periodMs = period === "24h" ? 86400000 : period === "7d" ? 604800000 : 604800000;
+      const since = new Date(Date.now() - periodMs).toISOString();
+
+      const { data, error } = await supabase
+        .from("task_activity_log")
+        .select("error_category, changed_at")
+        .in("field", ["error", "dispatch_error"])
+        .gte("changed_at", since)
+        .not("error_category", "is", null);
+
+      if (error) throw error;
+
+      // Count by category
+      const counts = {};
+      for (const entry of (data || [])) {
+        const cat = entry.error_category || "unknown";
+        counts[cat] = (counts[cat] || 0) + 1;
+      }
+
+      // Enrich with metadata
+      const categories = getErrorCategories();
+      const breakdown = categories.map(c => ({
+        ...c,
+        count: counts[c.category] || 0,
+      })).filter(c => c.count > 0).sort((a, b) => b.count - a.count);
+
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true, period, since, breakdown, total: (data || []).length }));
+    } catch (e) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: false, error: e.message }));
+    }
+  } else if (pathname === "/api/error-categories" && req.method === "GET") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(getErrorCategories()));
   } else {
     res.writeHead(404);
     res.end("Not found");
