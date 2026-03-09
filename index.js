@@ -1523,8 +1523,8 @@ async function assignQueuedQATasks() {
 - Spend more than 5 minutes total
 
 ### When done:
-- If acceptable: **MERGE the PR first** (squash merge via GitHub API), then update task status to \`completed\`
-${prMatch && repoMatch ? `  Merge command: \`gh pr merge ${prMatch[1]} -R ${repoMatch[1]} --squash --delete-branch\`` : prMatch ? `  Merge command: \`gh pr merge ${prMatch[1]} --squash --delete-branch\`` : '  Find the PR number from the task result and merge it'}
+- If acceptable: update task status to \`completed\`. **DO NOT merge the PR** — the merge queue handles merging automatically.
+""
 - If issues found: do NOT merge. Update task status to \`failed\` with specific issues listed`;
         } else if (taskType === 'ops' || taskType === 'review') {
           qaInstructions = `## QA Review (Ops/Config): ${task.title}
