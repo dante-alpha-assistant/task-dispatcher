@@ -1550,6 +1550,8 @@ initLangfuse();
                     qa_agent: null,
                     started_at: null,
                     completed_at: null,
+                    result: null,
+                    qa_result: null,
                     last_failed_agent: task.assigned_agent || task.last_failed_agent,
                     qa_retries: qaRetries + 1,
                     error: `QA failed (attempt ${qaRetries + 1}): ${qaFeedback.slice(0, 500)}`,
@@ -2421,7 +2423,8 @@ async function scheduler() {
         continue;
       }
       const hasWork = !!(t.result || (t.pull_request_url && t.pull_request_url.length > 0));
-      if (hasWork) {
+      const isQaRetry = (t.qa_retries || 0) > 0;  // QA failed → needs coding fix, not re-QA
+      if (hasWork && !isQaRetry) {  // Skip QA routing for tasks retried after QA failure
         console.log("[SCHEDULER] Task " + t.id + " has completed work but is todo — routing to qa_testing");
         await supabase.from("agent_tasks").update({ status: "qa_testing", assigned_agent: null }).eq("id", t.id);
         recordTransition(t.id);
