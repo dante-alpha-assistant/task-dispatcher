@@ -1,84 +1,70 @@
-import { Langfuse } from "@langfuse/client";
+/**
+ * Langfuse Cloud integration — task-level cost tracking.
+ * Uses REST API directly to avoid SDK version compatibility issues.
+ */
 
-let langfuse = null;
+const LANGFUSE_PUBLIC_KEY = process.env.LANGFUSE_PUBLIC_KEY || "";
+const LANGFUSE_SECRET_KEY = process.env.LANGFUSE_SECRET_KEY || "";
+const LANGFUSE_BASE_URL = process.env.LANGFUSE_BASE_URL || "https://cloud.langfuse.com";
+
+let enabled = false;
 
 export function initLangfuse() {
-  const publicKey = process.env.LANGFUSE_PUBLIC_KEY;
-  const secretKey = process.env.LANGFUSE_SECRET_KEY;
-  const baseUrl = process.env.LANGFUSE_BASE_URL || "https://cloud.langfuse.com";
-
-  if (!publicKey || !secretKey) {
-    console.log("[LANGFUSE] Not configured (missing LANGFUSE_PUBLIC_KEY/SECRET_KEY) — cost tracking disabled");
-    return null;
+  if (!LANGFUSE_PUBLIC_KEY || !LANGFUSE_SECRET_KEY) {
+    console.log("[LANGFUSE] Not configured — cost tracking disabled");
+    return;
   }
-
-  langfuse = new Langfuse({ publicKey, secretKey, baseUrl });
+  enabled = true;
   console.log("[LANGFUSE] Initialized — task-level cost tracking enabled");
-  return langfuse;
 }
 
-export function getLangfuse() {
-  return langfuse;
+function authHeader() {
+  return "Basic " + Buffer.from(`${LANGFUSE_PUBLIC_KEY}:${LANGFUSE_SECRET_KEY}`).toString("base64");
 }
 
 /**
- * Create a trace for a task lifecycle phase.
- * Phases: dispatch, coding, qa_testing, deploy
+ * Create a trace for a task phase transition.
  */
-export function traceTaskPhase(task, phase, agentName) {
-  if (!langfuse) return null;
-
-  const trace = langfuse.trace({
-    name: `task-${phase}`,
-    id: `${task.id}-${phase}-${Date.now()}`,
-    sessionId: task.id, // Groups all phases under one session
-    userId: agentName || "dispatcher",
-    metadata: {
-      taskId: task.id,
-      taskTitle: task.title,
-      taskType: task.type,
-      phase,
-      agentName,
-      priority: task.priority,
-      deployTarget: task.deploy_target,
-    },
-    tags: [phase, task.type, agentName || "system"].filter(Boolean),
-  });
-
-  return trace;
+export async function traceTaskPhase(task, phase, agentName) {
+  if (!enabled) return;
+  try {
+    await fetch(`${LANGFUSE_BASE_URL}/api/public/ingestion`, {
+      method: "POST",
+      headers: { Authorization: authHeader(), "Content-Type": "application/json" },
+      body: JSON.stringify({
+        batch: [{
+          id: `${task.id}-${phase}-${Date.now()}`,
+          type: "trace-create",
+          timestamp: new Date().toISOString(),
+          body: {
+            id: `${task.id}-${phase}-${Date.now()}`,
+            name: `task-${phase}`,
+            sessionId: task.id,
+            userId: agentName || "dispatcher",
+            metadata: {
+              taskId: task.id,
+              taskTitle: task.title,
+              taskType: task.type,
+              phase,
+              priority: task.priority,
+              deployTarget: task.deploy_target,
+            },
+            tags: [phase, task.type, agentName].filter(Boolean),
+          },
+        }],
+      }),
+    });
+  } catch (e) {
+    // Silent fail — don't break dispatch for telemetry
+  }
 }
 
 /**
- * Log a generation (LLM call) within a task phase.
- * Called when we know the token usage.
- */
-export function logGeneration(trace, { model, inputTokens, outputTokens, cost, durationMs, input, output }) {
-  if (!trace) return;
-
-  trace.generation({
-    name: `${model}-call`,
-    model,
-    input: input || "task prompt",
-    output: output || "agent response",
-    usage: {
-      input: inputTokens || 0,
-      output: outputTokens || 0,
-      total: (inputTokens || 0) + (outputTokens || 0),
-    },
-    ...(cost !== undefined && { costDetails: { total: cost } }),
-    ...(durationMs && { completionStartTime: new Date(Date.now() - durationMs) }),
-  });
-}
-
-/**
- * Record task phase completion with cost summary.
- * Stores cost data in the task's metadata field.
+ * Record task phase cost in task metadata.
  */
 export async function recordPhaseCost(supabase, taskId, phase, costData) {
   if (!costData) return;
-
   try {
-    // Get current metadata
     const { data: task } = await supabase
       .from("agent_tasks")
       .select("metadata")
@@ -87,7 +73,7 @@ export async function recordPhaseCost(supabase, taskId, phase, costData) {
 
     const metadata = task?.metadata || {};
     if (!metadata.costs) metadata.costs = {};
-    
+
     metadata.costs[phase] = {
       model: costData.model,
       inputTokens: costData.inputTokens || 0,
@@ -99,27 +85,19 @@ export async function recordPhaseCost(supabase, taskId, phase, costData) {
       timestamp: new Date().toISOString(),
     };
 
-    // Calculate totals
     const phases = Object.values(metadata.costs);
     metadata.totalCost = phases.reduce((sum, p) => sum + (p.cost || 0), 0);
     metadata.totalTokens = phases.reduce((sum, p) => sum + (p.totalTokens || 0), 0);
 
-    await supabase
-      .from("agent_tasks")
-      .update({ metadata })
-      .eq("id", taskId);
-
+    await supabase.from("agent_tasks").update({ metadata }).eq("id", taskId);
   } catch (e) {
-    console.error(`[LANGFUSE] Error recording phase cost for ${taskId}:`, e.message);
+    console.error(`[LANGFUSE] Error recording phase cost: ${e.message}`);
   }
 }
 
-/**
- * Flush pending events to Langfuse Cloud.
- * Call periodically or on shutdown.
- */
 export async function flushLangfuse() {
-  if (langfuse) {
-    await langfuse.flush();
-  }
+  // No-op — REST API sends immediately
 }
+
+export function getLangfuse() { return enabled; }
+export function logGeneration() {} // Stub for future use

@@ -12,7 +12,6 @@
   "license": "ISC",
   "dependencies": {
     "@kubernetes/client-node": "^1.0.0",
-    "@langfuse/client": "^4.6.1",
     "@supabase/supabase-js": "^2.98.0"
   }
 }
