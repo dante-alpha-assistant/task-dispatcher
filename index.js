@@ -1599,9 +1599,9 @@ async function assignQueuedQATasks() {
 - Spend more than 5 minutes total
 
 ### When done:
-- If acceptable: update task status to \`completed\`. **DO NOT merge the PR** — the merge queue handles merging automatically.
-""
-- If issues found: do NOT merge. Update task status to \`failed\` with specific issues listed`;
+// MERGE QUEUE: QA agents must NEVER merge PRs directly
+- If acceptable: update task status to \`completed\`. DO NOT merge the PR — the merge queue handles merging automatically.
+- If issues found: update task status to \`failed\` with specific issues listed`;
         } else if (taskType === 'ops' || taskType === 'review') {
           qaInstructions = `## QA Review (Ops/Config): ${task.title}
 
