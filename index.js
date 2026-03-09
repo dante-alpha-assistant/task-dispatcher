@@ -926,6 +926,7 @@ async function dispatchToAgent(task) {
     stage: task.stage,
     parent_task_id: task.parent_task_id,
     dispatched_by: task.dispatched_by,
+              pull_request_url: task.pull_request_url,
     repo: task.repo,
     branch: task.branch,
     context: task.context,
@@ -1829,6 +1830,7 @@ Generate realistic Gherkin scenarios that cover the task requirements, then PATC
               stage: task.stage,
               parent_task_id: task.parent_task_id,
               dispatched_by: task.dispatched_by,
+              pull_request_url: task.pull_request_url,
             }, null, 2);
 
             const qaMessage = `\`\`\`json
@@ -1842,6 +1844,9 @@ ${qaContextBlock}## QA Review: ${task.title}
 
 ### Description
 ${task.description || "(none)"}
+
+### Pull Request URL
+${task.pull_request_url && task.pull_request_url.length ? task.pull_request_url.join("\n") : "(no PR URL set)"}
 
 ### Result
 ${task.result ? JSON.stringify(task.result, null, 2).slice(0, 1000) : "(no result reported)"}
