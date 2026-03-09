@@ -1543,8 +1543,15 @@ function subscribe() {
             .eq('assigned_agent', task.assigned_agent)
             .in('status', ['in_progress'])
             .neq('id', task.id);
-          if (inFlight && inFlight.length > 0) {
-            const reason = `Agent ${agentName} busy (${inFlight.length} in-progress task), unassigning for re-dispatch`;
+          // Check capacity from agent_cards (default 1 for backward compat)
+          const { data: agentCard } = await supabase
+            .from('agent_cards')
+            .select('max_capacity')
+            .eq('name', task.assigned_agent)
+            .single();
+          const maxCapacity = agentCard?.max_capacity || 1;
+          if (inFlight && inFlight.length >= maxCapacity) {
+            const reason = `Agent ${agentName} at capacity (${inFlight.length}/${maxCapacity} in-progress tasks), unassigning for re-dispatch`;
             console.log(`[DISPATCH] ${reason}`);
             await supabase.from('agent_tasks').update({
               assigned_agent: null,
