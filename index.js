@@ -4,6 +4,7 @@ import { execSync } from "child_process";
 import { startMergeQueue } from "./merge-queue.js";
 import { initLangfuse, traceTaskPhase, logGeneration, recordPhaseCost, flushLangfuse } from "./langfuse.js";
 import { detectBlockerPattern, buildBlockerMetadata } from "./blocker-patterns.js";
+import { classifyError, getTriageAction, ERROR_CATEGORIES } from "./error-classifier.js";
 
 // K8s client setup
 const kc = new k8s.KubeConfig();
@@ -290,16 +291,25 @@ function isFinalStage(stage) {
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
 // Log an event to the task's activity log (visible in dashboard Activity tab)
-async function logTaskActivity(taskId, field, oldValue, newValue, changedBy = 'dispatcher') {
+async function logTaskActivity(taskId, field, oldValue, newValue, changedBy = 'dispatcher', extra = {}) {
   try {
-    await supabase.from('task_activity_log').insert({
+    const entry = {
       task_id: taskId,
       field,
       old_value: oldValue,
       new_value: newValue,
       changed_by: changedBy,
       changed_at: new Date().toISOString(),
-    });
+    };
+    // Auto-classify errors when logging error-related fields
+    if ((field === 'error' || field === 'dispatch_error' || field === 'qa_error') && newValue) {
+      const classification = classifyError(newValue);
+      entry.error_category = classification.category;
+    }
+    if (extra.error_category) {
+      entry.error_category = extra.error_category;
+    }
+    await supabase.from('task_activity_log').insert(entry);
   } catch (e) {
     console.error('[ACTIVITY-LOG] Failed to log activity for task', taskId, ':', e.message);
   }
@@ -310,7 +320,10 @@ async function logTaskActivity(taskId, field, oldValue, newValue, changedBy = 'd
 // Only TERMINAL errors (max retries, permanent failure) should set the error field.
 async function logTransientError(taskId, message, changedBy = 'dispatcher') {
   console.log(`[TRANSIENT-ERROR] Task ${taskId}: ${message}`);
-  await logTaskActivity(taskId, 'error', null, message, changedBy);
+  const classification = classifyError(message);
+  const triage = getTriageAction(classification.category);
+  console.log(`[ERROR-CLASSIFY] Task ${taskId}: category=${classification.category} (${classification.confidence}), action=${triage.action}, retriable=${triage.retriable}`);
+  await logTaskActivity(taskId, 'error', null, message, changedBy, { error_category: classification.category });
 }
 
 // Boot-time: detect orphaned tasks (assigned but never dispatched due to restart)
@@ -2085,6 +2098,46 @@ createServer(async (req, res) => {
     } catch {}
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ ok: true, service: "task-dispatcher", activeTasks: activeTasks.size, capacity, qaWorkers }));
+  } else if (pathname === "/api/error-stats" && req.method === "GET") {
+    // Error stats: count by category in last 24h and 7d
+    try {
+      const now = new Date();
+      const day = new Date(now - 24 * 60 * 60 * 1000).toISOString();
+      const week = new Date(now - 7 * 24 * 60 * 60 * 1000).toISOString();
+
+      const { data: dayData } = await supabase
+        .from('task_activity_log')
+        .select('error_category')
+        .not('error_category', 'is', null)
+        .gte('changed_at', day);
+
+      const { data: weekData } = await supabase
+        .from('task_activity_log')
+        .select('error_category')
+        .not('error_category', 'is', null)
+        .gte('changed_at', week);
+
+      const count = (data) => {
+        const counts = {};
+        for (const cat of Object.keys(ERROR_CATEGORIES)) counts[cat] = 0;
+        for (const row of (data || [])) {
+          counts[row.error_category] = (counts[row.error_category] || 0) + 1;
+        }
+        return counts;
+      };
+
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        last_24h: count(dayData),
+        last_7d: count(weekData),
+        total_24h: (dayData || []).length,
+        total_7d: (weekData || []).length,
+        categories: ERROR_CATEGORIES,
+      }));
+    } catch (e) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: e.message }));
+    }
   } else if (pathname === "/events" && req.method === "GET") {
     // SSE endpoint
     res.writeHead(200, {
