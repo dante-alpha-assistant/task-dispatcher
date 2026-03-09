@@ -3007,6 +3007,137 @@ console.log("[BOOT] Stale agent detector running every 60s (threshold: 10min)");
 // setTimeout(autoDeployDetector, 15000);
 console.log(`[BOOT] Auto-deploy detector DISABLED — manual deployment only`);
 
+// ==========================================
+// Health Checker — detect tasks in suspicious/inconsistent states
+// Runs every 5 minutes, flags tasks via metadata.health_flags
+// ==========================================
+const HEALTH_CHECK_INTERVAL = 5 * 60_000; // 5 minutes
+
+async function healthChecker() {
+  try {
+    // Fetch all non-terminal active tasks + recently completed/deployed
+    const { data: tasks, error } = await supabase
+      .from("agent_tasks")
+      .select("id, title, status, type, assigned_agent, qa_agent, error, started_at, completed_at, updated_at, metadata, pull_request_url, result")
+      .in("status", ["todo", "in_progress", "running", "qa_testing", "completed", "deployed"]);
+
+    if (error) {
+      console.error("[HEALTH] Failed to fetch tasks:", error.message);
+      return;
+    }
+    if (!tasks || tasks.length === 0) return;
+
+    const now = Date.now();
+    let flagged = 0;
+    let critical = 0;
+
+    for (const task of tasks) {
+      const flags = [];
+      const meta = task.metadata || {};
+      const qaResult = meta.qa_result || (task.result?.qa_result) || null;
+      const qaRetries = meta.qa_retries || 0;
+      const hasActiveError = !!task.error;
+      const startedMs = task.started_at ? new Date(task.started_at).getTime() : 0;
+      const updatedMs = task.updated_at ? new Date(task.updated_at).getTime() : 0;
+
+      // 1. completed + active error + no qa_result.passed
+      if (task.status === "completed" && hasActiveError && (!qaResult || !qaResult.passed)) {
+        flags.push({ code: "COMPLETED_WITH_ERROR", severity: "warning", message: "Completed with active error and no QA pass" });
+      }
+
+      // 2. deployed + active error (CRITICAL)
+      if (task.status === "deployed" && hasActiveError) {
+        flags.push({ code: "DEPLOYED_WITH_ERROR", severity: "critical", message: "Deployed with an unresolved error" });
+      }
+
+      // 3. in_progress + no assigned_agent
+      if ((task.status === "in_progress" || task.status === "running") && !task.assigned_agent) {
+        flags.push({ code: "IN_PROGRESS_UNASSIGNED", severity: "warning", message: "In progress with no assigned agent" });
+      }
+
+      // 4. qa_testing + no qa_agent for >10 min
+      if (task.status === "qa_testing" && !task.qa_agent) {
+        const qaWaitMs = now - updatedMs;
+        if (qaWaitMs > 10 * 60_000) {
+          flags.push({ code: "QA_STUCK_NO_AGENT", severity: "warning", message: `QA testing with no reviewer for ${Math.round(qaWaitMs / 60_000)}min` });
+        }
+      }
+
+      // 5. in_progress + started > 60 min ago + no recent update (zombie)
+      if ((task.status === "in_progress" || task.status === "running") && startedMs) {
+        const elapsed = now - startedMs;
+        const sinceUpdate = now - updatedMs;
+        if (elapsed > 60 * 60_000 && sinceUpdate > 30 * 60_000) {
+          flags.push({ code: "ZOMBIE_TASK", severity: "warning", message: `In progress for ${Math.round(elapsed / 60_000)}min, no update for ${Math.round(sinceUpdate / 60_000)}min` });
+        }
+      }
+
+      // 6. completed + coding type + no pull_request_url
+      if (task.status === "completed" && task.type === "coding") {
+        const prUrl = task.pull_request_url;
+        const hasPr = prUrl && (Array.isArray(prUrl) ? prUrl.length > 0 : !!prUrl);
+        if (!hasPr) {
+          flags.push({ code: "CODING_NO_PR", severity: "warning", message: "Coding task completed without a PR URL" });
+        }
+      }
+
+      // 7. todo + assigned_agent not null
+      if (task.status === "todo" && task.assigned_agent) {
+        flags.push({ code: "TODO_ASSIGNED", severity: "info", message: "Assigned but still in todo status" });
+      }
+
+      // 8. completed + qa_retries >= 2 + qa_result.passed = false
+      if (task.status === "completed" && qaRetries >= 2 && qaResult && qaResult.passed === false) {
+        flags.push({ code: "COMPLETED_QA_FAILED", severity: "warning", message: `Completed despite ${qaRetries} QA retries with failed result` });
+      }
+
+      // Compare with existing flags — only update if changed
+      const existingFlags = meta.health_flags || [];
+      const existingCodes = new Set(existingFlags.map(f => f.code));
+      const newCodes = new Set(flags.map(f => f.code));
+      const changed = flags.length !== existingFlags.length ||
+        flags.some(f => !existingCodes.has(f.code)) ||
+        existingFlags.some(f => !newCodes.has(f.code));
+
+      if (changed) {
+        const updatedMeta = { ...meta, health_flags: flags, health_checked_at: new Date().toISOString() };
+        if (flags.length === 0) delete updatedMeta.health_flags; // Clean up when resolved
+        await supabase.from("agent_tasks").update({ metadata: updatedMeta }).eq("id", task.id);
+
+        if (flags.length > 0) {
+          flagged++;
+          const flagSummary = flags.map(f => `${f.severity === "critical" ? "🔴" : "⚠️"} ${f.code}: ${f.message}`).join(", ");
+          console.log(`[HEALTH] Task ${task.id} ("${task.title?.slice(0, 40)}"): ${flagSummary}`);
+
+          // Broadcast health flag update via SSE
+          broadcast("task:health", { taskId: task.id, flags, title: task.title }, task.id);
+
+          // Discord alert for critical violations
+          const criticalFlags = flags.filter(f => f.severity === "critical");
+          if (criticalFlags.length > 0) {
+            critical++;
+            console.warn(`[HEALTH] 🔴 CRITICAL: Task ${task.id} — ${criticalFlags.map(f => f.message).join("; ")}`);
+          }
+        } else if (existingFlags.length > 0) {
+          console.log(`[HEALTH] Task ${task.id} ("${task.title?.slice(0, 40)}"): flags cleared ✅`);
+          broadcast("task:health", { taskId: task.id, flags: [], title: task.title }, task.id);
+        }
+      }
+    }
+
+    if (flagged > 0) {
+      console.log(`[HEALTH] Scan complete — ${flagged} task(s) flagged, ${critical} critical`);
+    }
+  } catch (e) {
+    console.error("[HEALTH] Health checker error:", e.message);
+  }
+}
+
+// Health checker — every 5 minutes
+setInterval(healthChecker, HEALTH_CHECK_INTERVAL);
+setTimeout(healthChecker, 15000); // First run 15s after boot
+console.log(`[BOOT] Health checker running every ${HEALTH_CHECK_INTERVAL / 1000}s`);
+
 // Graceful shutdown
 process.on("SIGTERM", () => {
   console.log("[SHUTDOWN] Received SIGTERM");
