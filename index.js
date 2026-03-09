@@ -2234,6 +2234,33 @@ async function taskMonitor() {
   }
 }
 
+
+// Check if a task's dependencies are all completed/deployed
+async function areDependenciesMet(taskId) {
+  try {
+    const { data: deps } = await supabase
+      .from('task_relationships')
+      .select('target_task_id')
+      .eq('source_task_id', taskId)
+      .eq('relationship_type', 'depends_on');
+    
+    if (!deps || deps.length === 0) return true; // No dependencies
+    
+    const depIds = deps.map(d => d.target_task_id);
+    const { data: depTasks } = await supabase
+      .from('agent_tasks')
+      .select('id, status')
+      .in('id', depIds);
+    
+    const completedStatuses = new Set(['completed', 'deployed', 'deploying']);
+    const allMet = (depTasks || []).every(t => completedStatuses.has(t.status));
+    return allMet;
+  } catch (e) {
+    console.error('[SCHEDULER] Error checking dependencies:', e.message);
+    return true; // On error, don't block
+  }
+}
+
 // --- Auto-scheduler: assign todo tasks to available agents ---
 async function scheduler() {
   try {
@@ -2310,6 +2337,12 @@ async function scheduler() {
     const trulyTodoTasks = [];
     for (const t of (todoTasks || [])) {
       if (t.type === "manual") continue;
+      // Check task dependencies
+      const depsMet = await areDependenciesMet(t.id);
+      if (!depsMet) {
+        // console.log('[SCHEDULER] Task ' + t.id.slice(0,8) + ' has unmet dependencies — skipping');
+        continue;
+      }
       const hasWork = !!(t.result || (t.pull_request_url && t.pull_request_url.length > 0));
       if (hasWork) {
         console.log("[SCHEDULER] Task " + t.id + " has completed work but is todo — routing to qa_testing");
