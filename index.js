@@ -1607,6 +1607,17 @@ initLangfuse();
           }
         }
 
+        // === COMPLETED LOCK: When task reaches completed, clear QA agent to prevent post-completion changes ===
+        if (task && task.status === 'completed' && eventType === 'UPDATE' && prev?.status !== 'completed') {
+          const lockUpdates = {};
+          if (task.qa_agent) lockUpdates.qa_agent = null;
+          // Don't clear assigned_agent here — deploy needs to know who worked on it
+          if (Object.keys(lockUpdates).length > 0) {
+            console.log(`[COMPLETED-LOCK] Task ${task.id} reached completed — clearing qa_agent to prevent post-completion changes`);
+            await supabase.from('agent_tasks').update(lockUpdates).eq('id', task.id);
+          }
+        }
+
         // ===== QA COMPLETION VALIDATOR =====
         // When a coding task moves to 'completed', verify the QA actually reviewed code.
         // Revert to qa_testing if the QA agent rubber-stamped without PR review.
@@ -1786,6 +1797,11 @@ DO NOT: SSH into servers, run commands, or deep-dive into infrastructure.`;
 3. Does the code match what was requested in the description?
 4. Check for regressions — does the change break existing patterns?
 DO NOT: Clone the repo, run builds, run tests, or spend more than 3 minutes.
+
+### ⛔ ATOMIC RULE: ONE status update only
+You MUST make exactly ONE status update call (pass OR fail). Your first update is FINAL.
+Do NOT update status to completed and then change qa_result or status in a second call.
+The database will REJECT any changes to a completed task. Decide pass/fail BEFORE updating.
 
 ### ⛔ HARD RULE: Coding tasks MUST have a PR
 If you cannot find a Pull Request URL (in the result, pull_request_url field, or task comments), you MUST **FAIL** the task immediately with:
