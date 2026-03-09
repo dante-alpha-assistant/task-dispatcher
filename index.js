@@ -831,6 +831,78 @@ async function buildContextBlockWithTimeout(task) {
   }
 }
 
+// --- Build blocker resolution context for retry dispatch ---
+function buildBlockerContext(task) {
+  const metadata = task.metadata;
+  if (!metadata?.blocker) return '';
+
+  const blocker = metadata.blocker;
+  const hasProvidedValues = blocker.provided_values && Object.keys(blocker.provided_values).length > 0;
+  const hasHumanResponse = !!blocker.human_response;
+
+  if (!hasProvidedValues && !hasHumanResponse) return '';
+
+  const lines = ['## Human Input (Blocker Resolved)', ''];
+  lines.push(`This task was previously blocked. **Reason:** ${blocker.reason || blocker.blocked_reason || '(not specified)'}`);
+  lines.push('');
+
+  if (hasProvidedValues) {
+    lines.push('### Provided Values');
+    for (const [key, value] of Object.entries(blocker.provided_values)) {
+      // Mask credential-like values in the prompt for logging safety
+      const isCredential = /key|secret|token|password|api_key/i.test(key);
+      if (isCredential) {
+        lines.push(`- **${key}:** \`[PROVIDED — access via task metadata]\``);
+      } else {
+        lines.push(`- **${key}:** \`${value}\``);
+      }
+    }
+    lines.push('');
+    lines.push('> **For credential values:** Fetch full values from the task metadata via Supabase API:');
+    lines.push('> ```bash');
+    lines.push(`> curl -s "https://lessxkxujvcmublgwdaa.supabase.co/rest/v1/agent_tasks?id=eq.${task.id}&select=metadata" \\`);
+    lines.push(`>   -H "apikey: ${SUPABASE_KEY}" -H "Authorization: Bearer ${SUPABASE_KEY}" | jq '.[0].metadata.blocker.provided_values'`);
+    lines.push('> ```');
+    lines.push('');
+  }
+
+  if (hasHumanResponse) {
+    lines.push('### Human Response');
+    lines.push(blocker.human_response);
+    lines.push('');
+  }
+
+  lines.push('Use these inputs to continue the task.\n');
+  return lines.join('\n');
+}
+
+// Archive blocker metadata after successful dispatch
+async function archiveBlockerMetadata(task) {
+  const metadata = task.metadata;
+  if (!metadata?.blocker) return;
+
+  const blocker = metadata.blocker;
+  const hasProvidedValues = blocker.provided_values && Object.keys(blocker.provided_values).length > 0;
+  const hasHumanResponse = !!blocker.human_response;
+  if (!hasProvidedValues && !hasHumanResponse) return;
+
+  try {
+    const updatedMetadata = { ...metadata };
+    // Move blocker to resolved_blockers history
+    if (!updatedMetadata.resolved_blockers) updatedMetadata.resolved_blockers = [];
+    updatedMetadata.resolved_blockers.push({
+      ...blocker,
+      resolved_at: new Date().toISOString(),
+    });
+    delete updatedMetadata.blocker;
+
+    await supabase.from('agent_tasks').update({ metadata: updatedMetadata }).eq('id', task.id);
+    console.log(`[BLOCKER] Archived resolved blocker for task ${task.id}`);
+  } catch (e) {
+    console.error(`[BLOCKER] Failed to archive blocker for task ${task.id}:`, e.message);
+  }
+}
+
 // --- Dispatch task to agent via /hooks/agent ---
 // Fetch task comments to include in dispatch (for retries / context)
 async function fetchTaskComments(taskId) {
@@ -983,6 +1055,7 @@ async function dispatchToAgent(task) {
 
   const contextBlock = await buildContextBlockWithTimeout(task);
   const commentsBlock = await fetchTaskComments(task.id);
+  const blockerContext = buildBlockerContext(task);
 
   // Build rebase section if metadata indicates rebase requested
   const rebaseSection = task.metadata?.rebase_requested && task.metadata?.rebase_pr ? (() => {
@@ -1023,7 +1096,7 @@ ${taskPayload}
 
 ${contextBlock}## Task Assigned: ${task.title}
 
-${rebaseSection || (task.description || "")}
+${blockerContext}${rebaseSection || (task.description || "")}
 ${!rebaseSection && task.prompt ? `**Prompt:** ${task.prompt}` : ""}
 ${!rebaseSection ? codingTaskSection : ""}
 
@@ -1156,6 +1229,9 @@ Do NOT skip this step. The task board at tasks.dante.id must reflect your work.`
         .from("agent_tasks")
         .update({ status: "in_progress", started_at: new Date().toISOString(), error: null, result: null, idle_retries: 0 })
         .eq("id", task.id);
+
+      // Archive blocker metadata after successful dispatch
+      await archiveBlockerMetadata(task);
     } else {
       const err = await resp.text();
       const errMsg = `Dispatch to ${agentName} failed: HTTP ${resp.status} — ${err.slice(0, 200)}`;
