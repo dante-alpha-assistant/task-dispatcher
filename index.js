@@ -1710,7 +1710,7 @@ initLangfuse();
               autoDetectBlocker(task).catch((e) => console.error(`[AUTO-BLOCKER] Error for task ${task.id}:`, e.message));
               // Auto-retry: QA failed coding tasks go back to todo for another coding agent
               // Limited to 2 auto-retries to prevent infinite loops
-              if (prev?.status === 'qa_testing' && task.type === 'coding' && task.qa_result && !task.qa_result.passed) {
+              if (prev?.status === 'qa_testing' && task.type === 'coding' && task.qa_result && task.qa_result.passed === false) {
                 const qaRetries = task.qa_retries || 0;
                 if (qaRetries < 2) {
                   console.log(`[QA-RETRY] Task ${task.id} QA failed (attempt ${qaRetries + 1}/2) — sending back to todo for coding fix`);
