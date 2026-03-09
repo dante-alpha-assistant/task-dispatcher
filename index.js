@@ -1782,8 +1782,37 @@ initLangfuse();
             }).eq('id', task.id);
             await logTransientError(task.id, reason);
           } else {
-            console.log(`[DISPATCH] Task ${task.id} → ${task.assigned_agent}`);
-            dispatchToAgent(task);
+            // Check dependencies before dispatching
+            const depsResult = await areDependenciesMet(task.id, { detailed: true });
+            if (!depsResult.met) {
+              const unmetNames = depsResult.unmet.map(d => `"${d.title}" (${d.status})`).join(', ');
+              const reason = `Unmet dependencies: ${unmetNames} — unassigning task`;
+              console.log(`[DISPATCH] ${reason}`);
+              await supabase.from('agent_tasks').update({
+                assigned_agent: null,
+                error: `Blocked by unmet dependencies: ${unmetNames}`,
+              }).eq('id', task.id);
+              await logTransientError(task.id, reason);
+            } else {
+              console.log(`[DISPATCH] Task ${task.id} → ${task.assigned_agent}`);
+              dispatchToAgent(task);
+            }
+          }
+        }
+
+        // Dependency check on qa_testing transition
+        if (task && task.status === 'qa_testing' && eventType === 'UPDATE' && prev?.status && prev.status !== task.status) {
+          const depsResult = await areDependenciesMet(task.id, { detailed: true });
+          if (!depsResult.met) {
+            const unmetNames = depsResult.unmet.map(d => `"${d.title}" (${d.status})`).join(', ');
+            console.log(`[DEPS] Task ${task.id} moved to qa_testing but has unmet dependencies: ${unmetNames} — reverting to blocked`);
+            await supabase.from('agent_tasks').update({
+              status: 'blocked',
+              blocked_reason: `Unmet dependencies: ${unmetNames}`,
+              error: `Cannot proceed — dependencies not met: ${unmetNames}`,
+            }).eq('id', task.id);
+            await logTransientError(task.id, `qa_testing blocked by unmet dependencies: ${unmetNames}`);
+            return; // Skip further processing for this event
           }
         }
 
@@ -2491,7 +2520,8 @@ async function taskMonitor() {
 
 
 // Check if a task's dependencies are all completed/deployed
-async function areDependenciesMet(taskId) {
+// Returns true if all met, or an object { met: false, unmet: [...] } with details
+async function areDependenciesMet(taskId, { detailed = false } = {}) {
   try {
     const { data: deps } = await supabase
       .from('task_relationships')
@@ -2499,20 +2529,22 @@ async function areDependenciesMet(taskId) {
       .eq('source_task_id', taskId)
       .eq('relationship_type', 'depends_on');
     
-    if (!deps || deps.length === 0) return true; // No dependencies
+    if (!deps || deps.length === 0) return detailed ? { met: true, unmet: [] } : true;
     
     const depIds = deps.map(d => d.target_task_id);
     const { data: depTasks } = await supabase
       .from('agent_tasks')
-      .select('id, status')
+      .select('id, title, status')
       .in('id', depIds);
     
     const completedStatuses = new Set(['completed', 'deployed', 'deploying']);
-    const allMet = (depTasks || []).every(t => completedStatuses.has(t.status));
-    return allMet;
+    const unmet = (depTasks || []).filter(t => !completedStatuses.has(t.status));
+    
+    if (!detailed) return unmet.length === 0;
+    return { met: unmet.length === 0, unmet };
   } catch (e) {
     console.error('[SCHEDULER] Error checking dependencies:', e.message);
-    return true; // On error, don't block
+    return detailed ? { met: true, unmet: [] } : true;
   }
 }
 
@@ -2602,6 +2634,7 @@ async function scheduler() {
       const isQaRetry = (t.qa_retries || 0) > 0;  // QA failed → needs coding fix, not re-QA
       const isRebaseNeeded = !!(t.metadata && t.metadata.rebase_requested);  // Merge queue conflict → needs rebase, not re-QA
       if (hasWork && !isQaRetry && !isRebaseNeeded) {  // Skip QA routing for tasks needing coding fixes or rebases
+        // depsMet already checked above — if we got here, dependencies are met
         console.log("[SCHEDULER] Task " + t.id + " has completed work but is todo — routing to qa_testing");
         await supabase.from("agent_tasks").update({ status: "qa_testing", assigned_agent: null }).eq("id", t.id);
         recordTransition(t.id);
