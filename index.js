@@ -1440,7 +1440,7 @@ async function assignQueuedQATasks() {
 
 ### When done:
 - If acceptable: **MERGE the PR first** (squash merge via GitHub API), then update task status to \`completed\`
-${prMatch && repoMatch ? `  Merge command: \`gh pr merge ${prMatch[1]} -R ${repoMatch[1]} --squash --delete-branch\`` : prMatch ? `  Merge command: \`gh pr merge ${prMatch[1]} --squash --delete-branch\`` : '  Find the PR number from the task result and merge it'}
+${prMatch && repoMatch ? `  Merge command: \`gh pr merge ${prMatch[1]} -R ${repoMatch[1]} --squash --delete-branch --auto\`` : prMatch ? `  Merge command: \`gh pr merge ${prMatch[1]} --squash --delete-branch\`` : '  Find the PR number from the task result and merge it'}
 - If issues found: do NOT merge. Update task status to \`failed\` with specific issues listed`;
         } else if (taskType === 'ops' || taskType === 'review') {
           qaInstructions = `## QA Review (Ops/Config): ${task.title}
@@ -1903,7 +1903,7 @@ ${qaCommentsBlock ? qaCommentsBlock : ""}
 
 **If QA passes (coding tasks — MERGE FIRST):**
 \`\`\`bash
-gh pr merge <PR_NUMBER> -R <REPO> --squash --delete-branch
+gh pr merge <PR_NUMBER> -R <REPO> --squash --delete-branch --auto
 curl -s -X PATCH "https://lessxkxujvcmublgwdaa.supabase.co/rest/v1/agent_tasks?id=eq.${task.id}" \\
   -H "apikey: ${SUPABASE_KEY}" \\
   -H "Authorization: Bearer ${SUPABASE_KEY}" \\
