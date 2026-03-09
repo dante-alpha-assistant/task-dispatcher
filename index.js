@@ -884,7 +884,7 @@ async function dispatchToAgent(task) {
         console.log(`[SKIP] ${skipReason}`);
         await supabase
           .from('agent_tasks')
-          .update({ assigned_agent: null, started_at: null, last_failed_agent: task.assigned_agent })
+          .update({ assigned_agent: null, started_at: null })
           .eq('id', task.id);
         await logTransientError(task.id, skipReason);
         return;
@@ -937,7 +937,7 @@ async function dispatchToAgent(task) {
       .update({
         assigned_agent: null,
         started_at: null,
-        last_failed_agent: agentName,
+        
         ...statusFix,
       })
       .eq('id', task.id);
@@ -1639,7 +1639,7 @@ initLangfuse();
                     completed_at: null,
                     result: null,
                     qa_result: null,
-                    last_failed_agent: task.assigned_agent || task.last_failed_agent,
+                    
                     qa_retries: qaRetries + 1,
                     error: null,
                   }).eq('id', task.id).then(() => {
@@ -1702,7 +1702,7 @@ initLangfuse();
             console.log(`[DISPATCH] ${reason}`);
             await supabase.from('agent_tasks').update({
               assigned_agent: null,
-              last_failed_agent: agentName,
+              
             }).eq('id', task.id);
             await logTransientError(task.id, reason);
           } else {
@@ -2598,7 +2598,7 @@ async function scheduler() {
 
       // Score agents: must have required capability, then rank by capacity + priority affinity
       const candidates = freeAgents
-        .filter(a => a.remaining > 0 && a.capabilities.includes(requiredCapability) && (isQaTask || a.name !== task.last_failed_agent))
+        .filter(a => a.remaining > 0 && a.capabilities.includes(requiredCapability) )
         .map(a => {
           let score = a.remaining;
           const affinityMultiplier = a.priority_affinity[task.priority];
