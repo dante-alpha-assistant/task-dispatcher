@@ -1029,6 +1029,15 @@ BLOCKED DETECTION RULES:
 - Use curl, kubectl, gh CLI FIRST before deciding to block
 - Only block if you genuinely CANNOT do it after trying.
 
+DATABASE MIGRATION RULES (MANDATORY):
+- If your code references NEW database columns, tables, or indexes: you MUST create a migration file
+- Migration files go in `migrations/NNNN_description.sql` (sequential numbering)
+- ALL SQL must be idempotent: use `IF NOT EXISTS`, `IF EXISTS`, `CREATE OR REPLACE`
+- Include the migration file in the SAME PR as your code changes
+- NEVER assume a column exists — if you add code that uses a new column, add the migration
+- Example: `migrations/0005_add_my_column.sql` containing `ALTER TABLE agent_tasks ADD COLUMN IF NOT EXISTS my_column text;`
+- If you skip this, QA will auto-fail your PR and the scheduler may crash at runtime
+
 Do NOT skip this step. The task board at tasks.dante.id must reflect your work.`;
 
   try {
@@ -1418,6 +1427,7 @@ async function assignQueuedQATasks() {
 - For API changes: verify the endpoint responds correctly with a test curl
 - For UI changes: check the PR diff matches what the task asked for
 - If the agent wrote "apply manually" or deferred work → REJECT immediately
+- **MIGRATION CHECK:** If the PR adds code referencing NEW database columns/tables, check if a migration file exists in `migrations/`. If code uses a column that doesn't have a migration file → REJECT with "Missing database migration file for new column(s)"
 
 ### DO NOT:
 - Clone the repo and try to build it
