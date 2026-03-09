@@ -3,6 +3,7 @@ import * as k8s from "@kubernetes/client-node";
 import { execSync } from "child_process";
 import { startMergeQueue } from "./merge-queue.js";
 import { initLangfuse, traceTaskPhase, logGeneration, recordPhaseCost, flushLangfuse } from "./langfuse.js";
+import { detectBlockerPattern, buildBlockerMetadata } from "./blocker-patterns.js";
 
 // K8s client setup
 const kc = new k8s.KubeConfig();
@@ -1041,12 +1042,27 @@ If a task requires steps you cannot perform autonomously (SQL migrations in Supa
 4. Only block if you genuinely cannot perform the action with your available tools
 
 **On blocked (requires manual intervention):**
+
+You MUST detect and self-block with structured metadata when you encounter these blocker types:
+- **missing_credential** — API key, token, or secret not configured or empty
+- **missing_config** — environment variable, URL, or setting needed but absent
+- **ambiguous_requirement** — task description unclear, needs human clarification
+- **permission_denied** — you lack access to a resource (403, RBAC, etc.)
+- **external_dependency** — waiting on a third-party service, approval, or another team
+- **infrastructure** — resource not available (DB down, service unreachable, pod crash)
+- **human_decision** — multiple valid approaches, need human to choose
+
 \`\`\`bash
 curl -s -X PATCH "https://lessxkxujvcmublgwdaa.supabase.co/rest/v1/agent_tasks?id=eq.${task.id}" \\
   -H "apikey: ${SUPABASE_KEY}" \\
   -H "Authorization: Bearer ${SUPABASE_KEY}" \\
   -H "Content-Type: application/json" \\
-  -d '{"status":"blocked","blocked_reason":"DESCRIBE WHAT NEEDS MANUAL INTERVENTION AND WHY YOU CANNOT DO IT","error":"Blocked: requires manual intervention"}'
+  -d '{"status":"blocked","blocked_reason":"DESCRIBE WHAT NEEDS MANUAL INTERVENTION","metadata":{"blocker":{"type":"BLOCKER_TYPE","title":"Short blocker title","description":"Detailed explanation","required_inputs":[{"key":"ENV_VAR","label":"Human label","type":"text","placeholder":"example"}],"suggested_action":"What the human should do"}},"error":"Blocked: requires manual intervention"}'
+\`\`\`
+
+**Example — missing credential:**
+\`\`\`json
+{"metadata":{"blocker":{"type":"missing_credential","title":"GitHub token expired","description":"GH_TOKEN returns 401","required_inputs":[{"key":"GH_TOKEN","label":"GitHub PAT","type":"password","placeholder":"ghp_..."}],"suggested_action":"Generate new PAT at github.com/settings/tokens"}}}
 \`\`\`
 
 ---
@@ -1088,7 +1104,7 @@ curl -s -X PATCH "https://lessxkxujvcmublgwdaa.supabase.co/rest/v1/agent_tasks?i
     -H "apikey: ${SUPABASE_KEY}" \
     -H "Authorization: Bearer ${SUPABASE_KEY}" \
     -H "Content-Type: application/json" \
-    -d '{"status":"blocked","blocked_reason":"EXPLAIN what you cannot do and why"}'
+    -d '{"status":"blocked","blocked_reason":"EXPLAIN what you cannot do and why","metadata":{"blocker":{"type":"BLOCKER_TYPE","title":"Short title","description":"Why you are blocked","required_inputs":[],"suggested_action":"What human should do"}}}'
 
 BLOCKED DETECTION RULES:
 - NEVER mark done if manual steps remain (SQL migrations, external config, DNS changes)
@@ -1606,6 +1622,8 @@ initLangfuse();
             // Auto-detect merge conflict failures and set rebase metadata
             if (task.status === "failed") {
               detectAndSetRebaseMetadata(task).catch(() => {});
+              // Auto-detect blocker patterns from error text → convert failed to blocked
+              autoDetectBlocker(task).catch((e) => console.error(`[AUTO-BLOCKER] Error for task ${task.id}:`, e.message));
               // Auto-retry: QA failed coding tasks go back to todo for another coding agent
               // Limited to 2 auto-retries to prevent infinite loops
               if (prev?.status === 'qa_testing' && task.type === 'coding' && task.qa_result && !task.qa_result.passed) {
@@ -3493,6 +3511,59 @@ startMergeQueue(supabase, logTaskActivity);
 setInterval(() => flushLangfuse().catch(() => {}), 60000);
 console.log(`[BOOT] Coding auto-scaler running every ${CODING_SCALER_INTERVAL / 1000}s (max ${MAX_CODING_WORKERS} ephemeral workers)`);
 
+
+// === AUTO-BLOCKER DETECTION ===
+// When a task fails, check the error text for common blocker patterns.
+// If a pattern matches, convert failed → blocked with structured metadata.
+async function autoDetectBlocker(task) {
+  if (!task || task.status !== 'failed') return;
+
+  // Combine all error sources for pattern matching
+  const errorText = [
+    typeof task.error === 'string' ? task.error : (task.error ? JSON.stringify(task.error) : ''),
+    task.blocked_reason || '',
+    task.result?.summary || '',
+    typeof task.result === 'string' ? task.result : '',
+  ].filter(Boolean).join(' ');
+
+  if (!errorText.trim()) return;
+
+  const detection = detectBlockerPattern(errorText);
+  if (!detection) return;
+
+  const blockerMeta = buildBlockerMetadata(detection);
+  const blockedReason = `Auto-detected: ${detection.pattern.title} — ${detection.details.slice(0, 200)}`;
+
+  console.log(`[AUTO-BLOCKER] Task ${task.id} ("${(task.title || '').slice(0, 40)}") failed → blocked (${detection.pattern.type}): ${detection.details.slice(0, 100)}`);
+
+  // Update task: failed → blocked with structured blocker metadata
+  const metadata = task.metadata || {};
+  metadata.blocker = blockerMeta;
+
+  const { error: updateErr } = await supabase
+    .from('agent_tasks')
+    .update({
+      status: 'blocked',
+      blocked_reason: blockedReason,
+      metadata,
+    })
+    .eq('id', task.id)
+    .eq('status', 'failed'); // Only update if still failed (avoid race conditions)
+
+  if (updateErr) {
+    console.error(`[AUTO-BLOCKER] Failed to update task ${task.id}:`, updateErr.message);
+    return;
+  }
+
+  // Log the auto-detection in activity log
+  await logTaskActivity(
+    task.id,
+    'auto_blocker_detected',
+    'failed',
+    `blocked (${detection.pattern.type}): ${blockedReason.slice(0, 300)}`,
+    'dispatcher'
+  );
+}
 
 // === AUTO-REBASE DETECTION ===
 // When a task fails QA due to merge conflicts, set rebase metadata
