@@ -1534,6 +1534,8 @@ initLangfuse();
           };
           const phase = phaseMap[task.status];
           if (phase) {
+            // Auto-detect merge conflict failures and set rebase metadata
+            if (task.status === "failed") detectAndSetRebaseMetadata(task).catch(() => {});
             const agent = task.assigned_agent || task.qa_agent || 'system';
             traceTaskPhase(task, phase, agent);
             // Record phase timing
@@ -3242,3 +3244,51 @@ console.log("Config + skills written for ephemeral coding worker");
 setInterval(() => flushLangfuse().catch(() => {}), 60000);
 console.log(`[BOOT] Coding auto-scaler running every ${CODING_SCALER_INTERVAL / 1000}s (max ${MAX_CODING_WORKERS} ephemeral workers)`);
 
+
+// === AUTO-REBASE DETECTION ===
+// When a task fails QA due to merge conflicts, set rebase metadata
+// so the next dispatch includes rebase instructions
+async function detectAndSetRebaseMetadata(task) {
+  if (!task || task.status !== 'failed') return;
+  
+  const qaResult = task.qa_result;
+  if (!qaResult) return;
+  
+  const failureText = JSON.stringify(qaResult).toLowerCase();
+  if (!failureText.includes('merge conflict') && !failureText.includes('mergestatestatus') && !failureText.includes('dirty')) return;
+  
+  // Extract PR info from pull_request_url
+  const prUrls = task.pull_request_url || [];
+  if (!prUrls.length) return;
+  
+  const prUrl = prUrls[0];
+  const prMatch = prUrl.match(/github\.com\/([\w-]+\/[\w-]+)\/pull\/(\d+)/);
+  if (!prMatch) return;
+  
+  const repo = prMatch[1];
+  const prNumber = parseInt(prMatch[2]);
+  
+  // Fetch PR details from GitHub
+  try {
+    const ghRes = await fetch(`https://api.github.com/repos/${repo}/pulls/${prNumber}`, {
+      headers: { Authorization: `token ${process.env.GH_TOKEN || process.env.GITHUB_TOKEN || ''}` }
+    });
+    if (!ghRes.ok) return;
+    const pr = await ghRes.json();
+    
+    const metadata = task.metadata || {};
+    metadata.rebase_requested = true;
+    metadata.rebase_pr = {
+      number: prNumber,
+      repo: repo,
+      branch: pr.head.ref,
+      base: pr.base.ref,
+      url: prUrl,
+    };
+    
+    await supabase.from('agent_tasks').update({ metadata }).eq('id', task.id);
+    console.log(`[REBASE] Set rebase metadata for task ${task.id} — PR #${prNumber} on ${repo} (branch: ${pr.head.ref})`);
+  } catch (e) {
+    console.error(`[REBASE] Failed to fetch PR info: ${e.message}`);
+  }
+}
