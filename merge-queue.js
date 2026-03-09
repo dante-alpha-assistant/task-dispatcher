@@ -151,10 +151,11 @@ async function mergeTask(supabase, logTaskActivity, task) {
       qa_agent: null,
       result: null,
       qa_result: null,
+      pull_request_url: null,
       started_at: null,
       completed_at: null,
       metadata,
-      error: `Merge queue: PR #${prNumber} has conflicts. Branch ${pr.head.ref} needs rebase against ${pr.base.ref}.`,
+      error: `Merge queue: PR #${prNumber} has conflicts. Branch ${pr.head.ref} needs rebase against ${pr.base.ref}. Existing PR: ${prUrl}`,
     }).eq("id", id);
 
     await logTaskActivity(id, "merge_conflict", null, `PR #${prNumber} has merge conflicts — sent back for rebase`, "merge-queue");
@@ -186,6 +187,7 @@ async function mergeTask(supabase, logTaskActivity, task) {
         assigned_agent: null,
         result: null,
         qa_result: null,
+        pull_request_url: null,
         started_at: null,
         completed_at: null,
         error: `Merge queue: CI checks failed on PR #${prNumber}: ${failedChecks.map(c => c.name + ": " + c.conclusion).join(", ")}`,

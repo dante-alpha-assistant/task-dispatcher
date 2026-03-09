@@ -2426,7 +2426,8 @@ async function scheduler() {
       }
       const hasWork = !!(t.result || (t.pull_request_url && t.pull_request_url.length > 0));
       const isQaRetry = (t.qa_retries || 0) > 0;  // QA failed → needs coding fix, not re-QA
-      if (hasWork && !isQaRetry) {  // Skip QA routing for tasks retried after QA failure
+      const isRebaseNeeded = !!(t.metadata && t.metadata.rebase_requested);  // Merge queue conflict → needs rebase, not re-QA
+      if (hasWork && !isQaRetry && !isRebaseNeeded) {  // Skip QA routing for tasks needing coding fixes or rebases
         console.log("[SCHEDULER] Task " + t.id + " has completed work but is todo — routing to qa_testing");
         await supabase.from("agent_tasks").update({ status: "qa_testing", assigned_agent: null }).eq("id", t.id);
         recordTransition(t.id);
