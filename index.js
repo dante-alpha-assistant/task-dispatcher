@@ -1,6 +1,7 @@
 import { createClient } from "@supabase/supabase-js";
 import * as k8s from "@kubernetes/client-node";
 import { execSync } from "child_process";
+import { startMergeQueue } from "./merge-queue.js";
 import { initLangfuse, traceTaskPhase, logGeneration, recordPhaseCost, flushLangfuse } from "./langfuse.js";
 
 // K8s client setup
@@ -1506,6 +1507,7 @@ Generate realistic Gherkin scenarios, then PATCH the task with acceptance_criter
 // --- Subscribe to Realtime changes ---
 function subscribe() {
   console.log("[BOOT] Task Dispatcher starting...");
+
 initLangfuse();
   console.log(`[BOOT] Agents: ${Object.keys(AGENTS).join(", ")}`);
 
@@ -1901,9 +1903,9 @@ ${qaCommentsBlock ? qaCommentsBlock : ""}
 
 ### Update task status when done:
 
-**If QA passes (coding tasks — MERGE FIRST):**
+**If QA passes (coding tasks — DO NOT MERGE, queue handles it):**
 \`\`\`bash
-gh pr merge <PR_NUMBER> -R <REPO> --squash --delete-branch
+# DO NOT merge — the merge queue handles this automatically
 curl -s -X PATCH "https://lessxkxujvcmublgwdaa.supabase.co/rest/v1/agent_tasks?id=eq.${task.id}" \\
   -H "apikey: ${SUPABASE_KEY}" \\
   -H "Authorization: Bearer ${SUPABASE_KEY}" \\
@@ -3267,6 +3269,9 @@ console.log("Config + skills written for ephemeral coding worker");
 // Start coding auto-scaler
 // DISABLED: persistent worker replicas replace ephemeral pods
 // setInterval(codingAutoScaler, CODING_SCALER_INTERVAL);
+
+// Start merge queue processor
+startMergeQueue(supabase, logTaskActivity);
 
 // Flush Langfuse events every 60s
 setInterval(() => flushLangfuse().catch(() => {}), 60000);
