@@ -1535,7 +1535,32 @@ initLangfuse();
           const phase = phaseMap[task.status];
           if (phase) {
             // Auto-detect merge conflict failures and set rebase metadata
-            if (task.status === "failed") detectAndSetRebaseMetadata(task).catch(() => {});
+            if (task.status === "failed") {
+              detectAndSetRebaseMetadata(task).catch(() => {});
+              // Auto-retry: QA failed coding tasks go back to todo for another coding agent
+              // Limited to 2 auto-retries to prevent infinite loops
+              if (prev?.status === 'qa_testing' && task.type === 'coding' && task.qa_result && !task.qa_result.passed) {
+                const qaRetries = task.qa_retries || 0;
+                if (qaRetries < 2) {
+                  console.log(`[QA-RETRY] Task ${task.id} QA failed (attempt ${qaRetries + 1}/2) — sending back to todo for coding fix`);
+                  const qaFeedback = task.qa_result.failures ? task.qa_result.failures.join('; ') : 'QA review failed';
+                  supabase.from('agent_tasks').update({
+                    status: 'todo',
+                    assigned_agent: null,
+                    qa_agent: null,
+                    started_at: null,
+                    completed_at: null,
+                    last_failed_agent: task.assigned_agent || task.last_failed_agent,
+                    qa_retries: qaRetries + 1,
+                    error: `QA failed (attempt ${qaRetries + 1}): ${qaFeedback.slice(0, 500)}`,
+                  }).eq('id', task.id).then(() => {
+                    logTaskActivity(task.id, 'qa_retry', null, `QA failed — auto-retrying (attempt ${qaRetries + 1}/2): ${qaFeedback.slice(0, 200)}`, 'dispatcher');
+                  }).catch(e => console.error(`[QA-RETRY] Failed to retry task ${task.id}:`, e.message));
+                } else {
+                  console.log(`[QA-RETRY] Task ${task.id} QA failed ${qaRetries + 1} times — staying failed for manual review`);
+                }
+              }
+            }
             const agent = task.assigned_agent || task.qa_agent || 'system';
             traceTaskPhase(task, phase, agent);
             // Record phase timing
