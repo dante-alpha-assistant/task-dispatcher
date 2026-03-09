@@ -1,6 +1,7 @@
 import { createClient } from "@supabase/supabase-js";
 import * as k8s from "@kubernetes/client-node";
 import { execSync } from "child_process";
+import { initLangfuse, traceTaskPhase, logGeneration, recordPhaseCost, flushLangfuse } from "./langfuse.js";
 
 // K8s client setup
 const kc = new k8s.KubeConfig();
@@ -1056,7 +1057,9 @@ Do NOT skip this step. The task board at tasks.dante.id must reflect your work.`
     });
 
     if (resp.ok) {
-      console.log(`[OK] Dispatched task ${task.id} ("${task.title}") → ${agentName}`);
+      console.log(`// Track dispatch in Langfuse
+    traceTaskPhase(task, "dispatch", agentName);
+    console.log("[OK] Dispatched task ${task.id} ("${task.title}") → ${agentName}`);
 
       // Track the dispatched task
       activeTasks.set(task.id, {
@@ -1502,6 +1505,7 @@ Generate realistic Gherkin scenarios, then PATCH the task with acceptance_criter
 // --- Subscribe to Realtime changes ---
 function subscribe() {
   console.log("[BOOT] Task Dispatcher starting...");
+initLangfuse();
   console.log(`[BOOT] Agents: ${Object.keys(AGENTS).join(", ")}`);
 
   const channel = supabase
@@ -1516,6 +1520,31 @@ function subscribe() {
       async (payload) => {
         const { eventType, new: task, old: prev } = payload;
         console.log(`[EVENT] ${eventType} on task ${task?.id || prev?.id}: status=${task?.status}`);
+
+        // === LANGFUSE: Track phase transitions ===
+        if (eventType === 'UPDATE' && task && prev && task.status !== prev.status) {
+          const phaseMap = {
+            'in_progress': 'coding',
+            'qa_testing': 'qa_review', 
+            'completed': 'completed',
+            'deployed': 'deployed',
+            'failed': 'failed',
+            'blocked': 'blocked',
+          };
+          const phase = phaseMap[task.status];
+          if (phase) {
+            const agent = task.assigned_agent || task.qa_agent || 'system';
+            traceTaskPhase(task, phase, agent);
+            // Record phase timing
+            const phaseStarted = task.started_at || task.updated_at;
+            const durationMs = phaseStarted ? Date.now() - new Date(phaseStarted).getTime() : 0;
+            recordPhaseCost(supabase, task.id, prev.status || 'unknown', {
+              model: 'unknown', // Will be enriched when agents report usage
+              durationMs,
+              cost: 0,
+            }).catch(() => {});
+          }
+        }
 
         // Broadcast status change to SSE clients
         if (task) {
@@ -3187,5 +3216,8 @@ console.log("Config + skills written for ephemeral coding worker");
 // Start coding auto-scaler
 // DISABLED: persistent worker replicas replace ephemeral pods
 // setInterval(codingAutoScaler, CODING_SCALER_INTERVAL);
+
+// Flush Langfuse events every 60s
+setInterval(() => flushLangfuse().catch(() => {}), 60000);
 console.log(`[BOOT] Coding auto-scaler running every ${CODING_SCALER_INTERVAL / 1000}s (max ${MAX_CODING_WORKERS} ephemeral workers)`);
 
