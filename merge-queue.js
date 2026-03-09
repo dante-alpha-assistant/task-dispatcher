@@ -82,6 +82,15 @@ async function processMergeQueue(supabase, logTaskActivity) {
     // Pick first task (FIFO by completed_at)
     const task = repoTasks[0];
 
+    // Mark all queued tasks for this repo with their position
+    for (let qi = 0; qi < repoTasks.length; qi++) {
+      await updateMergeStatus(supabase, repoTasks[qi].id, "queued", {
+        queue_position: qi + 1,
+        queue_length: repoTasks.length,
+        repo,
+      });
+    }
+
     // Acquire lock
     mergeLocks.set(repo, { taskId: task.id, startedAt: Date.now() });
     console.log(`[MERGE-QUEUE] Processing task ${task.id.slice(0, 8)} — PR #${task.prNumber} on ${repo}`);
@@ -95,6 +104,29 @@ async function processMergeQueue(supabase, logTaskActivity) {
       mergeLocks.delete(repo);
     }
   }
+}
+
+/**
+ * Helper to update metadata.merge_status on a task.
+ * @param {object} supabase
+ * @param {string} taskId
+ * @param {string} status - queued|merging|merged|conflict
+ * @param {object} [extra] - additional merge_status_details (queue_position, conflict_info, etc.)
+ */
+async function updateMergeStatus(supabase, taskId, status, extra = {}) {
+  // Read current metadata, patch merge fields
+  const { data } = await supabase
+    .from("agent_tasks")
+    .select("metadata")
+    .eq("id", taskId)
+    .single();
+
+  const metadata = data?.metadata || {};
+  metadata.merge_status = status;
+  metadata.merge_status_at = new Date().toISOString();
+  metadata.merge_status_details = { ...extra };
+
+  await supabase.from("agent_tasks").update({ metadata }).eq("id", taskId);
 }
 
 async function mergeTask(supabase, logTaskActivity, task) {
@@ -133,6 +165,10 @@ async function mergeTask(supabase, logTaskActivity, task) {
   // 2. Check mergeable status
   if (pr.mergeable === false || pr.mergeable_state === "dirty") {
     console.log(`[MERGE-QUEUE] PR #${prNumber} has conflicts — sending back for rebase`);
+    await updateMergeStatus(supabase, id, "conflict", {
+      repo, pr_number: prNumber, pr_url: prUrl,
+      conflict_info: `Branch ${pr.head.ref} conflicts with ${pr.base.ref}`,
+    });
 
     // Set rebase metadata and send back to coding agent
     const metadata = task.metadata || {};
@@ -198,6 +234,7 @@ async function mergeTask(supabase, logTaskActivity, task) {
   }
 
   // 5. All clear — squash merge
+  await updateMergeStatus(supabase, id, "merging", { repo, pr_number: prNumber, pr_url: prUrl });
   console.log(`[MERGE-QUEUE] Merging PR #${prNumber} on ${repo}...`);
   const mergeRes = await fetch(`https://api.github.com/repos/${repo}/pulls/${prNumber}/merge`, {
     method: "PUT",
@@ -217,7 +254,9 @@ async function mergeTask(supabase, logTaskActivity, task) {
       headers,
     }).catch(() => {});
 
-    // Update task to deployed — clear error since merge succeeded
+    // Update merge status to merged, then update task to deployed
+    await updateMergeStatus(supabase, id, "merged", { repo, pr_number: prNumber, pr_url: prUrl });
+
     await supabase.from("agent_tasks").update({
       status: "deployed",
       deployment_url: prUrl,
