@@ -1045,6 +1045,9 @@ async function dispatchToAgent(task) {
     return;
   }
 
+  // Extract attachments from metadata for agent access
+  const attachments = task.metadata?.attachments || [];
+
   const taskPayload = JSON.stringify({
     task_id: task.id,
     title: task.title,
@@ -1055,10 +1058,11 @@ async function dispatchToAgent(task) {
     stage: task.stage,
     parent_task_id: task.parent_task_id,
     dispatched_by: task.dispatched_by,
-              pull_request_url: task.pull_request_url,
+    pull_request_url: task.pull_request_url,
     repo: task.repo,
     branch: task.branch,
     context: task.context,
+    attachments: attachments.length > 0 ? attachments : undefined,
   }, null, 2);
 
   const contextBlock = await buildContextBlockWithTimeout(task);
@@ -1098,13 +1102,22 @@ async function dispatchToAgent(task) {
 - **Known repos:** queue-dashboard, task-dispatcher, dante-gitops (all under dante-alpha-assistant)
 ` : "";
 
+  // Build attachments notice
+  const attachmentNotice = attachments.length > 0 ? `
+## 📎 Screenshots Attached (${attachments.length})
+
+This task has **${attachments.length} screenshot(s)** attached. Review them before starting.
+
+${attachments.map((a, i) => `${i + 1}. [${a.filename}](${a.url})`).join('\n')}
+` : "";
+
   const message = `\`\`\`json
 ${taskPayload}
 \`\`\`
 
 ${contextBlock}## Task Assigned: ${task.title}
 
-${blockerContext}${rebaseSection || (task.description || "")}
+${attachmentNotice}${blockerContext}${rebaseSection || (task.description || "")}
 ${!rebaseSection && task.prompt ? `**Prompt:** ${task.prompt}` : ""}
 ${!rebaseSection ? codingTaskSection : ""}
 
