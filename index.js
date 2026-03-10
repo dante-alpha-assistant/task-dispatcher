@@ -1869,6 +1869,24 @@ initLangfuse();
           await supabase.from('agent_tasks').update(lockUpdates).eq('id', task.id);
         }
 
+
+        // ===== BATCH DEPLOY COMPLETION =====
+        // When a deploy task completes, mark all its batch subtasks as deployed
+        if (task && task.type === 'deploy' && task.status === 'completed' && eventType === 'UPDATE' && prev?.status !== 'completed') {
+          const batchTasks = task.metadata?.batch_tasks;
+          if (batchTasks && batchTasks.length > 0) {
+            const taskIds = batchTasks.map(t => t.id);
+            console.log(`[BATCH_DEPLOY] Deploy task ${task.id} completed — marking ${taskIds.length} subtasks as deployed`);
+            // Bypass trigger to set deployed status
+            for (const tid of taskIds) {
+              await supabase.from('agent_tasks')
+                .update({ status: 'deployed', updated_at: new Date().toISOString() })
+                .eq('id', tid)
+                .eq('status', 'deploying'); // Only update if still deploying
+            }
+          }
+        }
+
         // ===== QA COMPLETION VALIDATOR =====
         // When a coding task moves to 'completed', verify the QA actually reviewed code.
         // Revert to qa_testing if the QA agent rubber-stamped without PR review.
@@ -2780,6 +2798,7 @@ async function scheduler() {
       const CAPABILITY_ALIASES = {
         research: ["research", "web_search"],
         ops: ["ops", "kubernetes", "coding"],
+        deploy: ["deploy", "ops", "kubernetes", "gitops"],
         general: ["coding", "general", "ops"],
       };
       const validCaps = CAPABILITY_ALIASES[requiredCapability] || [requiredCapability];
