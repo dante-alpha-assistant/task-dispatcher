@@ -1893,6 +1893,10 @@ initLangfuse();
           if (batchTasks && batchTasks.length > 0) {
             const taskIds = batchTasks.map(t => t.id);
             console.log(`[BATCH_DEPLOY] Deploy task ${task.id} completed — marking ${taskIds.length} subtasks as deployed`);
+            // Also mark the deploy task itself as deployed (not just completed)
+            await supabase.from('agent_tasks')
+              .update({ status: 'deployed', updated_at: new Date().toISOString() })
+              .eq('id', task.id);
             // Bypass trigger to set deployed status
             for (const tid of taskIds) {
               await supabase.from('agent_tasks')
