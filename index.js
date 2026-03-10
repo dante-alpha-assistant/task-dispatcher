@@ -1017,26 +1017,46 @@ async function dispatchToAgent(task) {
       return;
     }
     const authHasWork = !!(authCurrentTask?.result || (authCurrentTask?.pull_request_url && authCurrentTask.pull_request_url.length > 0));
-    // If task was in_progress with a result/PR, move to qa_testing (work was done)
-    // If in_progress without result, move back to todo for re-dispatch
-    const statusFix = task.status === 'in_progress'
-      ? (authHasWork ? { status: 'qa_testing', completed_at: new Date().toISOString() }
-         : { status: 'todo' })
-      : {};
+
+    // NEVER reset in_progress tasks to todo — the agent may be actively working.
+    // Auth failures during in_progress are transient (pod restart, token rotation, etc.)
+    if (task.status === 'in_progress' && !authHasWork) {
+      // Agent is working but auth failed — log warning and skip, do NOT reset
+      const warnMsg = `Auth preflight failed for ${agentName} but task is in_progress — agent may be actively working. Not resetting. Will retry next cycle.`;
+      console.log(`[AUTH-PREFLIGHT] ${warnMsg}`);
+      await logTaskActivity(task.id, 'auth_warning', null, warnMsg, 'orchestration layer');
+      return;
+    }
+
+    // If task was in_progress WITH a result/PR, the agent finished — move to qa_testing
+    if (task.status === 'in_progress' && authHasWork) {
+      const qaMsg = `Auth preflight failed for ${agentName} but task has results — moving to QA. Agent likely completed work before gateway went down.`;
+      console.log(`[AUTH-PREFLIGHT] ${qaMsg}`);
+      await supabase
+        .from('agent_tasks')
+        .update({
+          status: 'qa_testing',
+          assigned_agent: null,
+          completed_at: new Date().toISOString(),
+        })
+        .eq('id', task.id);
+      await logTaskActivity(task.id, 'status', 'in_progress', 'qa_testing', agentName);
+      await logTaskActivity(task.id, 'auth_recovery', null, qaMsg, 'orchestration layer');
+      return;
+    }
+
+    // For non-in_progress tasks (e.g. todo with assigned_agent), clear assignment
+    const clearMsg = `Auth preflight failed for ${agentName} — clearing assignment. Task was ${task.status} (not in_progress).`;
+    console.log(`[AUTH-PREFLIGHT] ${clearMsg}`);
     await supabase
       .from('agent_tasks')
       .update({
         assigned_agent: null,
         started_at: null,
-        
-        ...statusFix,
       })
       .eq('id', task.id);
+    await logTaskActivity(task.id, 'auth_reset', agentName, null, 'orchestration layer');
     await logTransientError(task.id, authReason);
-    if (statusFix.status === 'qa_testing') {
-      await logTaskActivity(task.id, 'status', task.status, 'qa_testing', task.assigned_agent || agentName);
-    }
-    if (statusFix.status) console.log(`[AUTH-PREFLIGHT] Task ${task.id} was ${task.status} → ${statusFix.status} (had work: ${authHasWork})`);
     return;
   }
 
