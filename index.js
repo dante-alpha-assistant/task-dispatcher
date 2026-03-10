@@ -15,6 +15,88 @@ const customApi = kc.makeApiClient(k8s.CustomObjectsApi);
 const MAX_QA_WORKERS = 2;
 
 
+// --- Vercel integration ---
+const VERCEL_TOKEN = process.env.VERCEL_TOKEN;
+
+/**
+ * Get the Vercel deployment URL for a GitHub repo.
+ * Queries the Vercel API for the latest deployment matching the repo.
+ * @param {string} repoFullName - e.g. "dante-alpha-assistant/castlevania-landing"
+ * @param {string} [branch] - optional branch filter (e.g. "main")
+ * @returns {Promise<string|null>} The deployment URL or null
+ */
+async function getVercelDeploymentUrl(repoFullName, branch) {
+  if (!VERCEL_TOKEN) {
+    console.warn('[VERCEL] No VERCEL_TOKEN configured — cannot fetch deployment URL');
+    return null;
+  }
+  try {
+    // First, find the Vercel project linked to this GitHub repo
+    const projectsRes = await fetch('https://api.vercel.com/v9/projects?limit=100', {
+      headers: { Authorization: `Bearer ${VERCEL_TOKEN}` },
+    });
+    if (!projectsRes.ok) {
+      console.error(`[VERCEL] Failed to list projects: ${projectsRes.status}`);
+      return null;
+    }
+    const { projects } = await projectsRes.json();
+    
+    // Find project matching the repo
+    const repoName = repoFullName.split('/').pop()?.toLowerCase();
+    const project = projects?.find(p => {
+      const linkedRepo = p.link?.repo?.toLowerCase();
+      const linkedSlug = `${p.link?.org}/${p.link?.repo}`?.toLowerCase();
+      return linkedRepo === repoName || linkedSlug === repoFullName.toLowerCase() || p.name?.toLowerCase() === repoName;
+    });
+
+    if (!project) {
+      console.warn(`[VERCEL] No project found for repo ${repoFullName}`);
+      return null;
+    }
+
+    // Get latest deployment for this project
+    const query = new URLSearchParams({ projectId: project.id, limit: '5', target: 'production' });
+    if (branch) query.set('meta-githubCommitRef', branch);
+    
+    const deploymentsRes = await fetch(`https://api.vercel.com/v6/deployments?${query}`, {
+      headers: { Authorization: `Bearer ${VERCEL_TOKEN}` },
+    });
+    if (!deploymentsRes.ok) {
+      console.error(`[VERCEL] Failed to list deployments: ${deploymentsRes.status}`);
+      return null;
+    }
+    const { deployments } = await deploymentsRes.json();
+    
+    // Get the latest ready deployment
+    const readyDeploy = deployments?.find(d => d.state === 'READY') || deployments?.[0];
+    if (!readyDeploy) {
+      // Try preview deployments
+      const previewQuery = new URLSearchParams({ projectId: project.id, limit: '5' });
+      const previewRes = await fetch(`https://api.vercel.com/v6/deployments?${previewQuery}`, {
+        headers: { Authorization: `Bearer ${VERCEL_TOKEN}` },
+      });
+      if (previewRes.ok) {
+        const { deployments: previewDeps } = await previewRes.json();
+        const previewDeploy = previewDeps?.find(d => d.state === 'READY') || previewDeps?.[0];
+        if (previewDeploy) {
+          const url = previewDeploy.url ? `https://${previewDeploy.url}` : null;
+          console.log(`[VERCEL] Found preview deployment for ${repoFullName}: ${url}`);
+          return url;
+        }
+      }
+      console.warn(`[VERCEL] No deployments found for project ${project.name}`);
+      return null;
+    }
+    
+    const url = readyDeploy.url ? `https://${readyDeploy.url}` : null;
+    console.log(`[VERCEL] Found deployment for ${repoFullName}: ${url}`);
+    return url;
+  } catch (err) {
+    console.error(`[VERCEL] Error fetching deployment URL for ${repoFullName}:`, err.message);
+    return null;
+  }
+}
+
 // --- Config ---
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -520,11 +602,14 @@ async function dispatchViaFactory(task) {
           } catch {}
 
           console.log(`[FACTORY] Task ${task.id} completed! Deployment: ${deploymentUrl || "N/A"}`);
-          await supabase.from("agent_tasks").update({
+          const factoryUpdate = {
             status: "qa_testing",
             result: { output: "Factory pipeline completed", deployment_url: deploymentUrl, project_id: projectId, stage_results: stageResults },
             completed_at: new Date().toISOString(),
-          }).eq("id", task.id);
+          };
+          // Also set the top-level deployment_url column
+          if (deploymentUrl) factoryUpdate.deployment_url = deploymentUrl;
+          await supabase.from("agent_tasks").update(factoryUpdate).eq("id", task.id);
           return;
         }
 
@@ -1927,16 +2012,78 @@ initLangfuse();
           if (batchTasks && batchTasks.length > 0) {
             const taskIds = batchTasks.map(t => t.id);
             console.log(`[BATCH_DEPLOY] Deploy task ${task.id} completed — marking ${taskIds.length} subtasks as deployed`);
+            
+            // For Vercel deploy targets, resolve the actual deployment URL
+            const deployTarget = task.deploy_target || 'kubernetes';
+            let vercelUrlsByRepo = {};
+            if (deployTarget === 'vercel') {
+              const repos = task.metadata?.repos || {};
+              for (const repoName of Object.keys(repos)) {
+                try {
+                  const url = await getVercelDeploymentUrl(repoName, 'main');
+                  if (url) {
+                    vercelUrlsByRepo[repoName] = url;
+                    console.log(`[BATCH_DEPLOY] Vercel URL for ${repoName}: ${url}`);
+                  }
+                } catch (err) {
+                  console.error(`[BATCH_DEPLOY] Failed to get Vercel URL for ${repoName}:`, err.message);
+                }
+              }
+            }
+
             // Also mark the deploy task itself as deployed (not just completed)
+            const deployTaskUpdate = { status: 'deployed', updated_at: new Date().toISOString() };
+            // Set deployment_url on the deploy task if we found a Vercel URL
+            const allVercelUrls = Object.values(vercelUrlsByRepo);
+            if (allVercelUrls.length > 0) {
+              deployTaskUpdate.deployment_url = allVercelUrls[0]; // Primary URL
+            }
             await supabase.from('agent_tasks')
-              .update({ status: 'deployed', updated_at: new Date().toISOString() })
+              .update(deployTaskUpdate)
               .eq('id', task.id);
-            // Bypass trigger to set deployed status
+              
+            // Bypass trigger to set deployed status + deployment URL on subtasks
             for (const tid of taskIds) {
+              const subtaskUpdate = { status: 'deployed', updated_at: new Date().toISOString() };
+              
+              // Find the repo for this subtask and set its Vercel URL
+              if (deployTarget === 'vercel') {
+                const repos = task.metadata?.repos || {};
+                for (const [repoName, repoTasks] of Object.entries(repos)) {
+                  if (repoTasks.some(rt => rt.id === tid) && vercelUrlsByRepo[repoName]) {
+                    subtaskUpdate.deployment_url = vercelUrlsByRepo[repoName];
+                    break;
+                  }
+                }
+              }
+              
               await supabase.from('agent_tasks')
-                .update({ status: 'deployed', updated_at: new Date().toISOString() })
+                .update(subtaskUpdate)
                 .eq('id', tid)
                 .in('status', ['deploying', 'completed']); // Update deploying or completed (if deploying transition was blocked)
+            }
+          }
+        }
+
+        // ===== VERCEL DEPLOYMENT URL RESOLVER =====
+        // When any task transitions to "deployed" with deploy_target "vercel" and no deployment_url,
+        // resolve the Vercel URL from the PR/repo info
+        if (task?.status === 'deployed' && eventType === 'UPDATE' && prev?.status !== 'deployed' 
+            && task.deploy_target === 'vercel' && !task.deployment_url) {
+          const prUrl = Array.isArray(task.pull_request_url) ? task.pull_request_url[0] : task.pull_request_url;
+          const repoMatch = prUrl?.match(/github\.com\/([^/]+\/[^/]+)/);
+          const repoName = repoMatch?.[1] || task.repository_url;
+          if (repoName) {
+            try {
+              const vercelUrl = await getVercelDeploymentUrl(repoName, 'main');
+              if (vercelUrl) {
+                console.log(`[VERCEL_RESOLVER] Setting deployment_url for task ${task.id}: ${vercelUrl}`);
+                await supabase.from('agent_tasks')
+                  .update({ deployment_url: vercelUrl, updated_at: new Date().toISOString() })
+                  .eq('id', task.id);
+              }
+            } catch (err) {
+              console.error(`[VERCEL_RESOLVER] Error resolving URL for task ${task.id}:`, err.message);
             }
           }
         }
