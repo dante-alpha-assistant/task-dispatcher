@@ -1087,6 +1087,22 @@ async function dispatchToAgent(task) {
   })() : "";
 
   // Build coding task section if applicable
+  const deployTaskSection = task.type === "deploy" ? `
+## Batch Deploy Task
+
+**Use the deploy-batch skill for this work.** Read \`skills/deploy-batch/SKILL.md\` and follow it step by step.
+
+This is a batch deploy task. You must:
+1. Clone each repo listed in metadata.repos
+2. Merge each PR sequentially (rebase onto main, then fast-forward merge)
+3. Push to main (one push per repo, after ALL PRs for that repo are merged)
+4. Wait for CI to pass (one build per repo)
+5. Verify ArgoCD deploys the new image and pod is healthy
+6. Report results with merged/failed PR lists
+
+**IMPORTANT:** If a PR has merge conflicts, skip it and continue with the rest. Never force push.
+` : "";
+
   const codingTaskSection = task.type === "coding" ? `
 ## Coding Task
 
@@ -1106,7 +1122,7 @@ ${contextBlock}## Task Assigned: ${task.title}
 
 ${blockerContext}${rebaseSection || (task.description || "")}
 ${!rebaseSection && task.prompt ? `**Prompt:** ${task.prompt}` : ""}
-${!rebaseSection ? codingTaskSection : ""}
+${!rebaseSection ? codingTaskSection : ""}${deployTaskSection}
 
 **Task ID:** ${task.id}
 **Type:** ${task.type}
