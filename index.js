@@ -1006,10 +1006,21 @@ async function dispatchToAgent(task) {
     const authReason = `Auth preflight failed for ${agentName} (HTTP ${authCheck.status}) — agent may have expired credentials`;
     console.log(`[AUTH-PREFLIGHT] ${authReason}`);
     await logTaskActivity(task.id, 'dispatch_error', null, authReason, 'dispatcher');
-    // If task was in_progress with a result, move to qa_testing (work was done)
+    // Re-check task state to avoid race conditions
+    const { data: authCurrentTask } = await supabase
+      .from('agent_tasks')
+      .select('status, result, pull_request_url')
+      .eq('id', task.id)
+      .single();
+    if (authCurrentTask && ['qa_testing', 'completed', 'deployed', 'done'].includes(authCurrentTask.status)) {
+      console.log(`[AUTH-PREFLIGHT] Task ${task.id} already moved to ${authCurrentTask.status} — skipping`);
+      return;
+    }
+    const authHasWork = !!(authCurrentTask?.result || (authCurrentTask?.pull_request_url && authCurrentTask.pull_request_url.length > 0));
+    // If task was in_progress with a result/PR, move to qa_testing (work was done)
     // If in_progress without result, move back to todo for re-dispatch
     const statusFix = task.status === 'in_progress'
-      ? (task.result ? { status: 'qa_testing', completed_at: new Date().toISOString() }
+      ? (authHasWork ? { status: 'qa_testing', completed_at: new Date().toISOString() }
          : { status: 'todo' })
       : {};
     await supabase
@@ -1022,7 +1033,10 @@ async function dispatchToAgent(task) {
       })
       .eq('id', task.id);
     await logTransientError(task.id, authReason);
-    if (statusFix.status) console.log(`[AUTH-PREFLIGHT] Task ${task.id} was ${task.status} → ${statusFix.status} (had result: ${!!task.result})`);
+    if (statusFix.status === 'qa_testing') {
+      await logTaskActivity(task.id, 'status', task.status, 'qa_testing', task.assigned_agent || agentName);
+    }
+    if (statusFix.status) console.log(`[AUTH-PREFLIGHT] Task ${task.id} was ${task.status} → ${statusFix.status} (had work: ${authHasWork})`);
     return;
   }
 
@@ -2516,18 +2530,33 @@ async function taskMonitor() {
             }).eq("id", task.id);
             await logTransientError(task.id, `QA idle timeout: ${agentName} session idle >${Math.floor(idleMs/60000)}min — re-queued QA (retry ${idleRetries}/${MAX_IDLE_RETRIES})`);
           } else {
-            const hasCompletedWork = !!(task.result || (task.pull_request_url && task.pull_request_url.length > 0));
-            const targetStatus = hasCompletedWork ? 'blocked' : 'todo';
+            // Re-check task state to avoid race conditions
+            const { data: idleCurrentTask } = await supabase
+              .from('agent_tasks')
+              .select('status, result, pull_request_url, assigned_agent')
+              .eq('id', task.id)
+              .single();
+            if (idleCurrentTask && ['qa_testing', 'completed', 'deployed', 'done'].includes(idleCurrentTask.status)) {
+              console.log(`[MONITOR] Task ${task.id} already moved to ${idleCurrentTask.status} — skipping idle timeout`);
+              continue;
+            }
+            const hasCompletedWork = !!(idleCurrentTask?.result || (idleCurrentTask?.pull_request_url && idleCurrentTask.pull_request_url.length > 0));
+            // If work is done, go directly to qa_testing instead of todo/blocked (prevents regression)
+            const targetStatus = hasCompletedWork ? 'qa_testing' : 'todo';
             console.log(`[MONITOR] Idle timeout: task ${task.id} ("${task.title.slice(0,40)}") → ${agentName} idle ${Math.floor(idleMs/60000)}min (retry ${idleRetries}/${MAX_IDLE_RETRIES}) → ${targetStatus} (hasWork: ${hasCompletedWork})`);
             recordTransition(task.id);
+            const agentWhoWorkedIdle = idleCurrentTask?.assigned_agent || task.assigned_agent || agentName;
             await supabase.from("agent_tasks").update({
               status: targetStatus,
               assigned_agent: null,
               started_at: null,
               idle_retries: idleRetries,
-              blocked_reason: hasCompletedWork ? `Idle timeout: ${agentName} idle >${Math.floor(idleMs/60000)}min — task has completed work (PR/result) but QA agent couldn't process. Needs manual review or re-dispatch.` : null,
+              ...(hasCompletedWork ? { completed_at: new Date().toISOString() } : {}),
             }).eq("id", task.id);
-            await logTransientError(task.id, `Idle timeout: ${agentName} session idle >${Math.floor(idleMs/60000)}min — ${hasCompletedWork ? 'blocked (has work)' : 're-queued'} (retry ${idleRetries}/${MAX_IDLE_RETRIES})`);
+            if (hasCompletedWork) {
+              await logTaskActivity(task.id, 'status', 'in_progress', 'qa_testing', agentWhoWorkedIdle);
+            }
+            await logTransientError(task.id, `Idle timeout: ${agentName} session idle >${Math.floor(idleMs/60000)}min — ${hasCompletedWork ? 'qa_testing (has work)' : 're-queued'} (retry ${idleRetries}/${MAX_IDLE_RETRIES})`);
           }
           activeTasks.delete(task.id);
           continue;
@@ -2568,7 +2597,22 @@ async function taskMonitor() {
           sessionGoneAt.set(task.id, Date.now());
           console.log(`[MONITOR] Task ${task.id} ("${task.title}") → ${agentName}: session gone, grace period started`);
         } else if (Date.now() - sessionGoneAt.get(task.id) > SESSION_GONE_GRACE) {
-          // Check if past hard timeout → fail, otherwise → done
+          // === RACE GUARD: Re-check task state before any status change ===
+          const { data: currentTask } = await supabase
+            .from('agent_tasks')
+            .select('status, result, pull_request_url, assigned_agent')
+            .eq('id', task.id)
+            .single();
+          
+          if (currentTask && ['qa_testing', 'completed', 'deployed', 'done'].includes(currentTask.status)) {
+            console.log(`[MONITOR] Task ${task.id} already moved to ${currentTask.status} — skipping session-gone handler`);
+            sessionGoneAt.delete(task.id);
+            activeTasks.delete(task.id);
+            continue;
+          }
+          
+          const sessionGoneHasWork = !!(currentTask?.result || (currentTask?.pull_request_url && currentTask.pull_request_url.length > 0));
+
           const startTime = task.started_at || task.created_at;
           const timeout = task.type === "qa" ? QA_HARD_TIMEOUT : task.type === "coding" ? CODING_HARD_TIMEOUT : TASK_HARD_TIMEOUT;
           const elapsed = startTime ? Date.now() - new Date(startTime).getTime() : 0;
@@ -2596,6 +2640,18 @@ async function taskMonitor() {
               await logTransientError(task.id, qaGoneReason);
             }
             recordTransition(task.id);
+          } else if (sessionGoneHasWork) {
+            // Agent completed work but session ended — route directly to qa_testing
+            // This prevents the in_progress → todo → qa_testing regression
+            const agentWhoWorked = currentTask?.assigned_agent || task.assigned_agent || agentName;
+            console.log(`[MONITOR] Task ${task.id} ("${task.title}") — session gone but has completed work → qa_testing (agent: ${agentWhoWorked})`);
+            await supabase.from("agent_tasks").update({
+              status: "qa_testing",
+              assigned_agent: null,
+              started_at: null,
+              completed_at: new Date().toISOString(),
+            }).eq("id", task.id);
+            await logTaskActivity(task.id, 'status', 'in_progress', 'qa_testing', agentWhoWorked);
           } else if (elapsed > timeout) {
             console.log(`[MONITOR] Timeout + session gone: task ${task.id} ("${task.title}") → failed (${Math.round(elapsed / 60000)}min)`);
             await supabase.from("agent_tasks").update({
@@ -2744,8 +2800,10 @@ async function scheduler() {
       const isRebaseNeeded = !!(t.metadata && t.metadata.rebase_requested);  // Merge queue conflict → needs rebase, not re-QA
       if (hasWork && !isQaRetry && !isRebaseNeeded) {  // Skip QA routing for tasks needing coding fixes or rebases
         // depsMet already checked above — if we got here, dependencies are met
-        console.log("[SCHEDULER] Task " + t.id + " has completed work but is todo — routing to qa_testing");
-        await supabase.from("agent_tasks").update({ status: "qa_testing", assigned_agent: null }).eq("id", t.id);
+        const originalAgent = t.last_failed_agent || t.assigned_agent || 'unknown-agent';
+        console.log('[SCHEDULER] Task ' + t.id + ' has completed work but is todo — routing to qa_testing (original agent: ' + originalAgent + ')');
+        await supabase.from('agent_tasks').update({ status: 'qa_testing', assigned_agent: null }).eq('id', t.id);
+        await logTaskActivity(t.id, 'status', 'todo', 'qa_testing', originalAgent);
         recordTransition(t.id);
         continue;
       }
