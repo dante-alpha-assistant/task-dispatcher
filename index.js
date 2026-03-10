@@ -1789,8 +1789,8 @@ initLangfuse();
                 }
               }
             }
-            const agent = task.assigned_agent || task.qa_agent || 'system';
-            traceTaskPhase(task, phase, agent);
+            const phaseAgent = task.assigned_agent || prev?.assigned_agent || task.qa_agent || 'system';
+            traceTaskPhase(task, phase, phaseAgent);
             // Record phase timing
             const phaseStarted = task.started_at || task.updated_at;
             const durationMs = phaseStarted ? Date.now() - new Date(phaseStarted).getTime() : 0;
@@ -2015,7 +2015,27 @@ initLangfuse();
         // Auto-comment: when an agent writes a result, post it as a comment in the task thread
         if (eventType === 'UPDATE' && task?.result && !prev?.result) {
           try {
-            const agent = task.assigned_agent || prev?.assigned_agent || 'system';
+            // Determine the agent who produced this result.
+            // Note: the completing agent often clears assigned_agent in the same PATCH that sets result,
+            // and Supabase Realtime 'old' record may not include assigned_agent (depends on replica identity).
+            // Fallback: query the task_activity log for the last agent assignment.
+            let agent = task.assigned_agent || prev?.assigned_agent || task.qa_agent || null;
+            if (!agent) {
+              try {
+                const { data: activity } = await supabase
+                  .from('task_activity_log')
+                  .select('changed_by')
+                  .eq('task_id', task.id)
+                  .eq('field', 'status')
+                  .neq('changed_by', 'dispatcher')
+                  .order('changed_at', { ascending: false })
+                  .limit(1)
+                  .single();
+                agent = activity?.changed_by || 'system';
+              } catch {
+                agent = 'system';
+              }
+            }
             const result = typeof task.result === 'object' ? task.result : (() => { try { return JSON.parse(task.result); } catch { return null; } })();
             let commentBody = '📋 **Task Result**\n\n';
             if (result?.summary) {
