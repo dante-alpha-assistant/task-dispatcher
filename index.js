@@ -1898,7 +1898,7 @@ initLangfuse();
               await supabase.from('agent_tasks')
                 .update({ status: 'deployed', updated_at: new Date().toISOString() })
                 .eq('id', tid)
-                .eq('status', 'deploying'); // Only update if still deploying
+                .in('status', ['deploying', 'completed']); // Update deploying or completed (if deploying transition was blocked)
             }
           }
         }
