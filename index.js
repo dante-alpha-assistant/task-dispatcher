@@ -1377,7 +1377,7 @@ ${commentsBlock ? `\n${commentsBlock}` : ""}
 ${contextBlock}---
 ## 🚫 BLOCKED: When you CANNOT fully complete a task
 
-If a task requires steps you cannot perform autonomously (SQL migrations in Supabase Dashboard, DNS changes, external API config, secrets rotation, manual approval), you MUST:
+If a task requires steps you cannot perform autonomously (DNS changes, external API config, secrets rotation, manual approval), you MUST:
 1. Set the task status to \`blocked\` with a clear \`blocked_reason\` — do NOT mark it done/deployed
 2. NEVER write "apply manually" or "run this in the dashboard" as part of a completed task
 3. First try to do it yourself — you have: exec, curl, psql (if DB access is configured), GitHub API, browser automation, K8s kubectl
@@ -1474,6 +1474,20 @@ DATABASE MIGRATION RULES (MANDATORY):
 - NEVER assume a column exists — if you add code that uses a new column, add the migration
 - Example: migrations/0005_add_my_column.sql containing: ALTER TABLE agent_tasks ADD COLUMN IF NOT EXISTS my_column text;
 - If you skip this, QA will auto-fail your PR and the scheduler may crash at runtime
+
+EXECUTING MIGRATIONS (MANDATORY — DO NOT SKIP):
+- After creating migration files, you MUST EXECUTE them against the target Supabase project
+- Use the Supabase Management API to run SQL:
+  curl -s -X POST "https://api.supabase.com/v1/projects/PROJECT_REF/database/query" \\
+    -H "Authorization: Bearer $SUPABASE_MGMT_TOKEN" \\
+    -H "Content-Type: application/json" \\
+    -d '{"query": "YOUR SQL HERE"}'
+- Default project ref (tasks.dante.id): lessxkxujvcmublgwdaa
+- If the task has a different supabase_project_ref in its app config, use THAT ref instead
+- ALWAYS verify the migration ran successfully by querying the table/column afterwards
+- Example verification: SELECT column_name FROM information_schema.columns WHERE table_name = 'my_table' AND column_name = 'my_column';
+- A migration file that was NOT executed is the same as no migration at all — the app WILL break
+- NEVER mark a task as complete if migrations exist but were not executed
 
 Do NOT skip this step. The task board at tasks.dante.id must reflect your work.`;
 
@@ -1889,7 +1903,11 @@ async function assignQueuedQATasks() {
 - For API changes: verify the endpoint responds correctly with a test curl
 - For UI changes: check the PR diff matches what the task asked for
 - If the agent wrote "apply manually" or deferred work → REJECT immediately
-- **MIGRATION CHECK:** If the PR adds code referencing NEW database columns/tables, check if a migration file exists in the migrations/ folder. If code uses a column that doesn't have a migration file → REJECT with "Missing database migration file for new column(s)"
+- **MIGRATION CHECK (2 parts — BOTH required):**
+  1. FILE CHECK: If the PR adds code referencing NEW database columns/tables, check if a migration file exists in the migrations/ folder. If code uses a column that doesn't have a migration file → REJECT with "Missing database migration file for new column(s)"
+  2. EXECUTION CHECK: If migration files exist, verify they were ACTUALLY EXECUTED against Supabase. Query the database to confirm tables/columns exist:
+     curl -s -X POST "https://api.supabase.com/v1/projects/lessxkxujvcmublgwdaa/database/query" -H "Authorization: Bearer $SUPABASE_MGMT_TOKEN" -H "Content-Type: application/json" -d '{"query": "SELECT column_name FROM information_schema.columns WHERE table_name = '\''TABLE_NAME'\'' AND column_name = '\''COLUMN_NAME'\'';"}'
+     If the table/column does NOT exist in the database → REJECT with "Migration file exists but was NOT executed against Supabase"
 
 ### DO NOT:
 - Clone the repo and try to build it
