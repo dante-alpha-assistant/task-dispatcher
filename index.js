@@ -1270,8 +1270,19 @@ You MUST detect and self-block with structured metadata when you encounter these
 - **ambiguous_requirement** — task description unclear, needs human clarification
 - **permission_denied** — you lack access to a resource (403, RBAC, etc.)
 - **external_dependency** — waiting on a third-party service, approval, or another team
+- **task_dependency** — this task depends on another task that isn't completed yet
 - **infrastructure** — resource not available (DB down, service unreachable, pod crash)
 - **human_decision** — multiple valid approaches, need human to choose
+
+**IMPORTANT: When blocking for task_dependency, you MUST also create the dependency relationship:**
+\\\`\\\`\\\`bash
+curl -s -X POST "https://lessxkxujvcmublgwdaa.supabase.co/rest/v1/task_relationships" \\\\
+  -H "apikey: \${SUPABASE_KEY}" \\\\
+  -H "Authorization: Bearer \${SUPABASE_KEY}" \\\\
+  -H "Content-Type: application/json" \\\\
+  -d '{"source_task_id":"THIS_TASK_ID","target_task_id":"DEPENDENCY_TASK_ID","relationship_type":"depends_on","created_by":"AGENT_NAME"}'
+\\\`\\\`\\\`
+This ensures the dispatcher will NOT re-dispatch this task until the dependency is completed/deployed.
 
 \`\`\`bash
 curl -s -X PATCH "https://lessxkxujvcmublgwdaa.supabase.co/rest/v1/agent_tasks?id=eq.${task.id}" \\
