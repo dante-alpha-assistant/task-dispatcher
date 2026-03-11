@@ -154,7 +154,7 @@ const AGENTS = {
 async function getAgentCards() {
   const { data, error } = await supabase
     .from('agent_cards')
-    .select('name, capabilities, task_types, max_capacity, priority_affinity, status')
+    .select('name, capabilities, task_types, max_capacity, priority_affinity, status, available_credentials')
     .eq('status', 'online');
   if (error) {
     console.error('[CARDS] Failed to fetch agent cards:', error.message);
@@ -166,7 +166,24 @@ async function getAgentCards() {
     capabilities: c.task_types || [],
     max_concurrent: c.max_capacity != null ? c.max_capacity : 2,
     priority_affinity: c.priority_affinity || {},
+    available_credentials: c.available_credentials || [],
   }));
+}
+
+// --- App Credential Check ---
+// Pre-flight: verify an agent has all required credentials for an app-scoped task.
+// For coding dispatch: app.required_credentials ⊆ agent.available_credentials
+// For QA dispatch: app.required_qa_credentials ⊆ agent.available_credentials
+// Returns { ok: true } or { ok: false, missing: [...] }
+function checkAgentCredentials(agentCard, appContext, { isQa = false } = {}) {
+  if (!appContext) return { ok: true, missing: [] };
+  const required = isQa
+    ? (appContext.required_qa_credentials || [])
+    : (appContext.required_credentials || []);
+  if (!required.length) return { ok: true, missing: [] };
+  const available = new Set(agentCard.available_credentials || []);
+  const missing = required.filter(cred => !available.has(cred));
+  return { ok: missing.length === 0, missing };
 }
 
 const DANTE_ID_API_URL = process.env.DANTE_ID_API_URL || "https://api.dante.id";
@@ -1234,6 +1251,26 @@ async function dispatchToAgent(task) {
 
   // Fetch app context if task has app_id
   const appContext = await fetchAppContext(task.id, task.app_id);
+
+  // Pre-flight credential check: verify agent has required credentials for this app
+  if (appContext) {
+    const isQaDispatch = task.status === 'qa_testing';
+    // Fetch agent card for credential data
+    const { data: dispatchAgentCard } = await supabase
+      .from('agent_cards')
+      .select('available_credentials')
+      .ilike('name', agentName)
+      .single();
+    const agentCreds = { available_credentials: dispatchAgentCard?.available_credentials || [] };
+    const credCheck = checkAgentCredentials(agentCreds, appContext, { isQa: isQaDispatch });
+    if (!credCheck.ok) {
+      const credMsg = `[DISPATCH] Agent ${agentName} missing credentials for app "${appContext.name}": ${credCheck.missing.join(', ')} — skipping, clearing assignment`;
+      console.log(credMsg);
+      await supabase.from('agent_tasks').update({ assigned_agent: null }).eq('id', task.id);
+      await logTransientError(task.id, credMsg);
+      return;
+    }
+  }
 
   const taskPayload = JSON.stringify({
     task_id: task.id,
@@ -3153,6 +3190,12 @@ async function scheduler() {
     for (const task of allSchedulable) {
       const isQaTask = task.status === 'qa_testing';
 
+      // Pre-flight credential check: fetch app context if task has app_id
+      let taskAppContext = null;
+      if (task.app_id) {
+        taskAppContext = await fetchAppContext(task.id, task.app_id);
+      }
+
       // Respect assigned_agent hint — but remap disabled/degraded agents (todo tasks only)
       if (!isQaTask && task.assigned_agent) {
         let hintAgent = task.assigned_agent.toLowerCase();
@@ -3172,16 +3215,37 @@ async function scheduler() {
         }
         const agentSlot = freeAgents.find(a => a.name === hintAgent && a.remaining > 0);
         if (agentSlot) {
-          console.log(`[SCHEDULER] Assigning task ${task.id} ("${task.title}") → ${hintAgent} (hint)`);
-          await supabase
-            .from("agent_tasks")
-            .update({ assigned_agent: hintAgent, error: null })
-            .eq("id", task.id);
-          agentSlot.remaining--;
-          assigned++;
+          // Credential check for hint agent
+          if (taskAppContext) {
+            const credCheck = checkAgentCredentials(agentSlot, taskAppContext, { isQa: false });
+            if (!credCheck.ok) {
+              console.log(`[SCHEDULER] Hint agent ${hintAgent} missing credentials for app ${taskAppContext.name}: ${credCheck.missing.join(', ')} — clearing hint`);
+              await supabase.from("agent_tasks").update({ assigned_agent: null }).eq("id", task.id);
+              await logTransientError(task.id, `Hint agent ${hintAgent} missing credentials for app "${taskAppContext.name}": ${credCheck.missing.join(', ')}`);
+              // Fall through to capability-based assignment
+            } else {
+              console.log(`[SCHEDULER] Assigning task ${task.id} ("${task.title}") → ${hintAgent} (hint)`);
+              await supabase
+                .from("agent_tasks")
+                .update({ assigned_agent: hintAgent, error: null })
+                .eq("id", task.id);
+              agentSlot.remaining--;
+              assigned++;
+              continue;
+            }
+          } else {
+            console.log(`[SCHEDULER] Assigning task ${task.id} ("${task.title}") → ${hintAgent} (hint)`);
+            await supabase
+              .from("agent_tasks")
+              .update({ assigned_agent: hintAgent, error: null })
+              .eq("id", task.id);
+            agentSlot.remaining--;
+            assigned++;
+            continue;
+          }
+        } else {
           continue;
         }
-        continue;
       }
 
       // For qa_testing tasks, require "qa" capability; for regular tasks, use task type
@@ -3197,8 +3261,21 @@ async function scheduler() {
       const validCaps = CAPABILITY_ALIASES[requiredCapability] || [requiredCapability];
 
       // Score agents: must have required capability, then rank by capacity + priority affinity
+      // Also filter by app credential requirements (BLOCKING — agents without creds are skipped)
       const candidates = freeAgents
-        .filter(a => a.remaining > 0 && a.capabilities.some(c => validCaps.includes(c)) )
+        .filter(a => {
+          if (a.remaining <= 0) return false;
+          if (!a.capabilities.some(c => validCaps.includes(c))) return false;
+          // App credential check: skip agents missing required credentials
+          if (taskAppContext) {
+            const credCheck = checkAgentCredentials(a, taskAppContext, { isQa: isQaTask });
+            if (!credCheck.ok) {
+              console.log(`[SCHEDULER] Skipping ${a.name} for task ${task.id} — missing credentials for app "${taskAppContext.name}": ${credCheck.missing.join(', ')}`);
+              return false;
+            }
+          }
+          return true;
+        })
         .map(a => {
           let score = a.remaining;
           const affinityMultiplier = a.priority_affinity[task.priority];
@@ -3209,7 +3286,21 @@ async function scheduler() {
 
       const bestCandidate = candidates[0];
       if (!bestCandidate && !isQaTask) {
-        console.log(`[SCHEDULER] No candidate for task ${task.id} ("${task.title.substring(0,30)}") type=${task.type} required=${requiredCapability} last_failed=${task.last_failed_agent} agents=${freeAgents.map(a=>a.name+":"+a.capabilities.join(",")).join("|")}`);
+        // Check if any agents were skipped due to credential mismatch
+        const capableButNoCreds = taskAppContext ? freeAgents.filter(a =>
+          a.remaining > 0 &&
+          a.capabilities.some(c => validCaps.includes(c)) &&
+          !checkAgentCredentials(a, taskAppContext, { isQa: isQaTask }).ok
+        ) : [];
+        if (capableButNoCreds.length > 0) {
+          const missingList = capableButNoCreds.map(a => {
+            const creds = checkAgentCredentials(a, taskAppContext, { isQa: isQaTask });
+            return `${a.name}(missing:${creds.missing.join(',')})`;
+          }).join(', ');
+          console.log(`[DISPATCH] No agent has required credentials for app "${taskAppContext.name}": ${missingList}`);
+        } else {
+          console.log(`[SCHEDULER] No candidate for task ${task.id} ("${task.title.substring(0,30)}") type=${task.type} required=${requiredCapability} last_failed=${task.last_failed_agent} agents=${freeAgents.map(a=>a.name+":"+a.capabilities.join(",")).join("|")}`);
+        }
       }
 
       if (bestCandidate) {
@@ -3250,9 +3341,26 @@ async function scheduler() {
         assigned++;
       } else {
         const availableTypes = freeAgents.filter(a => a.remaining > 0).map(a => `${a.name}[${a.capabilities.join(',')}]`).join(', ') || 'none';
-        const errorMsg = isQaTask
-          ? `No QA-capable agent available. Need "qa" capability. Available: ${availableTypes}`
-          : `No capable agent for task type "${requiredCapability}". Available agents: ${availableTypes}`;
+        let errorMsg;
+        if (taskAppContext) {
+          // Check if the issue is credentials vs capabilities
+          const capableAgents = freeAgents.filter(a => a.remaining > 0 && a.capabilities.some(c => validCaps.includes(c)));
+          if (capableAgents.length > 0) {
+            const missingDetails = capableAgents.map(a => {
+              const creds = checkAgentCredentials(a, taskAppContext, { isQa: isQaTask });
+              return `${a.name}(missing:${creds.missing.join(',')})`;
+            }).join(', ');
+            errorMsg = `No agent has required credentials for app "${taskAppContext.name}": ${missingDetails}`;
+          } else {
+            errorMsg = isQaTask
+              ? `No QA-capable agent available. Need "qa" capability. Available: ${availableTypes}`
+              : `No capable agent for task type "${requiredCapability}". Available agents: ${availableTypes}`;
+          }
+        } else {
+          errorMsg = isQaTask
+            ? `No QA-capable agent available. Need "qa" capability. Available: ${availableTypes}`
+            : `No capable agent for task type "${requiredCapability}". Available agents: ${availableTypes}`;
+        }
         console.log(`[SCHEDULER] ${errorMsg} — task ${task.id}`);
         // Write a visible note to the task (not just log)
         const now = new Date().toISOString();
