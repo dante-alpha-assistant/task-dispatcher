@@ -2769,6 +2769,65 @@ createServer(async (req, res) => {
   } else if (pathname === "/api/error-categories" && req.method === "GET") {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify(getErrorCategories()));
+  } else if (pathname === "/api/agents/register-credentials" && req.method === "POST") {
+    // Agent credential self-registration endpoint
+    // Agents call this on startup to report which known env vars they have
+    let body = "";
+    req.on("data", chunk => body += chunk);
+    req.on("end", async () => {
+      try {
+        // Authenticate: agent must provide a known hooks token
+        const auth = req.headers.authorization || "";
+        const token = auth.replace("Bearer ", "");
+        const knownTokens = Object.values(AGENTS).map(a => a.token).filter(Boolean);
+        if (!token || !knownTokens.includes(token)) {
+          res.writeHead(401, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Unauthorized" }));
+          return;
+        }
+
+        const { agent_name, available_credentials } = JSON.parse(body);
+        if (!agent_name || typeof agent_name !== "string") {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "agent_name is required" }));
+          return;
+        }
+        if (!Array.isArray(available_credentials)) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "available_credentials must be an array" }));
+          return;
+        }
+
+        // Sanitize: only allow known credential names (no values)
+        const ALLOWED_CREDENTIAL_NAMES = [
+          "GH_TOKEN", "SUPABASE_SERVICE_ROLE_KEY", "SUPABASE_MGMT_TOKEN",
+          "VERCEL_TOKEN", "KUBECONFIG", "ANTHROPIC_API_KEY", "OPENROUTER_API_KEY",
+          "DOCKER_TOKEN", "NPM_TOKEN", "AWS_ACCESS_KEY_ID",
+        ];
+        const sanitized = available_credentials.filter(c =>
+          typeof c === "string" && ALLOWED_CREDENTIAL_NAMES.includes(c)
+        );
+
+        const { error } = await supabase
+          .from("agent_cards")
+          .update({ available_credentials: sanitized })
+          .eq("id", agent_name);
+
+        if (error) {
+          console.error(`[CRED-REG] DB error for ${agent_name}:`, error.message);
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: false, error: error.message }));
+          return;
+        }
+
+        console.log(`[CRED-REG] ${agent_name} registered ${sanitized.length} credential(s): ${sanitized.join(", ") || "none"}`);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true, agent: agent_name, credentials: sanitized }));
+      } catch (e) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: e.message }));
+      }
+    });
   } else {
     res.writeHead(404);
     res.end("Not found");
@@ -3767,6 +3826,73 @@ console.log(`[BOOT] QA auto-scaler ENABLED — spawns ephemeral workers when QA 
 setInterval(staleAgentDetector, STALE_AGENT_INTERVAL);
 setTimeout(staleAgentDetector, 10000);
 console.log("[BOOT] Stale agent detector running every 60s (threshold: 10min)");
+
+// ==========================================
+// Credential Poller — poll agents on startup to sync available_credentials
+// Queries each online agent's gateway for known env vars (existence only)
+// Runs once on boot, then every 30 minutes
+// ==========================================
+const KNOWN_CREDENTIAL_VARS = [
+  "GH_TOKEN", "SUPABASE_SERVICE_ROLE_KEY", "SUPABASE_MGMT_TOKEN",
+  "VERCEL_TOKEN", "KUBECONFIG", "ANTHROPIC_API_KEY", "OPENROUTER_API_KEY",
+  "DOCKER_TOKEN", "NPM_TOKEN", "AWS_ACCESS_KEY_ID",
+];
+
+async function pollAgentCredentials() {
+  try {
+    const { data: agents, error } = await supabase
+      .from("agent_cards")
+      .select("id, name, status, webhook_url")
+      .in("status", ["online", "degraded"]);
+
+    if (error || !agents?.length) return;
+
+    for (const agent of agents) {
+      try {
+        const agentConfig = AGENTS[agent.name] || AGENTS[agent.id];
+        if (!agentConfig?.gatewayToken) continue;
+
+        // Use the agent's gateway URL to query sessions — if the agent is reachable,
+        // ask it to report credentials via a lightweight webhook
+        const baseUrl = (agentConfig.url || "").replace(/\/hooks\/agent$/, "");
+        if (!baseUrl) continue;
+
+        // Send a credential check request via the agent's hooks endpoint
+        // The agent's OpenClaw gateway will process this as a system event
+        const checkPayload = {
+          type: "credential_check",
+          credentials_to_check: KNOWN_CREDENTIAL_VARS,
+          callback_url: `http://task-dispatcher.infra.svc.cluster.local:${PORT}/api/agents/register-credentials`,
+        };
+
+        const resp = await fetch(`${baseUrl}/hooks/credential-check`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${agentConfig.token}`,
+          },
+          body: JSON.stringify(checkPayload),
+          signal: AbortSignal.timeout(5000),
+        }).catch(() => null);
+
+        // If the agent doesn't support the credential-check hook (404), that's fine
+        // Agents will self-register via their own startup scripts
+        if (resp?.ok) {
+          console.log(`[CRED-POLL] ${agent.name}: credential check request sent`);
+        }
+      } catch (e) {
+        // Silently skip agents that can't be reached
+      }
+    }
+  } catch (e) {
+    console.warn("[CRED-POLL] Error polling agent credentials:", e.message);
+  }
+}
+
+// Run credential poll 15s after boot, then every 30 minutes
+setTimeout(pollAgentCredentials, 15000);
+setInterval(pollAgentCredentials, 30 * 60 * 1000);
+console.log("[BOOT] Credential poller — runs on boot + every 30min");
 
 // DISABLED: deploy-detect produces false positives (marks tasks deployed before image is live)
 // Deployment will be manual via Deploy button on dashboard. Re-enable when button is ready.
