@@ -2945,7 +2945,7 @@ async function taskMonitor() {
               .select('status, result, pull_request_url, assigned_agent')
               .eq('id', task.id)
               .single();
-            if (idleCurrentTask && ['qa_testing', 'completed', 'deployed', 'done'].includes(idleCurrentTask.status)) {
+            if (idleCurrentTask && ['completed', 'deployed', 'done', 'failed', 'deprecated'].includes(idleCurrentTask.status)) {
               console.log(`[MONITOR] Task ${task.id} already moved to ${idleCurrentTask.status} — skipping idle timeout`);
               continue;
             }
@@ -3013,8 +3013,23 @@ async function taskMonitor() {
             .eq('id', task.id)
             .single();
           
-          if (currentTask && ['qa_testing', 'completed', 'deployed', 'done'].includes(currentTask.status)) {
+          if (currentTask && ['completed', 'deployed', 'done', 'failed', 'deprecated'].includes(currentTask.status)) {
             console.log(`[MONITOR] Task ${task.id} already moved to ${currentTask.status} — skipping session-gone handler`);
+            sessionGoneAt.delete(task.id);
+            activeTasks.delete(task.id);
+            continue;
+          }
+
+          // Session gone but task still in qa_testing → clear qa_agent for re-dispatch
+          if (currentTask && currentTask.status === 'qa_testing') {
+            const hasWork = !!(currentTask.result || (currentTask.pull_request_url && currentTask.pull_request_url.length > 0));
+            console.log(`[MONITOR] Session gone for QA task ${task.id} ("${task.title.slice(0,40)}") → clearing qa_agent for re-dispatch (hasWork: ${hasWork})`);
+            await supabase.from("agent_tasks").update({
+              qa_agent: null,
+              assigned_agent: null,
+              started_at: null,
+            }).eq("id", task.id);
+            await logTransientError(task.id, `QA session gone (pod restart?) — re-queued for QA dispatch`);
             sessionGoneAt.delete(task.id);
             activeTasks.delete(task.id);
             continue;
