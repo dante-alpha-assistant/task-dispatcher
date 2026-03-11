@@ -1791,8 +1791,29 @@ async function assignQueuedQATasks() {
 2. Any obvious errors or issues?
 3. Update status to \`completed\` if acceptable, \`failed\` if not.`;
         }
-        // Add Gherkin acceptance criteria instructions
+        // Add progress comments + Gherkin acceptance criteria instructions
         qaInstructions += `
+
+### ⚠️ MANDATORY: Post Progress Comments During QA
+
+As you complete each check, post a comment to the task so the dashboard shows real-time progress. Do NOT wait until the end.
+
+After each step, post a comment:
+\\\`\\\`\\\`bash
+curl -s -X POST "https://lessxkxujvcmublgwdaa.supabase.co/rest/v1/task_comments" \\\\
+  -H "apikey: \${SUPABASE_SERVICE_ROLE_KEY:-eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imxlc3N4a3h1anZjbXVibGd3ZGFhIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3MTM2MTQ2NSwiZXhwIjoyMDg2OTM3NDY1fQ.Wo2WczTauYjpaqtAzfADTSa5htFF6_cKU4UHaJ1EARI}" \\\\
+  -H "Authorization: Bearer \${SUPABASE_SERVICE_ROLE_KEY:-eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imxlc3N4a3h1anZjbXVibGd3ZGFhIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3MTM2MTQ2NSwiZXhwIjoyMDg2OTM3NDY1fQ.Wo2WczTauYjpaqtAzfADTSa5htFF6_cKU4UHaJ1EARI}" \\\\
+  -H "Content-Type: application/json" \\\\
+  -d '{"task_id":"${task.id}","author":"beta-worker","author_type":"agent","body":"✅ Step N: DESCRIPTION OF WHAT YOU CHECKED AND RESULT"}'
+\\\`\\\`\\\`
+
+**Example comments:**
+- "✅ PR #1 exists — 47 files, feat/project-setup branch"
+- "✅ Code scan — no hardcoded secrets, proper error handling"
+- "⚠️ Missing migration for new contacts.phone column"
+- "❌ Task asked for Docker setup but no Dockerfile found"
+
+Post at LEAST 2-3 comments during QA. This is how the team knows you're working, not stuck.
 
 ### ⚠️ MANDATORY: Write Gherkin Acceptance Criteria
 
