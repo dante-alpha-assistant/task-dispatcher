@@ -2751,6 +2751,38 @@ createServer(async (req, res) => {
   } else if (pathname === "/api/error-categories" && req.method === "GET") {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify(getErrorCategories()));
+  } else if (pathname === "/api/register-credentials" && req.method === "POST") {
+    // Agent credential self-registration endpoint
+    // Accepts: { agent_name: string, available_credentials: string[] }
+    try {
+      let body = "";
+      for await (const chunk of req) body += chunk;
+      const { agent_name, available_credentials } = JSON.parse(body);
+      if (!agent_name || !Array.isArray(available_credentials)) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: "Missing agent_name or available_credentials array" }));
+        return;
+      }
+      // Validate: only allow known credential names (prevent arbitrary data injection)
+      const KNOWN_CRED_NAMES = ['GH_TOKEN', 'SUPABASE_SERVICE_ROLE_KEY', 'SUPABASE_MGMT_TOKEN', 'VERCEL_TOKEN', 'KUBECONFIG', 'OPENROUTER_API_KEY', 'ANTHROPIC_API_KEY', 'LANGFUSE_SECRET_KEY'];
+      const filtered = available_credentials.filter(c => KNOWN_CRED_NAMES.includes(c));
+      const { error } = await supabase
+        .from('agent_cards')
+        .update({ available_credentials: filtered })
+        .eq('name', agent_name);
+      if (error) {
+        console.error(`[CRED-REG] Failed to update credentials for ${agent_name}:`, error.message);
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: error.message }));
+        return;
+      }
+      console.log(`[CRED-REG] ${agent_name} registered credentials: [${filtered.join(', ')}]`);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true, agent_name, registered: filtered }));
+    } catch (e) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: false, error: e.message }));
+    }
   } else {
     res.writeHead(404);
     res.end("Not found");
