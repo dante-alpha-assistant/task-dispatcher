@@ -4219,7 +4219,8 @@ console.log("Config + skills written for ephemeral coding worker");
 // setInterval(codingAutoScaler, CODING_SCALER_INTERVAL);
 
 // Start merge queue processor
-startMergeQueue(supabase, logTaskActivity);
+// DISABLED: Merge queue auto-merges completed tasks — we use manual Deploy/Deploy All buttons instead
+// startMergeQueue(supabase, logTaskActivity);
 
 // Flush Langfuse events every 60s
 setInterval(() => flushLangfuse().catch(() => {}), 60000);
