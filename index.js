@@ -3275,7 +3275,7 @@ async function scheduler() {
       // Check task dependencies
       const depsMet = await areDependenciesMet(t.id);
       if (!depsMet) {
-        // console.log('[SCHEDULER] Task ' + t.id.slice(0,8) + ' has unmet dependencies — skipping');
+        console.log('[SCHEDULER] Task ' + t.id.slice(0,8) + ' has unmet dependencies — skipping');
         continue;
       }
       const hasWork = !!(t.result || (t.pull_request_url && t.pull_request_url.length > 0));
@@ -3294,6 +3294,7 @@ async function scheduler() {
         console.log("[SCHEDULER] Cooldown active for task " + t.id + " — skipping this cycle");
         continue;
       }
+      console.log(`[SCHEDULER] Task ${t.id.slice(0,8)} ("${t.title.slice(0,30)}") passed all filters — schedulable`);
       trulyTodoTasks.push(t);
     }
 
