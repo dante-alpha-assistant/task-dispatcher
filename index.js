@@ -1302,6 +1302,17 @@ This is a batch deploy task. You must:
 - If a PR fails, mark that subtask as deploy_failed and continue with the rest
 ` : "";
 
+  // Vercel deploy hint when deploy_target is vercel
+  const vercelDeploySection = (appContext && appContext.deploy_target === 'vercel') ? `
+## Vercel Deployment
+
+This app deploys to **Vercel** (not Kubernetes). When deploying:
+- **Use the vercel-deploy skill.** Read \`skills/vercel-deploy/SKILL.md\` and follow it step by step.
+- Use the helper script: \`bash skills/vercel-deploy/deploy.sh dante-alpha-assistant <repo-name> main\`
+- Requires \`VERCEL_TOKEN\` env var
+- After successful deployment, update the task with \`deployment_url\` in metadata
+` : "";
+
   const codingTaskSection = task.type === "coding" ? `
 ## Coding Task
 
@@ -1321,7 +1332,7 @@ ${contextBlock}## Task Assigned: ${task.title}
 ${appScopeSection}
 ${blockerContext}${rebaseSection || (task.description || "")}
 ${!rebaseSection && task.prompt ? `**Prompt:** ${task.prompt}` : ""}
-${!rebaseSection ? codingTaskSection : ""}${deployTaskSection}
+${!rebaseSection ? codingTaskSection : ""}${deployTaskSection}${vercelDeploySection}
 
 **Task ID:** ${task.id}
 **Type:** ${task.type}
@@ -3899,6 +3910,7 @@ const config = {
 fs.mkdirSync('/root/.openclaw/workspace/skills/task-worker', { recursive: true });
 fs.mkdirSync('/root/.openclaw/workspace/skills/coding-task', { recursive: true });
 fs.mkdirSync('/root/.openclaw/workspace/skills/deploy-batch', { recursive: true });
+fs.mkdirSync('/root/.openclaw/workspace/skills/vercel-deploy', { recursive: true });
 fs.writeFileSync('/root/.openclaw/openclaw.json', JSON.stringify(config, null, 2));
 
 // Write task-worker skill
@@ -3932,6 +3944,14 @@ try {
     fs.writeFileSync('/root/.openclaw/workspace/skills/deploy-batch/SKILL.md', fs.readFileSync(skillPath, 'utf8'));
   }
 } catch(e) { console.error('deploy-batch skill write failed:', e.message); }
+
+// Write vercel-deploy skill (read from bundled file)
+try {
+  const skillPath = require('path').join(__dirname, 'skills', 'vercel-deploy.md');
+  if (fs.existsSync(skillPath)) {
+    fs.writeFileSync('/root/.openclaw/workspace/skills/vercel-deploy/SKILL.md', fs.readFileSync(skillPath, 'utf8'));
+  }
+} catch(e) { console.error('vercel-deploy skill write failed:', e.message); }
 
 // Write coding-task skill  
 fs.writeFileSync('/root/.openclaw/workspace/skills/coding-task/SKILL.md', \`# coding-task Skill
