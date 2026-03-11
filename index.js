@@ -1164,6 +1164,24 @@ async function dispatchToAgent(task) {
     return;
   }
 
+  // Fetch app context if task has app_id
+  let appContext = null;
+  if (task.app_id) {
+    try {
+      const { data: app, error: appErr } = await supabase
+        .from('apps')
+        .select('*')
+        .eq('id', task.app_id)
+        .single();
+      if (!appErr && app) {
+        appContext = app;
+        console.log(`[DISPATCH] Task ${task.id} scoped to app "${app.name}" (repos: ${(app.repos || []).join(', ')})`);
+      }
+    } catch (e) {
+      console.warn(`[DISPATCH] Failed to fetch app for task ${task.id}:`, e.message);
+    }
+  }
+
   const taskPayload = JSON.stringify({
     task_id: task.id,
     title: task.title,
@@ -1174,7 +1192,7 @@ async function dispatchToAgent(task) {
     stage: task.stage,
     parent_task_id: task.parent_task_id,
     dispatched_by: task.dispatched_by,
-              pull_request_url: task.pull_request_url,
+    pull_request_url: task.pull_request_url,
     repo: task.repo,
     branch: task.branch,
     context: task.context,
@@ -1183,6 +1201,19 @@ async function dispatchToAgent(task) {
   const contextBlock = await buildContextBlockWithTimeout(task);
   const commentsBlock = await fetchTaskComments(task.id);
   const blockerContext = buildBlockerContext(task);
+
+  // Build app scope section for repo enforcement
+  const appScopeSection = appContext ? `
+## 🔒 App Scope: ${appContext.name}
+
+**You MUST ONLY push code to these repos: ${(appContext.repos || []).join(', ')}. Do NOT modify any other repo.**
+
+- **App:** ${appContext.name} (${appContext.slug})
+- **Allowed repos:** ${(appContext.repos || []).map(r => '`' + r + '`').join(', ')}
+- **Deploy target:** ${appContext.deploy_target}${appContext.supabase_project_ref ? `\n- **Supabase project:** ${appContext.supabase_project_ref}` : ''}${appContext.deploy_config && Object.keys(appContext.deploy_config).length > 0 ? `\n- **Deploy config:** ${JSON.stringify(appContext.deploy_config)}` : ''}${appContext.description ? `\n- **Description:** ${appContext.description}` : ''}
+
+⚠️ **CRITICAL:** Any push to a repo NOT in the list above will be considered a cross-repo contamination incident.
+` : "";
 
   // Build rebase section if metadata indicates rebase requested
   const rebaseSection = task.metadata?.rebase_requested && task.metadata?.rebase_pr ? (() => {
@@ -1243,7 +1274,7 @@ ${taskPayload}
 \`\`\`
 
 ${contextBlock}## Task Assigned: ${task.title}
-
+${appScopeSection}
 ${blockerContext}${rebaseSection || (task.description || "")}
 ${!rebaseSection && task.prompt ? `**Prompt:** ${task.prompt}` : ""}
 ${!rebaseSection ? codingTaskSection : ""}${deployTaskSection}
