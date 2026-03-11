@@ -1213,13 +1213,18 @@ async function dispatchToAgent(task) {
 
 This is a batch deploy task. You must:
 1. Clone each repo listed in metadata.repos
-2. Merge each PR sequentially (rebase onto main, then fast-forward merge)
-3. Push to main (one push per repo, after ALL PRs for that repo are merged)
-4. Wait for CI to pass (one build per repo)
+2. For each PR: rebase onto main, force-push branch, then merge via \`gh pr merge --rebase --admin\`
+3. ALWAYS verify PR state is MERGED after each merge: \`gh pr view --json state\`
+4. Wait for CI to pass
 5. Verify ArgoCD deploys the new image and pod is healthy
-6. Report results with merged/failed PR lists
+6. Update ALL subtask statuses via Supabase Management API (trigger bypass required)
+7. Verify subtask statuses are correct (deployed or deploy_failed)
 
-**IMPORTANT:** If a PR has merge conflicts, skip it and continue with the rest. Never force push.
+**CRITICAL RULES:**
+- NEVER push directly to main — always use \`gh pr merge\`
+- NEVER leave subtasks stuck in \`deploying\` — every one must end as \`deployed\` or \`deploy_failed\`
+- Use \`SUPABASE_MGMT_TOKEN\` env var for the Management API trigger bypass
+- If a PR fails, mark that subtask as deploy_failed and continue with the rest
 ` : "";
 
   const codingTaskSection = task.type === "coding" ? `
@@ -3770,6 +3775,7 @@ const config = {
 };
 fs.mkdirSync('/root/.openclaw/workspace/skills/task-worker', { recursive: true });
 fs.mkdirSync('/root/.openclaw/workspace/skills/coding-task', { recursive: true });
+fs.mkdirSync('/root/.openclaw/workspace/skills/deploy-batch', { recursive: true });
 fs.writeFileSync('/root/.openclaw/openclaw.json', JSON.stringify(config, null, 2));
 
 // Write task-worker skill
@@ -3795,6 +3801,14 @@ Use GH_TOKEN env var: git clone https://x-access-token:\\\${GH_TOKEN}@github.com
 - NEVER write "apply this manually" — block the task instead
 - Use curl, kubectl, gh CLI FIRST before blocking
 \`);
+
+// Write deploy-batch skill (read from bundled file or write inline)
+try {
+  const skillPath = require('path').join(__dirname, 'skills', 'deploy-batch.md');
+  if (fs.existsSync(skillPath)) {
+    fs.writeFileSync('/root/.openclaw/workspace/skills/deploy-batch/SKILL.md', fs.readFileSync(skillPath, 'utf8'));
+  }
+} catch(e) { console.error('deploy-batch skill write failed:', e.message); }
 
 // Write coding-task skill  
 fs.writeFileSync('/root/.openclaw/workspace/skills/coding-task/SKILL.md', \`# coding-task Skill
