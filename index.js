@@ -170,6 +170,74 @@ async function getAgentCards() {
 }
 
 const DANTE_ID_API_URL = process.env.DANTE_ID_API_URL || "https://api.dante.id";
+
+// --- App Scope Helpers ---
+// Build the app scope section for agent prompts (shared between dispatch and QA)
+function buildAppScopeSection(appContext) {
+  const repos = (appContext.repos || []);
+  const repoList = repos.join(', ');
+  let section = `
+## 🔒 App Scope: ${appContext.name}
+
+**ALLOWED REPOS: ${repoList}. You MUST ONLY clone, modify, and push to these repos. Pushing to any other repo is a HARD FAILURE.**
+
+- **App:** ${appContext.name} (${appContext.slug})
+- **Allowed repos:** ${repos.map(r => '`' + r + '`').join(', ')}`;
+  if (appContext.supabase_project_ref) {
+    section += `\n- **SUPABASE PROJECT:** ${appContext.supabase_project_ref} (URL: https://${appContext.supabase_project_ref}.supabase.co)`;
+  }
+  if (appContext.deploy_target) {
+    section += `\n- **DEPLOY TARGET:** ${appContext.deploy_target}`;
+  }
+  if (appContext.deploy_config && Object.keys(appContext.deploy_config).length > 0) {
+    section += `\n- **Deploy config:** ${JSON.stringify(appContext.deploy_config)}`;
+  }
+  if (appContext.description) {
+    section += `\n- **Description:** ${appContext.description}`;
+  }
+  section += `
+
+⚠️ **CRITICAL:** Any push to a repo NOT in the allowed list above is a cross-repo contamination incident and a HARD FAILURE.
+`;
+  return section;
+}
+
+// Build the QA repo validation section for app-scoped tasks
+function buildQaRepoValidation(appContext) {
+  const repos = (appContext.repos || []);
+  const repoList = repos.map(r => '`' + r + '`').join(', ');
+  return `
+### 🔒 REPO SCOPE VALIDATION (App: ${appContext.name})
+
+**MANDATORY CHECK:** This task is scoped to app **${appContext.name}**. Allowed repos: ${repoList}.
+
+You MUST verify:
+1. The PR targets one of the allowed repos: ${repoList}
+2. No commits or file changes reference repos outside the allowed list
+3. If the PR targets a repo NOT in the allowed list → **IMMEDIATE FAIL** with: "Cross-repo contamination: PR targets unauthorized repo"
+${appContext.supabase_project_ref ? `4. If Supabase queries are present, verify they target project ref \`${appContext.supabase_project_ref}\`` : ''}
+`;
+}
+
+// Fetch app context from Supabase by app_id
+async function fetchAppContext(taskId, appId) {
+  if (!appId) return null;
+  try {
+    const { data: app, error: appErr } = await supabase
+      .from('apps')
+      .select('*')
+      .eq('id', appId)
+      .single();
+    if (!appErr && app) {
+      console.log(`[APP] Fetched app "${app.name}" for task ${taskId} (repos: ${(app.repos || []).join(', ')})`);
+      return app;
+    }
+    if (appErr) console.warn(`[APP] Failed to fetch app ${appId} for task ${taskId}:`, appErr.message);
+  } catch (e) {
+    console.warn(`[APP] Error fetching app for task ${taskId}:`, e.message);
+  }
+  return null;
+}
 const PRIORITY_ORDER = { urgent: 0, high: 1, normal: 2, low: 3 };
 // === GUARD: State transition cooldown (prevents rapid cycling) ===
 const taskLastTransition = new Map();
@@ -1165,22 +1233,7 @@ async function dispatchToAgent(task) {
   }
 
   // Fetch app context if task has app_id
-  let appContext = null;
-  if (task.app_id) {
-    try {
-      const { data: app, error: appErr } = await supabase
-        .from('apps')
-        .select('*')
-        .eq('id', task.app_id)
-        .single();
-      if (!appErr && app) {
-        appContext = app;
-        console.log(`[DISPATCH] Task ${task.id} scoped to app "${app.name}" (repos: ${(app.repos || []).join(', ')})`);
-      }
-    } catch (e) {
-      console.warn(`[DISPATCH] Failed to fetch app for task ${task.id}:`, e.message);
-    }
-  }
+  const appContext = await fetchAppContext(task.id, task.app_id);
 
   const taskPayload = JSON.stringify({
     task_id: task.id,
@@ -1196,6 +1249,7 @@ async function dispatchToAgent(task) {
     repo: task.repo,
     branch: task.branch,
     context: task.context,
+    app_id: task.app_id || null,
   }, null, 2);
 
   const contextBlock = await buildContextBlockWithTimeout(task);
@@ -1203,17 +1257,7 @@ async function dispatchToAgent(task) {
   const blockerContext = buildBlockerContext(task);
 
   // Build app scope section for repo enforcement
-  const appScopeSection = appContext ? `
-## 🔒 App Scope: ${appContext.name}
-
-**You MUST ONLY push code to these repos: ${(appContext.repos || []).join(', ')}. Do NOT modify any other repo.**
-
-- **App:** ${appContext.name} (${appContext.slug})
-- **Allowed repos:** ${(appContext.repos || []).map(r => '`' + r + '`').join(', ')}
-- **Deploy target:** ${appContext.deploy_target}${appContext.supabase_project_ref ? `\n- **Supabase project:** ${appContext.supabase_project_ref}` : ''}${appContext.deploy_config && Object.keys(appContext.deploy_config).length > 0 ? `\n- **Deploy config:** ${JSON.stringify(appContext.deploy_config)}` : ''}${appContext.description ? `\n- **Description:** ${appContext.description}` : ''}
-
-⚠️ **CRITICAL:** Any push to a repo NOT in the list above will be considered a cross-repo contamination incident.
-` : "";
+  const appScopeSection = appContext ? buildAppScopeSection(appContext) : "";
 
   // Build rebase section if metadata indicates rebase requested
   const rebaseSection = task.metadata?.rebase_requested && task.metadata?.rebase_pr ? (() => {
@@ -1758,6 +1802,9 @@ async function assignQueuedQATasks() {
       try {
         const qaContextBlock = await buildContextBlockWithTimeout(task);
         const qaCommentsBlock = await fetchTaskComments(task.id);
+        // Fetch app context for repo validation in QA
+        const scalerAppContext = await fetchAppContext(task.id, task.app_id);
+        const scalerRepoValidation = scalerAppContext ? buildQaRepoValidation(scalerAppContext) : '';
         // Tiered QA prompt based on task type
         const taskType = task.type || 'general';
         let qaInstructions = '';
@@ -1821,6 +1868,10 @@ async function assignQueuedQATasks() {
 1. Check the task result — does it match what was requested?
 2. Any obvious errors or issues?
 3. Update status to \`completed\` if acceptable, \`failed\` if not.`;
+        }
+        // Add app repo validation to QA instructions if task is app-scoped
+        if (scalerRepoValidation) {
+          qaInstructions += '\n' + scalerRepoValidation;
         }
         // Add progress comments + Gherkin acceptance criteria instructions
         qaInstructions += `
@@ -2353,6 +2404,10 @@ initLangfuse();
             const prMatch = resultStr.match(/PR\s*#(\d+)/i);
             const repoMatch = resultStr.match(/(dante-alpha-assistant\/[\w-]+)/);
 
+            // Fetch app context for repo validation in QA
+            const qaAppContext = await fetchAppContext(task.id, task.app_id);
+            const qaRepoValidation = qaAppContext ? buildQaRepoValidation(qaAppContext) : '';
+
             let qaScope = '';
             let timeLimit = '3 minutes';
             if (taskType === 'ops' || taskType === 'review') {
@@ -2391,6 +2446,11 @@ Do NOT pass a coding task without reviewing actual code changes in a PR.`;
 2. Any obvious errors?
 DO NOT spend more than 2 minutes on this review.`;
               timeLimit = '2 minutes';
+            }
+
+            // Add app repo validation to QA scope if task is app-scoped
+            if (qaRepoValidation) {
+              qaScope += '\n' + qaRepoValidation;
             }
 
             // Add Gherkin acceptance criteria instructions to ALL QA reviews
