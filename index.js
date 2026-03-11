@@ -2615,7 +2615,7 @@ async function taskMonitor() {
     // Get ALL in_progress and assigned tasks from Supabase
     const { data: activeTasks_db, error } = await supabase
       .from("agent_tasks")
-      .select("id, title, status, assigned_agent, qa_agent, started_at, created_at")
+      .select("id, title, status, assigned_agent, qa_agent, started_at, created_at, result, pull_request_url, idle_retries")
       .in("status", ["in_progress", "qa_testing"]);
 
     if (error) {
