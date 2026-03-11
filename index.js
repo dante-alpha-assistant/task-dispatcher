@@ -154,7 +154,7 @@ const AGENTS = {
 async function getAgentCards() {
   const { data, error } = await supabase
     .from('agent_cards')
-    .select('name, capabilities, task_types, max_capacity, priority_affinity, status')
+    .select('name, capabilities, task_types, max_capacity, priority_affinity, status, available_credentials')
     .eq('status', 'online');
   if (error) {
     console.error('[CARDS] Failed to fetch agent cards:', error.message);
@@ -166,6 +166,7 @@ async function getAgentCards() {
     capabilities: c.task_types || [],
     max_concurrent: c.max_capacity != null ? c.max_capacity : 2,
     priority_affinity: c.priority_affinity || {},
+    available_credentials: c.available_credentials || [],
   }));
 }
 
@@ -217,6 +218,37 @@ You MUST verify:
 3. If the PR targets a repo NOT in the allowed list → **IMMEDIATE FAIL** with: "Cross-repo contamination: PR targets unauthorized repo"
 ${appContext.supabase_project_ref ? `4. If Supabase queries are present, verify they target project ref \`${appContext.supabase_project_ref}\`` : ''}
 `;
+}
+
+// --- App Credential Checking ---
+// Check if an agent has the required credentials for an app-scoped task
+// Returns { ok: true } if credentials are satisfied, or { ok: false, missing: [...] } if not
+function checkAgentCredentials(appContext, agentCredentials, credentialType = 'coding') {
+  if (!appContext) return { ok: true, missing: [] };
+  const required = credentialType === 'qa'
+    ? (appContext.required_qa_credentials || [])
+    : (appContext.required_credentials || []);
+  if (!required.length) return { ok: true, missing: [] };
+  const available = new Set(agentCredentials || []);
+  const missing = required.filter(c => !available.has(c));
+  return { ok: missing.length === 0, missing };
+}
+
+// Fetch agent available_credentials from agent_cards by name
+async function getAgentCredentials(agentName) {
+  if (!agentName) return [];
+  try {
+    const { data, error } = await supabase
+      .from('agent_cards')
+      .select('available_credentials')
+      .ilike('name', agentName)
+      .single();
+    if (error || !data) return [];
+    return data.available_credentials || [];
+  } catch (e) {
+    console.warn(`[CREDENTIALS] Error fetching credentials for ${agentName}:`, e.message);
+    return [];
+  }
 }
 
 // Fetch app context from Supabase by app_id
@@ -1235,6 +1267,20 @@ async function dispatchToAgent(task) {
   // Fetch app context if task has app_id
   const appContext = await fetchAppContext(task.id, task.app_id);
 
+  // Pre-flight credential check (BLOCKING) — only for app-scoped tasks
+  if (appContext) {
+    const agentCreds = await getAgentCredentials(agentName);
+    const credCheck = checkAgentCredentials(appContext, agentCreds, 'coding');
+    if (!credCheck.ok) {
+      const credMsg = `[DISPATCH] Agent ${agentName} missing required credentials for app "${appContext.name}": ${credCheck.missing.join(', ')}`;
+      console.warn(credMsg);
+      // Unassign this agent so scheduler can try another
+      await supabase.from('agent_tasks').update({ assigned_agent: null, started_at: null }).eq('id', task.id);
+      await logTransientError(task.id, credMsg);
+      return;
+    }
+  }
+
   const taskPayload = JSON.stringify({
     task_id: task.id,
     title: task.title,
@@ -1779,9 +1825,24 @@ async function assignQueuedQATasks() {
     const busyWorkers = new Set((assignedTasks || []).map((t) => t.qa_agent));
     const freeWorkers = runningWorkers.filter((w) => !busyWorkers.has(w));
 
+    // Pre-fetch QA agent credentials for credential checking (beta-worker is the QA agent)
+    const qaAgentCreds = await getAgentCredentials('beta-worker');
+
     for (let i = 0; i < Math.min(unassigned.length, freeWorkers.length); i++) {
       const task = unassigned[i];
       const worker = freeWorkers[i];
+
+      // Pre-flight credential check for QA on app-scoped tasks
+      if (task.app_id) {
+        const qaAppCtx = await fetchAppContext(task.id, task.app_id);
+        if (qaAppCtx) {
+          const credCheck = checkAgentCredentials(qaAppCtx, qaAgentCreds, 'qa');
+          if (!credCheck.ok) {
+            console.warn(`[DISPATCH] No agent has required credentials for app "${qaAppCtx.name}": missing ${credCheck.missing.join(', ')}`);
+            continue;
+          }
+        }
+      }
 
       const { error: assignErr } = await supabase
         .from("agent_tasks")
@@ -2389,6 +2450,21 @@ initLangfuse();
           if (!qaAgent?.token) {
             console.error(`[QA] No token for QA agent ${qaAgentName}, task ${task.id}`);
             return;
+          }
+
+          // Pre-flight credential check for QA dispatch
+          if (task.app_id) {
+            const qaDispatchAppCtx = await fetchAppContext(task.id, task.app_id);
+            if (qaDispatchAppCtx) {
+              const qaDispatchCreds = await getAgentCredentials(qaAgentName);
+              const qaCredCheck = checkAgentCredentials(qaDispatchAppCtx, qaDispatchCreds, 'qa');
+              if (!qaCredCheck.ok) {
+                console.warn(`[DISPATCH] No agent has required credentials for app "${qaDispatchAppCtx.name}": missing ${qaCredCheck.missing.join(', ')}`);
+                await supabase.from('agent_tasks').update({ assigned_agent: null, qa_agent: null }).eq('id', task.id);
+                await logTransientError(task.id, `QA agent ${qaAgentName} missing credentials for app "${qaDispatchAppCtx.name}": ${qaCredCheck.missing.join(', ')}`);
+                return;
+              }
+            }
           }
 
           console.log(`[QA] Dispatching QA review for task ${task.id} ("${task.title}") → ${qaAgentName}`);
@@ -3196,9 +3272,26 @@ async function scheduler() {
       };
       const validCaps = CAPABILITY_ALIASES[requiredCapability] || [requiredCapability];
 
+      // Pre-flight credential check: fetch app context and filter agents by credentials
+      let schedulerAppContext = null;
+      if (task.app_id) {
+        schedulerAppContext = await fetchAppContext(task.id, task.app_id);
+      }
+      const credType = isQaTask ? 'qa' : 'coding';
+
       // Score agents: must have required capability, then rank by capacity + priority affinity
       const candidates = freeAgents
         .filter(a => a.remaining > 0 && a.capabilities.some(c => validCaps.includes(c)) )
+        .filter(a => {
+          // Credential check: if task is app-scoped, agent must have required credentials
+          if (!schedulerAppContext) return true;
+          const credCheck = checkAgentCredentials(schedulerAppContext, a.available_credentials, credType);
+          if (!credCheck.ok) {
+            console.log(`[SCHEDULER] Skipping ${a.name} for task ${task.id} — missing credentials for app "${schedulerAppContext.name}": ${credCheck.missing.join(', ')}`);
+            return false;
+          }
+          return true;
+        })
         .map(a => {
           let score = a.remaining;
           const affinityMultiplier = a.priority_affinity[task.priority];
@@ -3209,7 +3302,19 @@ async function scheduler() {
 
       const bestCandidate = candidates[0];
       if (!bestCandidate && !isQaTask) {
-        console.log(`[SCHEDULER] No candidate for task ${task.id} ("${task.title.substring(0,30)}") type=${task.type} required=${requiredCapability} last_failed=${task.last_failed_agent} agents=${freeAgents.map(a=>a.name+":"+a.capabilities.join(",")).join("|")}`);
+        // Check if failure is due to credentials specifically
+        const capableButMissingCreds = schedulerAppContext ? freeAgents
+          .filter(a => a.remaining > 0 && a.capabilities.some(c => validCaps.includes(c)))
+          .filter(a => !checkAgentCredentials(schedulerAppContext, a.available_credentials, credType).ok)
+          : [];
+        if (capableButMissingCreds.length > 0) {
+          const required = credType === 'qa'
+            ? (schedulerAppContext.required_qa_credentials || [])
+            : (schedulerAppContext.required_credentials || []);
+          console.warn(`[DISPATCH] No agent has required credentials for app "${schedulerAppContext.name}": missing ${required.join(', ')}. Capable agents without creds: ${capableButMissingCreds.map(a => a.name).join(', ')}`);
+        } else {
+          console.log(`[SCHEDULER] No candidate for task ${task.id} ("${task.title.substring(0,30)}") type=${task.type} required=${requiredCapability} last_failed=${task.last_failed_agent} agents=${freeAgents.map(a=>a.name+":"+a.capabilities.join(",")).join("|")}`);
+        }
       }
 
       if (bestCandidate) {
