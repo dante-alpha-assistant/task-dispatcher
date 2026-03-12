@@ -3359,7 +3359,7 @@ async function scheduler() {
       // Capability aliasing: some task types map to multiple valid capabilities
       const CAPABILITY_ALIASES = {
         research: ["research", "web_search"],
-        ops: ["ops", "kubernetes", "coding"],
+        ops: ["ops", "kubernetes"],
         deploy: ["deploy", "ops", "kubernetes", "gitops"],
         general: ["coding", "general", "ops"],
       };
