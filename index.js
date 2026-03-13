@@ -2671,11 +2671,14 @@ curl -s -X PATCH "https://lessxkxujvcmublgwdaa.supabase.co/rest/v1/agent_tasks?i
         const body = comment.body || "";
         if (!body.includes("@")) return;
 
-        // Parse @mentions (case-insensitive, supports hyphens/underscores)
-        const mentionMatches = body.match(/@([a-zA-Z0-9_-]+)/g) || [];
-        if (mentionMatches.length === 0) return;
+        // Parse @mentions — supports both @agent-name and @[agent-name] formats (case-insensitive)
+        const rawMatches = [
+          ...(body.match(/@\[([a-zA-Z0-9_-]+)\]/g) || []).map(m => m.slice(2, -1)),  // @[name]
+          ...(body.match(/@([a-zA-Z0-9_-]+)(?!\])/g) || []).map(m => m.slice(1)),     // @name
+        ];
+        if (rawMatches.length === 0) return;
 
-        const mentionedNames = [...new Set(mentionMatches.map(m => m.slice(1).toLowerCase()))];
+        const mentionedNames = [...new Set(rawMatches.map(m => m.toLowerCase()))];
         console.log(`[COMMENT-MENTION] Comment ${comment.id} on task ${comment.task_id} @mentions: ${mentionedNames.join(", ")}`);
 
         // Fetch full task context
