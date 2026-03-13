@@ -2965,10 +2965,33 @@ async function taskMonitor() {
 
       if (sessionAlive) {
         // Idle timeout: QA tasks get longer timeout since they need to clone, build, and test
-        const IDLE_TIMEOUT = isQaTesting ? 15 * 60 * 1000 : 5 * 60 * 1000; // 15min QA, 5min coding
+        // Per-task-type idle timeouts (Fix: coding was 5min, now 15min)
+        const IDLE_TIMEOUTS = {
+          coding: 15 * 60 * 1000,   // 15 min - clones, codex subprocess, builds, PRs
+          deploy: 15 * 60 * 1000,   // 15 min - merges, CI waits, ArgoCD
+          ops: 10 * 60 * 1000,      // 10 min - kubectl, sealing, infra
+          research: 20 * 60 * 1000, // 20 min - deep research rounds
+          qa: 15 * 60 * 1000,       // 15 min - clone, build, test
+          review: 10 * 60 * 1000,   // 10 min
+          general: 10 * 60 * 1000,  // 10 min
+          manual: 10 * 60 * 1000,   // 10 min
+        };
+        const taskType = isQaTesting ? "qa" : (task.type || "general");
+        const IDLE_TIMEOUT = IDLE_TIMEOUTS[taskType] || 10 * 60 * 1000; // default 10 min
         const hookSession = sessions?.find(s => s.key === (isQaTesting ? `agent:main:hook:qa:${task.id}` : `agent:main:hook:task:${task.id}`));
+        // Subprocess-aware idle detection: check if any exec sessions are still running
+        // (e.g. Codex 5.3, git clone, npm run build) — these mean the agent is NOT idle
+        const hasActiveSubprocesses = sessions.some(s => {
+          if (!s.key || !s.key.startsWith(exec:)) return false;
+          // Only count subprocesses that updated recently (within 2x the idle timeout)
+          const subAge = Date.now() - (s.updatedAt || 0);
+          return subAge < IDLE_TIMEOUT * 2;
+        });
         const idleMs = hookSession ? Date.now() - (hookSession.updatedAt || 0) : 0;
-        if (idleMs > IDLE_TIMEOUT) {
+        if (hasActiveSubprocesses && idleMs > IDLE_TIMEOUT) {
+          console.log(`[MONITOR] Task ${task.id} idle ${Math.floor(idleMs/60000)}min but has active subprocesses — extending timeout`);
+        }
+        if (idleMs > IDLE_TIMEOUT && !hasActiveSubprocesses) {
           const idleRetries = (task.idle_retries || 0) + 1;
           const MAX_IDLE_RETRIES = 3;
           const hasCompletedWork = !!(task.result || (task.pull_request_url && task.pull_request_url.length > 0));
