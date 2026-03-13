@@ -2650,6 +2650,147 @@ curl -s -X PATCH "https://lessxkxujvcmublgwdaa.supabase.co/rest/v1/agent_tasks?i
       console.log(`[REALTIME] Subscription status: ${status}`);
     });
 
+  // --- Subscribe to task_comments for @mention routing ---
+  // When a user posts a comment mentioning an agent, the dispatcher sends a hook
+  // to that specific agent with full task context so it can reply.
+  const commentsChannel = supabase
+    .channel("task-comments-mentions")
+    .on(
+      "postgres_changes",
+      {
+        event: "INSERT",
+        schema: "public",
+        table: "task_comments",
+      },
+      async (payload) => {
+        const comment = payload.new;
+
+        // Ignore agent/system comments — prevents infinite reply loops
+        if (comment.author_type === "agent" || comment.author_type === "system") return;
+
+        const body = comment.body || "";
+        if (!body.includes("@")) return;
+
+        // Parse @mentions (case-insensitive, supports hyphens/underscores)
+        const mentionMatches = body.match(/@([a-zA-Z0-9_-]+)/g) || [];
+        if (mentionMatches.length === 0) return;
+
+        const mentionedNames = [...new Set(mentionMatches.map(m => m.slice(1).toLowerCase()))];
+        console.log(`[COMMENT-MENTION] Comment ${comment.id} on task ${comment.task_id} @mentions: ${mentionedNames.join(", ")}`);
+
+        // Fetch full task context
+        const { data: task } = await supabase
+          .from("agent_tasks")
+          .select("id, title, description, status, type, priority, result, pull_request_url, assigned_agent, blocked_reason, error, acceptance_criteria")
+          .eq("id", comment.task_id)
+          .single();
+        if (!task) {
+          console.warn(`[COMMENT-MENTION] Task ${comment.task_id} not found`);
+          return;
+        }
+
+        // Fetch full comment thread for context
+        const { data: allComments } = await supabase
+          .from("task_comments")
+          .select("id, author, author_type, body, created_at, reply_to")
+          .eq("task_id", comment.task_id)
+          .order("created_at", { ascending: true })
+          .limit(50);
+
+        // Build comment thread text
+        const commentThread = (allComments || []).map(c => {
+          const time = new Date(c.created_at).toISOString().replace("T", " ").slice(0, 16);
+          return `**${c.author}** (${c.author_type}) — ${time}:\n> ${c.body.replace(/\n/g, "\n> ")}`;
+        }).join("\n\n");
+
+        const DASHBOARD_URL = process.env.DASHBOARD_URL || "https://tasks.dante.id";
+        const prUrls = Array.isArray(task.pull_request_url) ? task.pull_request_url.join(", ") : (task.pull_request_url || "none");
+
+        // Dispatch to each mentioned agent independently
+        for (const agentName of mentionedNames) {
+          const agentConfig = AGENTS[agentName];
+          if (!agentConfig) {
+            console.log(`[COMMENT-MENTION] Unknown agent: @${agentName} — skipping`);
+            continue;
+          }
+
+          const callbackUrl = `${DASHBOARD_URL}/api/tasks/${comment.task_id}/comments/reply`;
+
+          const message = `## 💬 Task Comment — You were @mentioned by ${comment.author}
+
+You have been mentioned in a task comment. Read the full context below, understand what is being asked, and reply with a helpful response.
+
+---
+
+### Task Details
+**Task:** ${task.title}
+**Task ID:** ${task.id}
+**Status:** ${task.status} | **Type:** ${task.type} | **Priority:** ${task.priority}
+**PR:** ${prUrls}
+${task.assigned_agent ? `**Assigned Agent:** ${task.assigned_agent}` : ""}
+${task.blocked_reason ? `**⚠️ Blocked Reason:** ${task.blocked_reason}` : ""}
+**Task URL:** ${DASHBOARD_URL}/task/${task.id}
+
+---
+
+### 💬 New Comment from ${comment.author}:
+${comment.body}
+
+---
+
+### Full Comment Thread:
+${commentThread || "(no previous comments)"}
+
+---
+
+### Task Description:
+${task.description || "(no description)"}
+
+${task.acceptance_criteria ? `### Acceptance Criteria:\n${task.acceptance_criteria}\n` : ""}
+${task.result ? `### Previous Result:\n${typeof task.result === "object" ? JSON.stringify(task.result, null, 2) : task.result}\n` : ""}
+${task.error ? `### Error:\n${task.error}\n` : ""}
+---
+
+## ⚡ MANDATORY: Reply to this comment
+
+You MUST reply to this comment. Use the following curl command to post your reply:
+
+\`\`\`bash
+curl -s -X POST "${callbackUrl}" \\
+  -H "Content-Type: application/json" \\
+  -d '{"body": "YOUR_REPLY_HERE", "author": "${agentName}", "comment_id": "${comment.id}"}'
+\`\`\`
+
+Replace YOUR_REPLY_HERE with your actual response.
+Do NOT skip this step — the user is waiting for your reply in the task comment thread.`;
+
+          const sessionKey = `hook:comment:${comment.task_id}:${comment.id}:${agentName}`;
+
+          try {
+            const headers = { "Content-Type": "application/json" };
+            if (agentConfig.token) headers["Authorization"] = `Bearer ${agentConfig.token}`;
+
+            const resp = await fetch(agentConfig.url, {
+              method: "POST",
+              headers,
+              body: JSON.stringify({
+                message,
+                name: "Task Comment Mention",
+                sessionKey,
+                wakeMode: "now",
+              }),
+            });
+            console.log(`[COMMENT-MENTION] Notified @${agentName} for task ${comment.task_id} (comment ${comment.id}): HTTP ${resp.status}`);
+          } catch (e) {
+            console.error(`[COMMENT-MENTION] Failed to notify @${agentName}: ${e.message}`);
+          }
+        }
+      }
+    )
+    .subscribe((status) => {
+      console.log(`[REALTIME-COMMENTS] Comment mention subscription status: ${status}`);
+    });
+
   return channel;
 }
 
