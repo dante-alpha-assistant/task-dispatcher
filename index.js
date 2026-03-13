@@ -2982,7 +2982,7 @@ async function taskMonitor() {
         // Subprocess-aware idle detection: check if any exec sessions are still running
         // (e.g. Codex 5.3, git clone, npm run build) — these mean the agent is NOT idle
         const hasActiveSubprocesses = sessions.some(s => {
-          if (!s.key || !s.key.startsWith(exec:)) return false;
+          if (!s.key || !s.key.startsWith("exec:")) return false;
           // Only count subprocesses that updated recently (within 2x the idle timeout)
           const subAge = Date.now() - (s.updatedAt || 0);
           return subAge < IDLE_TIMEOUT * 2;
