@@ -2205,7 +2205,7 @@ initLangfuse();
 
         // ===== BATCH DEPLOY COMPLETION =====
         // When a deploy task completes, mark all its batch subtasks as deployed
-        if (task && task.type === 'deploy' && task.status === 'completed' && eventType === 'UPDATE' && prev?.status !== 'completed') {
+        if (task && task.type === 'deploy' && (task.status === 'completed' || task.status === 'deployed') && eventType === 'UPDATE' && prev?.status !== 'completed' && prev?.status !== 'deployed') {
           const batchTasks = task.metadata?.batch_tasks;
           if (batchTasks && batchTasks.length > 0) {
             const taskIds = batchTasks.map(t => t.id);
