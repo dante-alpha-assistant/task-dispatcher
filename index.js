@@ -3122,7 +3122,7 @@ async function taskMonitor() {
         // Idle timeout: QA tasks get longer timeout since they need to clone, build, and test
         // Per-task-type idle timeouts (Fix: coding was 5min, now 15min)
         const IDLE_TIMEOUTS = {
-          coding: 15 * 60 * 1000,   // 15 min - clones, codex subprocess, builds, PRs
+          coding: 30 * 60 * 1000,   // 30 min - codex/claude code needs time - clones, codex subprocess, builds, PRs
           deploy: 15 * 60 * 1000,   // 15 min - merges, CI waits, ArgoCD
           ops: 10 * 60 * 1000,      // 10 min - kubectl, sealing, infra
           research: 20 * 60 * 1000, // 20 min - deep research rounds
