@@ -150,6 +150,27 @@ const AGENTS = {
   },
 };
 
+
+// Close a hook session on the agent gateway when a task is done/reset
+async function closeAgentSession(agentName, taskId, isQa = false) {
+  const agent = AGENTS[agentName];
+  if (!agent?.gatewayToken) return;
+  const gwUrl = agent.url.replace(/\/hooks\/agent$/, "");
+  const sessionKey = isQa ? `agent:main:hook:qa:${taskId}` : `agent:main:hook:task:${taskId}`;
+  try {
+    // Send a "close" message to the session to terminate it gracefully
+    const resp = await fetch(`${gwUrl}/tools/invoke`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${agent.gatewayToken}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ tool: 'sessions_send', parameters: { sessionKey, message: '[SYSTEM] Task session closed by dispatcher. Stop all work.' } }),
+      signal: AbortSignal.timeout(5000),
+    });
+    console.log(`[SESSION-CLEANUP] Closed session ${sessionKey} on ${agentName}: ${resp.status}`);
+  } catch (e) {
+    console.warn(`[SESSION-CLEANUP] Failed to close ${sessionKey} on ${agentName}: ${e.message}`);
+  }
+}
+
 // Only fetch online agents — disabled agents are never auto-assigned or dispatched to
 async function getAgentCards() {
   const { data, error } = await supabase
@@ -2143,6 +2164,13 @@ initLangfuse();
             } catch (e) {
               // Non-blocking — cost enrichment is best-effort
             }
+            // Close hook session when task leaves in_progress or qa_testing
+            if (['in_progress', 'qa_testing'].includes(prev?.status)) {
+              const cleanupAgent = prev?.assigned_agent || task.assigned_agent;
+              if (cleanupAgent) {
+                closeAgentSession(cleanupAgent, task.id, prev?.status === 'qa_testing').catch(() => {});
+              }
+            }
             recordPhaseCost(supabase, task.id, prev.status || 'unknown', {
               model: phaseModel,
               inputTokens: phaseInputTokens,
@@ -3214,6 +3242,8 @@ async function taskMonitor() {
               error: `Idle timeout: ${agentName} unresponsive after ${idleRetries} retries — moved to blocked`,
             }).eq("id", task.id);
             await logTaskActivity(task.id, 'dispatch_error', null, `Idle timeout: ${agentName} unresponsive after ${idleRetries} retries. HasCompletedWork: ${hasCompletedWork}. Moved to blocked.`, 'dispatcher');
+            // Close the stale hook session
+            closeAgentSession(agentName, task.id, isQaTesting).catch(() => {});
           } else if (hasCompletedWork && isQaTesting) {
             // QA idle but work is done — stay in qa_testing, just clear QA agent for re-dispatch
             // Don't reset to todo — that loses the completed coding work
@@ -3257,6 +3287,8 @@ async function taskMonitor() {
             if (hasCompletedWork) {
               await logTaskActivity(task.id, 'status', 'in_progress', 'qa_testing', agentWhoWorkedIdle);
             }
+            // Close the stale hook session on the agent gateway
+            closeAgentSession(agentName, task.id, isQaTesting).catch(() => {});
             const idleMsg = `Idle timeout: ${agentName} session idle >${Math.floor(idleMs/60000)}min — ${hasCompletedWork ? 'qa_testing (has work)' : 're-queued'} (retry ${idleRetries}/${MAX_IDLE_RETRIES})`;
             await logTransientError(task.id, idleMsg);
             // Post visible comment so timeline shows WHY the task bounced back
