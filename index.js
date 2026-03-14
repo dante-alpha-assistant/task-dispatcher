@@ -17,27 +17,45 @@ const MAX_QA_WORKERS = 2;
 
 // --- Vercel integration ---
 const VERCEL_TOKEN = process.env.VERCEL_TOKEN;
+// Team slug for the Vercel account (lautaro450)
+const VERCEL_TEAM_SLUG = process.env.VERCEL_TEAM_SLUG || 'lautaro450';
+
+/**
+ * Build the predictable Vercel URL for a repo as a fallback.
+ * Pattern: https://{repo-name}.vercel.app
+ * @param {string} repoFullName - e.g. "dante-alpha-assistant/castlevania-landing"
+ * @returns {string} predictable Vercel URL
+ */
+function getVercelFallbackUrl(repoFullName) {
+  const repoName = repoFullName.split('/').pop()?.toLowerCase();
+  return repoName ? `https://${repoName}.vercel.app` : null;
+}
 
 /**
  * Get the Vercel deployment URL for a GitHub repo.
  * Queries the Vercel API for the latest deployment matching the repo.
+ * Falls back to the predictable https://{repo-name}.vercel.app pattern when:
+ * - VERCEL_TOKEN is not configured
+ * - The API call fails or finds no matching deployment
  * @param {string} repoFullName - e.g. "dante-alpha-assistant/castlevania-landing"
  * @param {string} [branch] - optional branch filter (e.g. "main")
  * @returns {Promise<string|null>} The deployment URL or null
  */
 async function getVercelDeploymentUrl(repoFullName, branch) {
   if (!VERCEL_TOKEN) {
-    console.warn('[VERCEL] No VERCEL_TOKEN configured — cannot fetch deployment URL');
-    return null;
+    console.warn('[VERCEL] No VERCEL_TOKEN configured — using predictable URL fallback');
+    return getVercelFallbackUrl(repoFullName);
   }
   try {
     // First, find the Vercel project linked to this GitHub repo
-    const projectsRes = await fetch('https://api.vercel.com/v9/projects?limit=100', {
+    // Include teamId so projects scoped to the lautaro450 team are returned
+    const projectsQuery = new URLSearchParams({ limit: '100', teamId: VERCEL_TEAM_SLUG });
+    const projectsRes = await fetch(`https://api.vercel.com/v9/projects?${projectsQuery}`, {
       headers: { Authorization: `Bearer ${VERCEL_TOKEN}` },
     });
     if (!projectsRes.ok) {
-      console.error(`[VERCEL] Failed to list projects: ${projectsRes.status}`);
-      return null;
+      console.error(`[VERCEL] Failed to list projects: ${projectsRes.status} — falling back to predictable URL`);
+      return getVercelFallbackUrl(repoFullName);
     }
     const { projects } = await projectsRes.json();
     
@@ -50,28 +68,28 @@ async function getVercelDeploymentUrl(repoFullName, branch) {
     });
 
     if (!project) {
-      console.warn(`[VERCEL] No project found for repo ${repoFullName}`);
-      return null;
+      console.warn(`[VERCEL] No project found for repo ${repoFullName} — falling back to predictable URL`);
+      return getVercelFallbackUrl(repoFullName);
     }
 
-    // Get latest deployment for this project
-    const query = new URLSearchParams({ projectId: project.id, limit: '5', target: 'production' });
+    // Get latest deployment for this project (include teamId)
+    const query = new URLSearchParams({ projectId: project.id, limit: '5', target: 'production', teamId: VERCEL_TEAM_SLUG });
     if (branch) query.set('meta-githubCommitRef', branch);
     
     const deploymentsRes = await fetch(`https://api.vercel.com/v6/deployments?${query}`, {
       headers: { Authorization: `Bearer ${VERCEL_TOKEN}` },
     });
     if (!deploymentsRes.ok) {
-      console.error(`[VERCEL] Failed to list deployments: ${deploymentsRes.status}`);
-      return null;
+      console.error(`[VERCEL] Failed to list deployments: ${deploymentsRes.status} — falling back to predictable URL`);
+      return getVercelFallbackUrl(repoFullName);
     }
     const { deployments } = await deploymentsRes.json();
     
     // Get the latest ready deployment
     const readyDeploy = deployments?.find(d => d.state === 'READY') || deployments?.[0];
     if (!readyDeploy) {
-      // Try preview deployments
-      const previewQuery = new URLSearchParams({ projectId: project.id, limit: '5' });
+      // Try preview deployments (also include teamId)
+      const previewQuery = new URLSearchParams({ projectId: project.id, limit: '5', teamId: VERCEL_TEAM_SLUG });
       const previewRes = await fetch(`https://api.vercel.com/v6/deployments?${previewQuery}`, {
         headers: { Authorization: `Bearer ${VERCEL_TOKEN}` },
       });
@@ -84,16 +102,18 @@ async function getVercelDeploymentUrl(repoFullName, branch) {
           return url;
         }
       }
-      console.warn(`[VERCEL] No deployments found for project ${project.name}`);
-      return null;
+      // Fall back to predictable URL rather than returning null
+      console.warn(`[VERCEL] No deployments found for project ${project.name} — falling back to predictable URL`);
+      return getVercelFallbackUrl(repoFullName);
     }
     
-    const url = readyDeploy.url ? `https://${readyDeploy.url}` : null;
+    const url = readyDeploy.url ? `https://${readyDeploy.url}` : getVercelFallbackUrl(repoFullName);
     console.log(`[VERCEL] Found deployment for ${repoFullName}: ${url}`);
     return url;
   } catch (err) {
     console.error(`[VERCEL] Error fetching deployment URL for ${repoFullName}:`, err.message);
-    return null;
+    // Always fall back to predictable URL on error
+    return getVercelFallbackUrl(repoFullName);
   }
 }
 
@@ -2354,24 +2374,53 @@ initLangfuse();
 
         // ===== VERCEL DEPLOYMENT URL RESOLVER =====
         // When any task transitions to "deployed" with deploy_target "vercel" and no deployment_url,
-        // resolve the Vercel URL from the PR/repo info
+        // resolve the Vercel URL from the PR/repo info. Falls back to the predictable
+        // https://{repo-name}.vercel.app pattern when the Vercel API is unavailable.
         if (task?.status === 'deployed' && eventType === 'UPDATE' && prev?.status !== 'deployed' 
             && task.deploy_target === 'vercel' && !task.deployment_url) {
-          const prUrl = Array.isArray(task.pull_request_url) ? task.pull_request_url[0] : task.pull_request_url;
-          const repoMatch = prUrl?.match(/github\.com\/([^/]+\/[^/]+)/);
-          const repoName = repoMatch?.[1] || task.repository_url;
-          if (repoName) {
-            try {
-              const vercelUrl = await getVercelDeploymentUrl(repoName, 'main');
+          try {
+            // 1. Try to extract repo from PR URL
+            const prUrl = Array.isArray(task.pull_request_url) ? task.pull_request_url[0] : task.pull_request_url;
+            let repoFullName = prUrl?.match(/github\.com\/([^/]+\/[^/]+)/)?.[1];
+
+            // 2. Fall back to repository_url field
+            if (!repoFullName && task.repository_url) {
+              const m = task.repository_url.match(/github\.com\/([^/]+\/[^/]+?)(?:\.git)?$/);
+              repoFullName = m?.[1];
+            }
+
+            // 3. Fall back to task result artifacts (coding agent stores PR URLs there)
+            if (!repoFullName && task.result?.artifacts?.length) {
+              for (const artifact of task.result.artifacts) {
+                const artifactUrl = artifact?.url || artifact;
+                const m = String(artifactUrl).match(/github\.com\/([^/]+\/[^/]+)/);
+                if (m) { repoFullName = m[1]; break; }
+              }
+            }
+
+            // 4. Fall back to task result summary string
+            if (!repoFullName && task.result?.summary) {
+              const m = task.result.summary.match(/github\.com\/([^/]+\/[^/]+)/);
+              if (m) repoFullName = m[1];
+            }
+
+            if (repoFullName) {
+              // Remove trailing path segments (e.g. /pull/123)
+              repoFullName = repoFullName.replace(/\/pull\/.*/, '').replace(/\/tree\/.*/, '');
+              const vercelUrl = await getVercelDeploymentUrl(repoFullName, 'main');
               if (vercelUrl) {
                 console.log(`[VERCEL_RESOLVER] Setting deployment_url for task ${task.id}: ${vercelUrl}`);
                 await supabase.from('agent_tasks')
                   .update({ deployment_url: vercelUrl, updated_at: new Date().toISOString() })
                   .eq('id', task.id);
+              } else {
+                console.warn(`[VERCEL_RESOLVER] Could not resolve URL for task ${task.id} (repo: ${repoFullName})`);
               }
-            } catch (err) {
-              console.error(`[VERCEL_RESOLVER] Error resolving URL for task ${task.id}:`, err.message);
+            } else {
+              console.warn(`[VERCEL_RESOLVER] Cannot determine repo for task ${task.id} — no PR URL, repository_url, or result artifacts`);
             }
+          } catch (err) {
+            console.error(`[VERCEL_RESOLVER] Error resolving URL for task ${task.id}:`, err.message);
           }
         }
 
@@ -3948,7 +3997,7 @@ async function autoDeployDetector() {
     // 2. Query completed tasks (QA passed) that haven't been marked as deployed yet
     const { data: completedTasks, error } = await supabase
       .from("agent_tasks")
-      .select("id, title, status, completed_at, result, type, repository_id")
+      .select("id, title, status, completed_at, result, type, repository_id, deploy_target, pull_request_url, repository_url")
       .eq("status", "completed")
       .order("completed_at", { ascending: true });
 
@@ -3970,13 +4019,12 @@ async function autoDeployDetector() {
       if (Date.now() - completedAt < DEPLOY_GRACE_PERIOD) continue;
 
       // Determine if this task's code changes are deployed:
-      // Strategy: If the ArgoCD sync finished AFTER the task was completed,
-      // the new image (built from the task's merged PR) is live.
-      // This works because: PR merge → CI builds image → GHCR push →
-      // Image Updater detects → ArgoCD syncs → app is Synced+Healthy
+      // Strategy depends on deploy_target:
+      // - vercel: PR merged → Vercel auto-deploys — no ArgoCD involved
+      // - kubernetes (default): ArgoCD sync finished AFTER task completed
       const isCodingTask = task.type === "coding";
+      const deployTarget = task.deploy_target || "kubernetes";
       
-      // For coding tasks, check if ArgoCD synced after task completion
       // For non-coding tasks (ops, research, etc.), they don't need deploy detection —
       // mark them as deployed immediately since there's nothing to deploy
       if (!isCodingTask) {
@@ -3989,24 +4037,102 @@ async function autoDeployDetector() {
         continue;
       }
 
-      // Extract PR number or commit from task result
+      // Extract PR number, commit, and repo from task result + fields
       let commitRef = null;
       let prNumber = null;
       let repoFullName = null;
+
+      // Check pull_request_url field first (most reliable)
+      const taskPrUrl = Array.isArray(task.pull_request_url) ? task.pull_request_url[0] : task.pull_request_url;
+      if (taskPrUrl) {
+        const m = taskPrUrl.match(/github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)/);
+        if (m) { repoFullName = m[1]; prNumber = parseInt(m[2]); commitRef = `PR #${prNumber}`; }
+      }
+
       if (task.result) {
         const resultStr = typeof task.result === "string" ? task.result : JSON.stringify(task.result);
         // Match PR numbers like "PR #13" or "PR#13" or "#13 merged"
-        const prMatch = resultStr.match(/PR\s*#(\d+)/i) || resultStr.match(/#(\d+)\s*merged/i);
-        if (prMatch) {
-          prNumber = parseInt(prMatch[1]);
-          commitRef = `PR #${prNumber}`;
+        if (!prNumber) {
+          const prMatch = resultStr.match(/PR\s*#(\d+)/i) || resultStr.match(/#(\d+)\s*merged/i);
+          if (prMatch) { prNumber = parseInt(prMatch[1]); commitRef = `PR #${prNumber}`; }
         }
         // Match commit SHAs
         const shaMatch = resultStr.match(/\b([0-9a-f]{7,40})\b/);
         if (!commitRef && shaMatch) commitRef = shaMatch[1].slice(0, 7);
         // Extract repo name from result (e.g. "dante-alpha-assistant/queue-dashboard")
-        const repoMatch = resultStr.match(/(dante-alpha-assistant\/[\w-]+)/);
-        if (repoMatch) repoFullName = repoMatch[1];
+        if (!repoFullName) {
+          const repoMatch = resultStr.match(/(dante-alpha-assistant\/[\w-]+)/);
+          if (repoMatch) repoFullName = repoMatch[1];
+        }
+      }
+
+      // For Vercel-targeted coding tasks: Vercel auto-deploys when a PR is merged.
+      // We don't need ArgoCD sync — just verify the PR is merged, then mark deployed
+      // and resolve the deployment URL.
+      if (deployTarget === 'vercel') {
+        if (!prNumber) {
+          console.log(`[DEPLOY-DETECT] Task ${task.id} (vercel, "${task.title.slice(0, 40)}") no PR ref — skipping`);
+          continue;
+        }
+
+        // Resolve repo if not yet known
+        if (!repoFullName && task.repository_id) {
+          const { data: repo } = await supabase.from('agent_repositories').select('full_name').eq('id', task.repository_id).single();
+          if (repo) repoFullName = repo.full_name;
+        }
+        if (!repoFullName && task.repository_url) {
+          const m = task.repository_url.match(/github\.com\/([^/]+\/[^/]+?)(?:\.git)?$/);
+          if (m) repoFullName = m[1];
+        }
+
+        const KNOWN_REPOS = ['dante-alpha-assistant/queue-dashboard', 'dante-alpha-assistant/task-dispatcher'];
+        const reposToCheck = repoFullName ? [repoFullName] : KNOWN_REPOS;
+        let prMerged = false;
+        for (const repo of reposToCheck) {
+          try {
+            const ghResp = await fetch(`https://api.github.com/repos/${repo}/pulls/${prNumber}`, {
+              headers: { 'Authorization': `token ${process.env.GH_TOKEN}`, 'Accept': 'application/vnd.github.v3+json' },
+              signal: AbortSignal.timeout(5000),
+            });
+            if (ghResp.ok) {
+              const pr = await ghResp.json();
+              if (pr.merged && pr.merged_at) {
+                repoFullName = repo;
+                prMerged = true;
+                break;
+              } else if (pr.state === 'open') {
+                console.log(`[DEPLOY-DETECT] Task ${task.id} (vercel) PR #${prNumber} on ${repo} is open — waiting for merge`);
+                break;
+              }
+            }
+          } catch (ghErr) {
+            console.warn(`[DEPLOY-DETECT] GitHub API error for ${repo}#${prNumber}:`, ghErr.message);
+          }
+        }
+
+        if (prMerged) {
+          console.log(`[DEPLOY-DETECT] Task ${task.id} (vercel, "${task.title.slice(0, 40)}") PR merged → deployed`);
+          // Resolve the Vercel deployment URL (API or fallback to https://{repo}.vercel.app)
+          let deploymentUrl = null;
+          if (repoFullName) {
+            try {
+              deploymentUrl = await getVercelDeploymentUrl(repoFullName, 'main');
+            } catch (e) {
+              console.warn(`[DEPLOY-DETECT] Could not resolve Vercel URL for ${repoFullName}:`, e.message);
+            }
+          }
+          const updateData = { status: 'deployed', error: null };
+          if (deploymentUrl) updateData.deployment_url = deploymentUrl;
+          await supabase.from("agent_tasks").update(updateData).eq("id", task.id);
+          deployed++;
+
+          broadcast("task:status", {
+            taskId: task.id, status: "deployed", previousStatus: "completed",
+            title: task.title, environment: "vercel", commitRef,
+            deploymentUrl, timestamp: new Date().toISOString(),
+          }, task.id);
+        }
+        continue; // Done handling this Vercel task — skip ArgoCD logic below
       }
 
       // For coding tasks: MUST verify the specific PR was merged via GitHub API
