@@ -2286,6 +2286,34 @@ initLangfuse();
           }
         }
 
+        // ===== APP STATUS SYNC =====
+        // When a task with app_id transitions to 'deployed' or 'failed', sync the app status.
+        // deployed → app.status = 'live'
+        // failed   → app.status = 'failed'
+        if (task?.app_id && eventType === 'UPDATE') {
+          let newAppStatus = null;
+          if (task.status === 'deployed' && prev?.status !== 'deployed') {
+            newAppStatus = 'live';
+          } else if (task.status === 'failed' && prev?.status !== 'failed') {
+            newAppStatus = 'failed';
+          }
+          if (newAppStatus) {
+            try {
+              const { error: appSyncErr } = await supabase
+                .from('apps')
+                .update({ status: newAppStatus, updated_at: new Date().toISOString() })
+                .eq('id', task.app_id);
+              if (appSyncErr) {
+                console.warn(`[APP-STATUS] Failed to sync app ${task.app_id} → ${newAppStatus}: ${appSyncErr.message}`);
+              } else {
+                console.log(`[APP-STATUS] App ${task.app_id} → ${newAppStatus} (task ${task.id} ${task.status})`);
+              }
+            } catch (appSyncEx) {
+              console.warn(`[APP-STATUS] Error syncing app status:`, appSyncEx.message);
+            }
+          }
+        }
+
         // ===== QA COMPLETION VALIDATOR =====
         // When a coding task moves to 'completed', verify the QA actually reviewed code.
         // Revert to qa_testing if the QA agent rubber-stamped without PR review.
