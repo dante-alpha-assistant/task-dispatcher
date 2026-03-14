@@ -3014,7 +3014,7 @@ async function taskMonitor() {
     // Get ALL in_progress and assigned tasks from Supabase
     const { data: activeTasks_db, error } = await supabase
       .from("agent_tasks")
-      .select("id, title, status, assigned_agent, qa_agent, started_at, created_at, result, pull_request_url, idle_retries")
+      .select("id, title, status, assigned_agent, qa_agent, started_at, created_at, result, pull_request_url, idle_retries, task_type")
       .in("status", ["in_progress", "qa_testing"]);
 
     if (error) {
@@ -3131,7 +3131,7 @@ async function taskMonitor() {
           general: 10 * 60 * 1000,  // 10 min
           manual: 10 * 60 * 1000,   // 10 min
         };
-        const taskType = isQaTesting ? "qa" : (task.type || "general");
+        const taskType = isQaTesting ? "qa" : (task.task_type || task.type || "general");
         const IDLE_TIMEOUT = IDLE_TIMEOUTS[taskType] || 10 * 60 * 1000; // default 10 min
         const hookSession = sessions?.find(s => s.key === (isQaTesting ? `agent:main:hook:qa:${task.id}` : `agent:main:hook:task:${task.id}`));
         // Subprocess-aware idle detection: check if any exec sessions are still running
@@ -3230,7 +3230,7 @@ async function taskMonitor() {
         const startTime = task.started_at || task.created_at;
         // Use status-based timeout: QA tasks get QA timeout even if task.type is 'coding'
         const isInQa = task.status === 'qa_testing';
-        const timeout = isInQa ? QA_HARD_TIMEOUT : (task.type === 'qa' ? QA_HARD_TIMEOUT : task.type === 'coding' ? CODING_HARD_TIMEOUT : TASK_HARD_TIMEOUT);
+        const timeout = isInQa ? QA_HARD_TIMEOUT : ((task.task_type || task.type) === "qa" ? QA_HARD_TIMEOUT : (task.task_type || task.type) === "coding" ? CODING_HARD_TIMEOUT : TASK_HARD_TIMEOUT);
         const elapsed = startTime ? Date.now() - new Date(startTime).getTime() : 0;
         // Even with active session, kill after 2x the timeout (absolute safety)
         if (elapsed > timeout * 2) {
@@ -3293,7 +3293,7 @@ async function taskMonitor() {
           const sessionGoneHasWork = !!(currentTask?.result || (currentTask?.pull_request_url && currentTask.pull_request_url.length > 0));
 
           const startTime = task.started_at || task.created_at;
-          const timeout = task.type === "qa" ? QA_HARD_TIMEOUT : task.type === "coding" ? CODING_HARD_TIMEOUT : TASK_HARD_TIMEOUT;
+          const timeout = (task.task_type || task.type) === "qa" ? QA_HARD_TIMEOUT : (task.task_type || task.type) === "coding" ? CODING_HARD_TIMEOUT : TASK_HARD_TIMEOUT;
           const elapsed = startTime ? Date.now() - new Date(startTime).getTime() : 0;
 
           if (isQaTesting) {
