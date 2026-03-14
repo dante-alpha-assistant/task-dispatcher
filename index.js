@@ -2094,13 +2094,61 @@ initLangfuse();
             }
             const phaseAgent = task.assigned_agent || prev?.assigned_agent || task.qa_agent || 'system';
             traceTaskPhase(task, phase, phaseAgent);
-            // Record phase timing
+            // Record phase timing with actual usage from agent gateway
             const phaseStarted = task.started_at || task.updated_at;
             const durationMs = phaseStarted ? Date.now() - new Date(phaseStarted).getTime() : 0;
+            // Try to get actual model/token usage from the agent's session
+            let phaseModel = 'unknown';
+            let phaseInputTokens = 0;
+            let phaseOutputTokens = 0;
+            let phaseCost = 0;
+            try {
+              const costAgent = prev?.assigned_agent || task.assigned_agent;
+              const costConfig = costAgent ? AGENTS[costAgent] : null;
+              if (costConfig?.gatewayToken) {
+                const isQa = prev?.status === 'qa_testing';
+                const sessKey = isQa ? `agent:main:hook:qa:${task.id}` : `agent:main:hook:task:${task.id}`;
+                const gwUrl = costConfig.url.replace(/\/hooks\/agent$/, ""); const sessResp = await fetch(`${gwUrl}/tools/invoke`, {
+                  method: 'POST',
+                  headers: { Authorization: `Bearer ${costConfig.gatewayToken}`, 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ tool: 'sessions_list', parameters: { limit: 50, messageLimit: 0 } }),
+                  signal: AbortSignal.timeout(5000),
+                });
+                if (sessResp.ok) {
+                  const sessData = await sessResp.json();
+                  const sessText = sessData?.result?.content?.[0]?.text;
+                  if (sessText) {
+                    const parsed = JSON.parse(sessText);
+                    const sess = (parsed.sessions || []).find(s => s.key === sessKey);
+                    if (sess) {
+                      phaseModel = sess.model || 'unknown';
+                      const total = sess.totalTokens || 0;
+                      // Estimate input/output split (typically 80% input, 20% output for coding)
+                      phaseInputTokens = Math.round(total * 0.8);
+                      phaseOutputTokens = total - phaseInputTokens;
+                      // Cost estimation based on model pricing
+                      const pricing = {
+                        'claude-sonnet-4-6': { input: 3.0, output: 15.0 },
+                        'claude-opus-4-6': { input: 15.0, output: 75.0 },
+                        'kimi-k2.5': { input: 0.45, output: 2.25 },
+                      };
+                      const modelKey = phaseModel.replace(/^.*\//, '');
+                      const price = pricing[modelKey] || { input: 1.0, output: 5.0 };
+                      phaseCost = (phaseInputTokens / 1_000_000 * price.input) + (phaseOutputTokens / 1_000_000 * price.output);
+                      console.log(`[COST] Task ${task.id} phase ${prev?.status}: model=${phaseModel} tokens=${total} cost=$${phaseCost.toFixed(4)}`);
+                    }
+                  }
+                }
+              }
+            } catch (e) {
+              // Non-blocking — cost enrichment is best-effort
+            }
             recordPhaseCost(supabase, task.id, prev.status || 'unknown', {
-              model: 'unknown', // Will be enriched when agents report usage
+              model: phaseModel,
+              inputTokens: phaseInputTokens,
+              outputTokens: phaseOutputTokens,
               durationMs,
-              cost: 0,
+              cost: phaseCost,
             }).catch(() => {});
           }
         }
