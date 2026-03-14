@@ -3163,7 +3163,14 @@ async function taskMonitor() {
               qa_agent: null,
               idle_retries: idleRetries,
             }).eq("id", task.id);
-            await logTransientError(task.id, `QA idle timeout: ${agentName} session idle >${Math.floor(idleMs/60000)}min — re-queued QA (retry ${idleRetries}/${MAX_IDLE_RETRIES})`);
+            const qaIdleMsg = `QA idle timeout: ${agentName} session idle >${Math.floor(idleMs/60000)}min but work is done — clearing QA agent for re-dispatch (retry ${idleRetries}/${MAX_IDLE_RETRIES})`;
+            await logTransientError(task.id, qaIdleMsg);
+            try {
+              await supabase.from('task_comments').insert({
+                task_id: task.id, author: 'system', author_type: 'system',
+                content: `⏰ ${qaIdleMsg}`,
+              });
+            } catch(e) {}
           } else {
             // Re-check task state to avoid race conditions
             const { data: idleCurrentTask } = await supabase
@@ -3191,7 +3198,18 @@ async function taskMonitor() {
             if (hasCompletedWork) {
               await logTaskActivity(task.id, 'status', 'in_progress', 'qa_testing', agentWhoWorkedIdle);
             }
-            await logTransientError(task.id, `Idle timeout: ${agentName} session idle >${Math.floor(idleMs/60000)}min — ${hasCompletedWork ? 'qa_testing (has work)' : 're-queued'} (retry ${idleRetries}/${MAX_IDLE_RETRIES})`);
+            const idleMsg = `Idle timeout: ${agentName} session idle >${Math.floor(idleMs/60000)}min — ${hasCompletedWork ? 'qa_testing (has work)' : 're-queued'} (retry ${idleRetries}/${MAX_IDLE_RETRIES})`;
+            await logTransientError(task.id, idleMsg);
+            // Post visible comment so timeline shows WHY the task bounced back
+            try {
+              await supabase.from('task_comments').insert({
+                task_id: task.id,
+                author: 'system',
+                author_type: 'system',
+                content: `⏰ ${idleMsg}`,
+              });
+              console.log(`[AUTO-COMMENT] Posted idle timeout comment for task ${task.id}`);
+            } catch(e) { console.error(`[AUTO-COMMENT] idle comment error: ${e.message}`); }
           }
           activeTasks.delete(task.id);
           continue;
