@@ -2045,6 +2045,12 @@ initLangfuse();
         const { eventType, new: task, old: prev } = payload;
         console.log(`[EVENT] ${eventType} on task ${task?.id || prev?.id}: status=${task?.status}`);
 
+        // Guard: never process further if old status was deprecated (terminal state)
+        if (prev?.status === 'deprecated') {
+          console.log(`[GUARD] Task ${task?.id} was deprecated — ignoring transition to ${task?.status}`);
+          return;
+        }
+
         // === LANGFUSE: Track phase transitions ===
         if (eventType === 'UPDATE' && task && prev && task.status !== prev.status) {
           const phaseMap = {
@@ -2419,13 +2425,29 @@ initLangfuse();
 
 
         // Remove completed/failed tasks from active tracking
-        if (task?.status === 'qa_testing' || task?.status === 'failed' || task?.status === 'completed' || task?.status === 'deployed') {
+        if (task?.status === 'qa_testing' || task?.status === 'failed' || task?.status === 'completed' || task?.status === 'deployed' || task?.status === 'deprecated') {
           if (activeTasks.has(task.id)) {
             console.log(`[TRACKER] Task ${task.id} completed (${task.status}), removing from active tracking`);
             activeTasks.delete(task.id);
           }
           // A2A: check if parent task should be completed
           await checkParentCompletion(task);
+        }
+
+        // Handle task deprecated: treat as terminal, close session, remove from tracking
+        if (task?.status === 'deprecated' && eventType === 'UPDATE' && prev?.status !== 'deprecated') {
+          console.log(`[DEPRECATED] Task ${task.id} ("${task.title}") deprecated from ${prev?.status} — treating as terminal`);
+          // Remove from active tracking
+          if (activeTasks.has(task.id)) {
+            activeTasks.delete(task.id);
+            console.log(`[TRACKER] Task ${task.id} deprecated, removed from active tracking`);
+          }
+          // Close agent session to free the lane
+          const deprecatedAgent = prev?.assigned_agent || task.assigned_agent;
+          if (deprecatedAgent) {
+            closeAgentSession(deprecatedAgent, task.id, prev?.status === 'qa_testing').catch(() => {});
+            console.log(`[DEPRECATED] Closing session for agent ${deprecatedAgent}, task ${task.id}`);
+          }
         }
 
         // Auto-cleanup QA sessions: when task leaves qa_testing, delete the QA session on the agent
@@ -3123,7 +3145,7 @@ async function taskMonitor() {
         .select("status")
         .eq("id", task.id)
         .single();
-      if (freshTask && ["done", "failed", "completed"].includes(freshTask.status)) {
+      if (freshTask && ["done", "failed", "completed", "deprecated"].includes(freshTask.status)) {
         continue;
       }
 
