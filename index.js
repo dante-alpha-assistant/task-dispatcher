@@ -2409,13 +2409,24 @@ initLangfuse();
               commentBody += typeof task.result === 'string' ? task.result : JSON.stringify(task.result, null, 2);
             }
             if (result?.artifacts?.length) {
-              commentBody += '\n\n📎 **Artifacts:** ' + result.artifacts.join(', ');
+              commentBody += '\n\n📎 **Artifacts:** ' + result.artifacts.map(a => typeof a === 'string' ? a : (a.url || JSON.stringify(a))).join(', ');
             }
             if (result?.test_results) {
               commentBody += '\n\n🧪 **Test Results:** ' + (typeof result.test_results === 'string' ? result.test_results : JSON.stringify(result.test_results));
             }
             if (task.pull_request_url?.length) {
               commentBody += '\n\n🔗 **PR:** ' + task.pull_request_url.join(', ');
+            }
+            // Show artifact links (repos, URLs) if available
+            if (result?.artifacts?.length) {
+              const repoArtifacts = result.artifacts.filter(a => a?.type === 'github_repo' || a?.type === 'repo');
+              const otherArtifacts = result.artifacts.filter(a => a?.type !== 'github_repo' && a?.type !== 'repo');
+              if (repoArtifacts.length) {
+                commentBody += '\n📦 **Repository:** ' + repoArtifacts.map(a => a.url || a).join(', ');
+              }
+              if (otherArtifacts.length && !task.pull_request_url?.length) {
+                commentBody += '\n🔗 **Links:** ' + otherArtifacts.map(a => a.url || a).join(', ');
+              }
             } else if (task.repository_url) {
               commentBody += '\n\n📦 **Repository:** ' + task.repository_url;
             }
