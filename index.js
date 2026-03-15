@@ -2118,20 +2118,16 @@ initLangfuse();
             // Record phase timing with actual usage from agent gateway
             const phaseStarted = task.started_at || task.updated_at;
             const durationMs = phaseStarted ? Date.now() - new Date(phaseStarted).getTime() : 0;
-            // Close hook session when task leaves in_progress or qa_testing (immediate — don't delay this)
-            if (['in_progress', 'qa_testing'].includes(prev?.status)) {
-              const cleanupAgent = prev?.assigned_agent || task.assigned_agent;
-              if (cleanupAgent) {
-                closeAgentSession(cleanupAgent, task.id, prev?.status === 'qa_testing').catch(() => {});
-              }
-            }
             // Delay cost enrichment by 4s: the final Claude API call (which triggered the status change)
             // may not be tallied in sessions_list yet — wait for the gateway to flush token counts.
+            // NOTE: closeAgentSession is intentionally moved INSIDE the setTimeout so we capture
+            // token counts BEFORE closing the session (otherwise the session may archive before query).
             {
               const costTaskId = task.id;
               const costPrevStatus = prev?.status;
               const costAgent = prev?.assigned_agent || task.assigned_agent;
               const costDurationMs = durationMs;
+              const costIsSessionPhase = ['in_progress', 'qa_testing'].includes(prev?.status);
               setTimeout(async () => {
                 let phaseModel = 'unknown';
                 let phaseInputTokens = 0;
@@ -2158,18 +2154,32 @@ initLangfuse();
                       const sess = sessions.find(s => s.key === sessKey);
                       if (sess) {
                         phaseModel = sess.model || 'unknown';
-                        const total = sess.totalTokens || 0;
-                        phaseInputTokens = Math.round(total * 0.8);
-                        phaseOutputTokens = total - phaseInputTokens;
+                        // Try separate inputTokens/outputTokens fields first (OpenRouter / kimi-k2.5 reports these separately)
+                        // Fall back to totalTokens with 80/20 split approximation (Anthropic sessions)
+                        const rawInput = sess.inputTokens || (sess.usage && sess.usage.inputTokens) || 0;
+                        const rawOutput = sess.outputTokens || (sess.usage && sess.usage.outputTokens) || 0;
+                        if (rawInput > 0 || rawOutput > 0) {
+                          phaseInputTokens = rawInput;
+                          phaseOutputTokens = rawOutput;
+                        } else {
+                          const total = sess.totalTokens || 0;
+                          phaseInputTokens = Math.round(total * 0.8);
+                          phaseOutputTokens = total - phaseInputTokens;
+                        }
+                        if (phaseInputTokens === 0 && phaseOutputTokens === 0) {
+                          console.warn(`[COST] Task ${costTaskId}: session found but 0 tokens. Full session data: ${JSON.stringify(sess)}`);
+                        }
                         const pricing = {
                           'claude-sonnet-4-6': { input: 3.0, output: 15.0 },
                           'claude-opus-4-6': { input: 15.0, output: 75.0 },
                           'kimi-k2.5': { input: 0.45, output: 2.25 },
+                          'gemini-2.5-pro': { input: 1.25, output: 10.0 },
+                          'gemini-2.0-flash': { input: 0.1, output: 0.4 },
                         };
                         const modelKey = phaseModel.replace(/^.*\//, '');
                         const price = pricing[modelKey] || { input: 1.0, output: 5.0 };
                         phaseCost = (phaseInputTokens / 1_000_000 * price.input) + (phaseOutputTokens / 1_000_000 * price.output);
-                        console.log(`[COST] Task ${costTaskId} phase ${costPrevStatus}: model=${phaseModel} tokens=${total} cost=$${phaseCost.toFixed(4)}`);
+                        console.log(`[COST] Task ${costTaskId} phase ${costPrevStatus}: model=${phaseModel} in=${phaseInputTokens} out=${phaseOutputTokens} cost=$${phaseCost.toFixed(4)}`);
                       } else {
                         console.log(`[COST] Session not found: ${sessKey} (task ${costTaskId}, ${sessions.length} sessions available)`);
                       }
@@ -2189,6 +2199,10 @@ initLangfuse();
                   durationMs: costDurationMs,
                   cost: phaseCost,
                 }).catch((e) => console.error(`[COST] recordPhaseCost failed for task ${costTaskId}: ${e.message}`));
+                // Close session AFTER cost is captured to prevent session archiving before token query
+                if (costIsSessionPhase && costAgent) {
+                  closeAgentSession(costAgent, costTaskId, costPrevStatus === 'qa_testing').catch(() => {});
+                }
               }, 4000);
             }
           }
