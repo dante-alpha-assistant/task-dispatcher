@@ -2089,10 +2089,8 @@ initLangfuse();
               console.log(`[AUTO-DEPLOY] Task ${task.id} completed by app-factory — auto-deploying`);
               setTimeout(async () => {
                 try {
-                  await supabase.from('agent_tasks').update({
-                    status: 'deployed',
-                    deployed_at: new Date().toISOString(),
-                  }).eq('id', task.id);
+                  const { error: deployErr } = await supabase.from("agent_tasks").update({ status: "deployed", completed_at: new Date().toISOString() }).eq("id", task.id);
+                  if (deployErr) { console.error(); return; }
                   await logTaskActivity(task.id, 'status', 'completed', 'deployed', 'auto-deploy');
                   console.log(`[AUTO-DEPLOY] Task ${task.id} auto-deployed successfully`);
                 } catch (e) {
