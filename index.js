@@ -2089,14 +2089,22 @@ initLangfuse();
               console.log(`[AUTO-DEPLOY] Task ${task.id} completed by app-factory — auto-deploying`);
               setTimeout(async () => {
                 try {
-                  const { error: deployErr } = await supabase.from("agent_tasks").update({ status: "deployed", completed_at: new Date().toISOString() }).eq("id", task.id);
-                  if (deployErr) { console.error(); return; }
+                  // Resolve deployment URL from repo name (Vercel predictable URL)
+                  let deployUrl = task.deployment_url;
+                  if (!deployUrl && task.repository_url) {
+                    const repoName = task.repository_url.replace(/.*\//, '');
+                    deployUrl = `https://${repoName}.vercel.app`;
+                  }
+                  const updatePayload = { status: 'deployed' };
+                  if (deployUrl) updatePayload.deployment_url = deployUrl;
+                  const { error: deployErr } = await supabase.from("agent_tasks").update(updatePayload).eq("id", task.id);
+                  if (deployErr) { console.error(`[AUTO-DEPLOY] DB error: ${deployErr.message}`); return; }
                   await logTaskActivity(task.id, 'status', 'completed', 'deployed', 'auto-deploy');
-                  console.log(`[AUTO-DEPLOY] Task ${task.id} auto-deployed successfully`);
+                  console.log(`[AUTO-DEPLOY] Task ${task.id} auto-deployed: ${deployUrl || 'no URL'}`);
                 } catch (e) {
                   console.error(`[AUTO-DEPLOY] Failed to auto-deploy task ${task.id}:`, e.message);
                 }
-              }, 2000); // 2s delay to let other handlers finish
+              }, 2000);
             }
 
             // Auto-detect merge conflict failures and set rebase metadata
