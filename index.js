@@ -2089,11 +2089,16 @@ initLangfuse();
               console.log(`[AUTO-DEPLOY] Task ${task.id} completed by app-factory — auto-deploying`);
               setTimeout(async () => {
                 try {
-                  // Resolve deployment URL from repo name (Vercel predictable URL)
+                  // Resolve deployment URL via Vercel API (handles random suffixes)
                   let deployUrl = task.deployment_url;
                   if (!deployUrl && task.repository_url) {
-                    const repoName = task.repository_url.replace(/.*\//, '');
-                    deployUrl = `https://${repoName}.vercel.app`;
+                    const repoFullName = task.repository_url.replace("https://github.com/", "");
+                    try {
+                      deployUrl = await getVercelDeploymentUrl(repoFullName);
+                      console.log(`[AUTO-DEPLOY] Vercel URL for ${repoFullName}: ${deployUrl}`);
+                    } catch (e) {
+                      console.warn(`[AUTO-DEPLOY] Vercel URL lookup failed: ${e.message}`);
+                    }
                   }
                   const updatePayload = { status: 'deployed' };
                   if (deployUrl) updatePayload.deployment_url = deployUrl;
