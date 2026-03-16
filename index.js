@@ -2089,16 +2089,25 @@ initLangfuse();
               console.log(`[AUTO-DEPLOY] Task ${task.id} completed by app-factory — auto-deploying`);
               setTimeout(async () => {
                 try {
-                  // Resolve deployment URL via Vercel API (handles random suffixes)
+                  // Resolve deployment URL: 1) app record (real URL), 2) Vercel API fallback
                   let deployUrl = task.deployment_url;
+                  if (!deployUrl && task.app_id) {
+                    try {
+                      const { data: appRec } = await supabase.from('apps')
+                        .select('deployment_url, vercel_preview_url')
+                        .eq('id', task.app_id).single();
+                      deployUrl = appRec?.deployment_url || appRec?.vercel_preview_url;
+                      if (deployUrl) console.log(`[AUTO-DEPLOY] URL from app record: ${deployUrl}`);
+                    } catch (e) {
+                      console.warn(`[AUTO-DEPLOY] App lookup failed: ${e.message}`);
+                    }
+                  }
                   if (!deployUrl && task.repository_url) {
                     const repoFullName = task.repository_url.replace("https://github.com/", "");
                     try {
                       deployUrl = await getVercelDeploymentUrl(repoFullName);
-                      console.log(`[AUTO-DEPLOY] Vercel URL for ${repoFullName}: ${deployUrl}`);
-                    } catch (e) {
-                      console.warn(`[AUTO-DEPLOY] Vercel URL lookup failed: ${e.message}`);
-                    }
+                      if (deployUrl) console.log(`[AUTO-DEPLOY] Vercel URL: ${deployUrl}`);
+                    } catch (e) {}
                   }
                   const updatePayload = { status: 'deployed' };
                   if (deployUrl) updatePayload.deployment_url = deployUrl;
