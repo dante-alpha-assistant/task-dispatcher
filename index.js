@@ -2083,6 +2083,24 @@ initLangfuse();
           };
           const phase = phaseMap[task.status];
           if (phase) {
+            
+            // Auto-deploy: app-factory tasks skip manual deploy step
+            if (task.status === 'completed' && task.dispatched_by === 'app-factory') {
+              console.log(`[AUTO-DEPLOY] Task ${task.id} completed by app-factory — auto-deploying`);
+              setTimeout(async () => {
+                try {
+                  await supabase.from('agent_tasks').update({
+                    status: 'deployed',
+                    deployed_at: new Date().toISOString(),
+                  }).eq('id', task.id);
+                  await logTaskActivity(task.id, 'status', 'completed', 'deployed', 'auto-deploy');
+                  console.log(`[AUTO-DEPLOY] Task ${task.id} auto-deployed successfully`);
+                } catch (e) {
+                  console.error(`[AUTO-DEPLOY] Failed to auto-deploy task ${task.id}:`, e.message);
+                }
+              }, 2000); // 2s delay to let other handlers finish
+            }
+
             // Auto-detect merge conflict failures and set rebase metadata
             if (task.status === "failed") {
               detectAndSetRebaseMetadata(task).catch(() => {});
