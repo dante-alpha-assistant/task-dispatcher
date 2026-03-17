@@ -2352,17 +2352,6 @@ initLangfuse();
         // The coding agent is done — assigned_agent should reflect current owner (nobody until scheduler assigns QA agent)
         if (task && task.status === 'qa_testing' && eventType === 'UPDATE' && prev?.status && prev.status !== task.status) {
           // App-factory tasks skip QA — auto-advance to completed (auto-deploy will pick it up from there)
-          if (task.dispatched_by === 'app-factory') {
-            console.log(`[AUTO-QA-SKIP] Task ${task.id} is app-factory — skipping QA, advancing to completed`);
-            await supabase.from('agent_tasks').update({
-              status: 'completed',
-              assigned_agent: null,
-              qa_agent: null,
-              completed_at: new Date().toISOString(),
-            }).eq('id', task.id);
-            await logTaskActivity(task.id, 'status', 'qa_testing', 'completed', 'auto-qa-skip');
-            return; // Skip normal QA flow
-          }
           if (task.assigned_agent) {
             console.log(`[UNASSIGN] Task ${task.id} → qa_testing, clearing assigned_agent (was: ${task.assigned_agent}), resetting started_at for QA timeout`);
             await supabase
