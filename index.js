@@ -494,7 +494,7 @@ async function preflightAuthCheck(agentName) {
   }
 }
 
-const SCHEDULER_INTERVAL = 30_000; // 30 seconds
+const SCHEDULER_INTERVAL = 10_000; // 10 seconds (was 30s)
 const FACTORY_POLL_INTERVAL = 15_000; // 15 seconds
 const FACTORY_MAX_WAIT = 10 * 60 * 1000; // 10 minutes
 
@@ -2064,6 +2064,24 @@ initLangfuse();
       async (payload) => {
         const { eventType, new: task, old: prev } = payload;
         console.log(`[EVENT] ${eventType} on task ${task?.id || prev?.id}: status=${task?.status}`);
+
+        // Event-driven fast dispatch: trigger scheduler immediately on new todo tasks
+        // or when a task becomes available (completed → unblocks dependents)
+        const shouldFastDispatch = (
+          (eventType === 'INSERT' && task?.status === 'todo') ||
+          (eventType === 'UPDATE' && task?.status === 'todo' && prev?.status !== 'todo') ||
+          (eventType === 'UPDATE' && task?.status === 'completed' && prev?.status !== 'completed') ||
+          (eventType === 'UPDATE' && task?.status === 'deployed' && prev?.status !== 'deployed') ||
+          (eventType === 'UPDATE' && task?.status === 'qa_testing' && prev?.status !== 'qa_testing')
+        );
+        if (shouldFastDispatch && !global._fastDispatchPending) {
+          global._fastDispatchPending = true;
+          setTimeout(() => {
+            global._fastDispatchPending = false;
+            console.log(`[FAST-DISPATCH] Triggered by ${eventType} on ${task?.id?.slice(0,8)} (status=${task?.status})`);
+            scheduler().catch(e => console.error('[FAST-DISPATCH] Error:', e.message));
+          }, 2000); // 2s debounce — lets DB settle
+        }
 
         // Guard: never process further if old status was deprecated (terminal state)
         if (prev?.status === 'deprecated') {
@@ -3736,7 +3754,7 @@ async function scheduler() {
 
     // Fetch todo tasks that don't have an agent assigned yet
     // Cooldown: skip tasks updated in last 30s to prevent assign/clear loops
-    const cooldownTime = new Date(Date.now() - 30000).toISOString();
+    const cooldownTime = new Date(Date.now() - 10000).toISOString();
     const { data: todoTasks, error: todoErr } = await supabase
       .from("agent_tasks")
       .select("*")
