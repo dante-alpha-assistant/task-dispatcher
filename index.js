@@ -2209,6 +2209,50 @@ initLangfuse();
               }, 5000);
             }
 
+            // === DEPENDENCY CASCADE: when a task completes/deploys, immediately dispatch dependents ===
+            if (task.status === 'completed' || task.status === 'deployed') {
+              (async () => {
+                try {
+                  // Find tasks that depend_on this task (incoming depends_on = this task blocks them)
+                  const { data: dependents } = await supabase
+                    .from('task_relationships')
+                    .select('source_task_id')
+                    .eq('target_task_id', task.id)
+                    .eq('relationship_type', 'depends_on');
+
+                  if (dependents && dependents.length > 0) {
+                    const depIds = dependents.map(d => d.source_task_id);
+                    // For each dependent, check if ALL its deps are now met
+                    for (const depId of depIds) {
+                      const depsMet = await areDependenciesMet(depId);
+                      if (depsMet) {
+                        // Check if the task is in todo (ready to dispatch)
+                        const { data: depTask } = await supabase
+                          .from('agent_tasks')
+                          .select('id, title, status')
+                          .eq('id', depId)
+                          .single();
+                        if (depTask && depTask.status === 'todo') {
+                          console.log(`[CASCADE] Task ${task.id.slice(0,8)} ${task.status} → unblocked dependent ${depId.slice(0,8)} ("${depTask.title.slice(0,40)}") — triggering fast dispatch`);
+                        }
+                      }
+                    }
+                    // Trigger scheduler immediately to pick up newly-unblocked tasks
+                    if (!global._fastDispatchPending) {
+                      global._fastDispatchPending = true;
+                      setTimeout(() => {
+                        global._fastDispatchPending = false;
+                        console.log(`[CASCADE] Fast dispatch triggered by ${task.id.slice(0,8)} completing`);
+                        scheduler().catch(e => console.error('[CASCADE] Error:', e.message));
+                      }, 1000);
+                    }
+                  }
+                } catch (e) {
+                  console.error(`[CASCADE] Error checking dependents for ${task.id}: ${e.message}`);
+                }
+              })();
+            }
+
             // Auto-detect merge conflict failures and set rebase metadata
             if (task.status === "failed") {
               detectAndSetRebaseMetadata(task).catch(() => {});
