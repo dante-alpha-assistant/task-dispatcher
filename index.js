@@ -2084,41 +2084,111 @@ initLangfuse();
           const phase = phaseMap[task.status];
           if (phase) {
             
-            // Auto-deploy: app-factory tasks skip manual deploy step
-            if (task.status === 'completed' && task.dispatched_by === 'app-factory') {
-              console.log(`[AUTO-DEPLOY] Task ${task.id} completed by app-factory — auto-deploying`);
+            // Auto-deploy: when an app-factory task completes, check if ALL sibling tasks are done
+            // If so, create a batch deploy task (same as "Deploy All") to merge PRs properly
+            if (task.status === 'completed' && task.dispatched_by === 'app-factory' && task.app_id) {
+              console.log(`[AUTO-DEPLOY] Task ${task.id} completed by app-factory — checking siblings`);
               setTimeout(async () => {
                 try {
-                  // Resolve deployment URL: 1) app record (real URL), 2) Vercel API fallback
-                  let deployUrl = task.deployment_url;
-                  if (!deployUrl && task.app_id) {
-                    try {
-                      const { data: appRec } = await supabase.from('apps')
-                        .select('deployment_url, vercel_preview_url')
-                        .eq('id', task.app_id).single();
-                      deployUrl = appRec?.deployment_url || appRec?.vercel_preview_url;
-                      if (deployUrl) console.log(`[AUTO-DEPLOY] URL from app record: ${deployUrl}`);
-                    } catch (e) {
-                      console.warn(`[AUTO-DEPLOY] App lookup failed: ${e.message}`);
-                    }
+                  const { data: siblings, error: sibErr } = await supabase
+                    .from('agent_tasks')
+                    .select('id, title, status, pull_request_url, repository_url, deploy_target, type')
+                    .eq('app_id', task.app_id)
+                    .eq('dispatched_by', 'app-factory')
+                    .neq('type', 'deploy');
+
+                  if (sibErr) { console.error(`[AUTO-DEPLOY] Sibling fetch error: ${sibErr.message}`); return; }
+                  if (!siblings || siblings.length === 0) return;
+
+                  const completedTasks = siblings.filter(t => t.status === 'completed');
+                  const pendingTasks = siblings.filter(t => !['completed','deployed','deploying','failed'].includes(t.status));
+
+                  console.log(`[AUTO-DEPLOY] App ${task.app_id}: ${completedTasks.length} completed, ${pendingTasks.length} pending, ${siblings.length} total`);
+
+                  if (pendingTasks.length > 0 || completedTasks.length === 0) {
+                    console.log(`[AUTO-DEPLOY] Not all tasks done yet — waiting (${pendingTasks.length} pending)`);
+                    return;
                   }
-                  if (!deployUrl && task.repository_url) {
-                    const repoFullName = task.repository_url.replace("https://github.com/", "");
-                    try {
-                      deployUrl = await getVercelDeploymentUrl(repoFullName);
-                      if (deployUrl) console.log(`[AUTO-DEPLOY] Vercel URL: ${deployUrl}`);
-                    } catch (e) {}
+
+                  // Guard: deploy task already exists for this app?
+                  const { data: existingDeploy } = await supabase
+                    .from('agent_tasks')
+                    .select('id, status')
+                    .eq('app_id', task.app_id)
+                    .eq('type', 'deploy')
+                    .in('status', ['todo', 'in_progress', 'deploying']);
+                  
+                  if (existingDeploy && existingDeploy.length > 0) {
+                    console.log(`[AUTO-DEPLOY] Deploy task already exists for app ${task.app_id} — skipping`);
+                    return;
                   }
-                  const updatePayload = { status: 'deployed' };
-                  if (deployUrl) updatePayload.deployment_url = deployUrl;
-                  const { error: deployErr } = await supabase.from("agent_tasks").update(updatePayload).eq("id", task.id);
-                  if (deployErr) { console.error(`[AUTO-DEPLOY] DB error: ${deployErr.message}`); return; }
-                  await logTaskActivity(task.id, 'status', 'completed', 'deployed', 'auto-deploy');
-                  console.log(`[AUTO-DEPLOY] Task ${task.id} auto-deployed: ${deployUrl || 'no URL'}`);
+
+                  const getPrUrl = (t) => Array.isArray(t.pull_request_url) ? t.pull_request_url[0] : t.pull_request_url;
+                  const deployable = completedTasks.filter(t => getPrUrl(t));
+
+                  if (deployable.length === 0) {
+                    console.warn(`[AUTO-DEPLOY] All tasks completed but none have PRs`);
+                    return;
+                  }
+
+                  const byRepo = {};
+                  for (const t of deployable) {
+                    const prUrl = getPrUrl(t);
+                    const match = prUrl ? prUrl.match(/github\.com\/([^/]+\/[^/]+)\/pull/) : null;
+                    const repo = match ? match[1] : t.repository_url || 'unknown';
+                    if (!byRepo[repo]) byRepo[repo] = [];
+                    byRepo[repo].push({
+                      id: t.id, title: t.title, pr_url: prUrl,
+                      pr_number: prUrl ? (prUrl.match(/\/pull\/(\d+)/) || [])[1] : null,
+                      deploy_target: t.deploy_target || 'vercel',
+                    });
+                  }
+
+                  const { data: deployTask, error: createErr } = await supabase
+                    .from('agent_tasks')
+                    .insert({
+                      title: `Deploy — ${deployable.length} PRs for app ${task.app_id.slice(0,8)} [${new Date().toISOString().slice(0,16)}]`,
+                      type: 'deploy',
+                      priority: 'urgent',
+                      status: 'todo',
+                      app_id: task.app_id,
+                      deploy_target: deployable[0].deploy_target || 'vercel',
+                      dispatched_by: 'app-factory',
+                      repository_url: deployable[0].repository_url,
+                      description: 'Merge and deploy ' + deployable.length + ' PRs sequentially:\n\n' + deployable.map(t => '- ' + t.title + ' (' + getPrUrl(t) + ')').join('\n'),
+                      metadata: {
+                        batch_tasks: deployable.map(t => ({ id: t.id, title: t.title, pr_url: getPrUrl(t) })),
+                        repos: byRepo,
+                        strategy: 'sequential_rebase',
+                      },
+                    })
+                    .select()
+                    .single();
+
+                  if (createErr) { console.error(`[AUTO-DEPLOY] Deploy task create error: ${createErr.message}`); return; }
+
+                  const relationships = deployable.map(t => ({
+                    source_task_id: t.id,
+                    target_task_id: deployTask.id,
+                    relationship_type: 'deployed_by',
+                    created_by: 'auto-deploy',
+                  }));
+                  await supabase.from('task_relationships').insert(relationships);
+
+                  await supabase.from('agent_tasks')
+                    .update({ status: 'deploying', updated_at: new Date().toISOString() })
+                    .in('id', deployable.map(t => t.id));
+
+                  for (const t of deployable) {
+                    await logTaskActivity(t.id, 'status', 'completed', 'deploying', 'auto-deploy');
+                  }
+
+                  console.log(`[AUTO-DEPLOY] Created deploy task ${deployTask.id} for ${deployable.length} PRs`);
+                  await logTaskActivity(deployTask.id, 'status', null, 'todo', 'auto-deploy');
                 } catch (e) {
-                  console.error(`[AUTO-DEPLOY] Failed to auto-deploy task ${task.id}:`, e.message);
+                  console.error(`[AUTO-DEPLOY] Error: ${e.message}`);
                 }
-              }, 2000);
+              }, 5000);
             }
 
             // Auto-detect merge conflict failures and set rebase metadata
