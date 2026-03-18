@@ -2123,6 +2123,14 @@ initLangfuse();
 
                   console.log(`[AUTO-DEPLOY] App ${task.app_id}: ${completedTasks.length} completed, ${pendingTasks.length} pending, ${siblings.length} total`);
 
+                  // Fetch app-level deploy_target (authoritative source)
+                  let appDeployTarget = 'vercel';
+                  if (task.app_id) {
+                    const { data: appData } = await supabase.from('apps').select('deploy_target').eq('id', task.app_id).single();
+                    if (appData?.deploy_target) appDeployTarget = appData.deploy_target;
+                    console.log(`[AUTO-DEPLOY] App deploy_target: ${appDeployTarget}`);
+                  }
+
                   if (pendingTasks.length > 0 || completedTasks.length === 0) {
                     console.log(`[AUTO-DEPLOY] Not all tasks done yet — waiting (${pendingTasks.length} pending)`);
                     return;
@@ -2158,7 +2166,7 @@ initLangfuse();
                     byRepo[repo].push({
                       id: t.id, title: t.title, pr_url: prUrl,
                       pr_number: prUrl ? (prUrl.match(/\/pull\/(\d+)/) || [])[1] : null,
-                      deploy_target: t.deploy_target || 'vercel',
+                      deploy_target: appDeployTarget,
                     });
                   }
 
@@ -2170,7 +2178,7 @@ initLangfuse();
                       priority: 'urgent',
                       status: 'todo',
                       app_id: task.app_id,
-                      deploy_target: deployable[0].deploy_target || 'vercel',
+                      deploy_target: appDeployTarget,
                       dispatched_by: 'app-factory',
                       repository_url: deployable[0].repository_url,
                       description: 'Merge and deploy ' + deployable.length + ' PRs sequentially:\n\n' + deployable.map(t => '- ' + t.title + ' (' + getPrUrl(t) + ')').join('\n'),
