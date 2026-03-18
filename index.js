@@ -168,6 +168,11 @@ const AGENTS = {
     token: process.env.BETA_WORKER_HOOKS_TOKEN || "beta-worker-hooks-tok-2026",
     gatewayToken: process.env.BETA_WORKER_GATEWAY_TOKEN || "beta-worker-gw-tok-2026",
   },
+  "setup-agent": {
+    url: process.env.SETUP_AGENT_HOOKS_URL || `http://setup-agent.agents.svc.cluster.local:18789/hooks/agent`,
+    token: process.env.SETUP_AGENT_HOOKS_TOKEN || "setup-agent-hooks-tok-2026",
+    gatewayToken: process.env.SETUP_AGENT_GATEWAY_TOKEN || "setup-agent-gw-tok-2026",
+  },
 };
 
 
