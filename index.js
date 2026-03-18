@@ -2490,6 +2490,35 @@ initLangfuse();
           }
         }
 
+        // 🔒 REPO SCOPE GUARD: validate PR repo against app's allowed repos
+        if (task && task.status === 'qa_testing' && eventType === 'UPDATE' && prev?.status === 'in_progress' && task.app_id) {
+          const prUrl = Array.isArray(task.pull_request_url) ? task.pull_request_url[0] : task.pull_request_url;
+          if (prUrl) {
+            const prRepoMatch = prUrl.match(/github\.com\/([^/]+\/[^/]+)/);
+            if (prRepoMatch) {
+              const prRepo = prRepoMatch[1].replace(/\.git$/, '').replace(/\/pull\/.*$/, '');
+              const repoAppCtx = await fetchAppContext(task.id, task.app_id);
+              if (repoAppCtx && repoAppCtx.repos && repoAppCtx.repos.length > 0) {
+                const normalizedAllowed = repoAppCtx.repos.map(r => r.toLowerCase().replace(/\.git$/, ''));
+                if (!normalizedAllowed.includes(prRepo.toLowerCase())) {
+                  console.error(`[REPO-GUARD] ❌ Task ${task.id} PR targets repo "${prRepo}" which is NOT in app "${repoAppCtx.name}" allowed repos: ${repoAppCtx.repos.join(', ')}`);
+                  await supabase.from('agent_tasks').update({
+                    status: 'in_progress',
+                    error: `Cross-repo violation: PR targets "${prRepo}" but app "${repoAppCtx.name}" only allows: ${repoAppCtx.repos.join(', ')}. Fix the PR to target an allowed repo.`,
+                  }).eq('id', task.id);
+                  await supabase.from('task_comments').insert({
+                    task_id: task.id,
+                    author: 'dispatcher',
+                    body: `🔒 **Repo Scope Violation** — PR targets \`${prRepo}\` but this task is scoped to app **${repoAppCtx.name}** (allowed: ${repoAppCtx.repos.map(r => '`' + r + '`').join(', ')}). Reverted to in_progress.`,
+                  });
+                  return;
+                }
+                console.log(`[REPO-GUARD] ✅ Task ${task.id} PR repo "${prRepo}" is in app "${repoAppCtx.name}" allowed repos`);
+              }
+            }
+          }
+        }
+
         // Dependency check on qa_testing transition
         if (task && task.status === 'qa_testing' && eventType === 'UPDATE' && prev?.status && prev.status !== task.status) {
           const depsResult = await areDependenciesMet(task.id, { detailed: true });
@@ -4859,9 +4888,17 @@ fs.writeFileSync('/root/.openclaw/workspace/skills/coding-task/SKILL.md', \`# co
 7. Create PR: gh pr create --title "{task title}" --body "Task: {task_id}" --base main
 8. Update task status with the curl command from the dispatch payload
 
+## App Scope (CRITICAL)
+If the task payload contains an app_id and allowed repos, you MUST:
+- ONLY clone and modify repos listed in the allowed repos
+- NEVER push to any repo outside the allowed list
+- If no repo is specified but app has repos, use the first allowed repo
+- Cross-repo pushes will be REJECTED by the server-side repo guard
+
 ## NEVER:
 - Edit files without cloning the repo first
 - Commit to main directly
+- Push to repos not listed in the app's allowed repos
 - Mark done if manual steps remain — set status to blocked instead
 \`);
 
