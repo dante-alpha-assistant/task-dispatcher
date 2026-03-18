@@ -237,8 +237,19 @@ function buildAppScopeSection(appContext) {
   if (appContext.description) {
     section += `\n- **Description:** ${appContext.description}`;
   }
-  section += `
+  if (repos.length > 0) {
+    section += `
 
+### 📂 Clone These Repos FIRST
+Before starting any work, clone all app repos to understand the codebase:
+\`\`\`bash
+${repos.map(r => `git clone https://x-access-token:\${GH_TOKEN}@github.com/${r}.git /tmp/${r.split('/').pop()}`).join('\n')}
+\`\`\`
+**For research tasks:** Read the codebase thoroughly — architecture, dependencies, config, schemas, env vars. Code is the PRIMARY source of truth.
+**For coding tasks:** Work exclusively in these repos. No other repos.
+`;
+  }
+  section += `
 ⚠️ **CRITICAL:** Any push to a repo NOT in the allowed list above is a cross-repo contamination incident and a HARD FAILURE.
 `;
   return section;
