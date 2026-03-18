@@ -2464,6 +2464,24 @@ initLangfuse();
           }
         }
 
+        // PR Guard: coding tasks CANNOT move to qa_testing without a pull_request_url
+        if (task && task.status === 'qa_testing' && eventType === 'UPDATE' && prev?.status === 'in_progress') {
+          const prUrl = Array.isArray(task.pull_request_url) ? task.pull_request_url[0] : task.pull_request_url;
+          if (task.type === 'coding' && !prUrl) {
+            console.log(`[PR-GUARD] Task ${task.id} ("${task.title}") is coding type but has NO PR — rejecting to in_progress`);
+            await supabase.from('agent_tasks').update({
+              status: 'in_progress',
+              error: 'PR required: coding tasks must create a pull request before completing. Create a PR and update pull_request_url.',
+            }).eq('id', task.id);
+            await supabase.from('task_comments').insert({
+              task_id: task.id,
+              author: 'dispatcher',
+              body: '⚠️ **PR Required** — This coding task was marked complete without a pull request. Reverted to in_progress. The agent must create a PR and set pull_request_url before completing.',
+            });
+            return; // Block the transition
+          }
+        }
+
         // Dependency check on qa_testing transition
         if (task && task.status === 'qa_testing' && eventType === 'UPDATE' && prev?.status && prev.status !== task.status) {
           const depsResult = await areDependenciesMet(task.id, { detailed: true });
