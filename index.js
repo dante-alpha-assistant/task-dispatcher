@@ -5,6 +5,7 @@ import { startMergeQueue } from "./merge-queue.js";
 import { initLangfuse, traceTaskPhase, logGeneration, recordPhaseCost, flushLangfuse } from "./langfuse.js";
 import { detectBlockerPattern, buildBlockerMetadata } from "./blocker-patterns.js";
 import { classifyError, getErrorCategories } from "./error-classifier.js";
+import { resolveAppCredentials } from "./credential-resolver.js";
 
 // K8s client setup
 const kc = new k8s.KubeConfig();
@@ -1325,17 +1326,26 @@ async function dispatchToAgent(task) {
   const appContext = await fetchAppContext(task.id, task.app_id);
 
   // Pre-flight credential check (BLOCKING) — only for app-scoped tasks
+  let appCredentials = {};
   if (appContext) {
-    const agentCreds = await getAgentCredentials(agentName);
-    const credCheck = checkAgentCredentials(appContext, agentCreds, 'coding');
-    if (!credCheck.ok) {
-      const credMsg = `[DISPATCH] Agent ${agentName} missing required credentials for app "${appContext.name}": ${credCheck.missing.join(', ')}`;
+    // Use new app-level credential resolution
+    const credentialResolution = await resolveAppCredentials(task.app_id, task.type || 'coding');
+    
+    if (!credentialResolution.ok) {
+      const credMsg = `[DISPATCH] App "${appContext.name}" missing required credentials: ${credentialResolution.missing.join(', ')}`;
       console.warn(credMsg);
-      // Unassign this agent so scheduler can try another
-      await supabase.from('agent_tasks').update({ assigned_agent: null, started_at: null }).eq('id', task.id);
+      // Block the task instead of unassigning - this is an app configuration issue
+      await supabase.from('agent_tasks').update({ 
+        status: 'blocked',
+        blocked_reason: `Missing app credentials: ${credentialResolution.missing.join(', ')}`,
+        error: credMsg 
+      }).eq('id', task.id);
       await logTransientError(task.id, credMsg);
       return;
     }
+    
+    appCredentials = credentialResolution.k8sSecrets;
+    console.log(`[DISPATCH] App "${appContext.name}" credentials resolved: ${Object.keys(appCredentials).join(', ')}`);
   }
 
   const taskPayload = JSON.stringify({
@@ -4042,22 +4052,30 @@ async function scheduler() {
       };
       const validCaps = CAPABILITY_ALIASES[requiredCapability] || [requiredCapability];
 
-      // Pre-flight credential check: fetch app context and filter agents by credentials
+      // Pre-flight credential check: fetch app context and validate app-level credentials
       let schedulerAppContext = null;
+      let hasAppCredentials = true;
       if (task.app_id) {
         schedulerAppContext = await fetchAppContext(task.id, task.app_id);
+        if (schedulerAppContext) {
+          // Use new app-level credential resolution
+          const credType = isQaTask ? 'qa' : (task.type || 'coding');
+          const credentialResolution = await resolveAppCredentials(task.app_id, credType);
+          
+          if (!credentialResolution.ok) {
+            console.log(`[SCHEDULER] App "${schedulerAppContext.name}" missing credentials for task ${task.id}: ${credentialResolution.missing.join(', ')}`);
+            hasAppCredentials = false;
+          }
+        }
       }
-      const credType = isQaTask ? 'qa' : 'coding';
 
-      // Score agents: must have required capability, then rank by capacity + priority affinity
+      // Score agents: must have required capability and app must have required credentials
       const candidates = freeAgents
         .filter(a => a.remaining > 0 && a.capabilities.some(c => validCaps.includes(c)) )
         .filter(a => {
-          // Credential check: if task is app-scoped, agent must have required credentials
-          if (!schedulerAppContext) return true;
-          const credCheck = checkAgentCredentials(schedulerAppContext, a.available_credentials, credType);
-          if (!credCheck.ok) {
-            console.log(`[SCHEDULER] Skipping ${a.name} for task ${task.id} — missing credentials for app "${schedulerAppContext.name}": ${credCheck.missing.join(', ')}`);
+          // App-level credential check: if app doesn't have required credentials, skip all agents
+          if (!hasAppCredentials) {
+            console.log(`[SCHEDULER] Skipping ${a.name} for task ${task.id} — app missing required credentials`);
             return false;
           }
           return true;
@@ -4072,16 +4090,19 @@ async function scheduler() {
 
       const bestCandidate = candidates[0];
       if (!bestCandidate && !isQaTask) {
-        // Check if failure is due to credentials specifically
-        const capableButMissingCreds = schedulerAppContext ? freeAgents
-          .filter(a => a.remaining > 0 && a.capabilities.some(c => validCaps.includes(c)))
-          .filter(a => !checkAgentCredentials(schedulerAppContext, a.available_credentials, credType).ok)
-          : [];
-        if (capableButMissingCreds.length > 0) {
-          const required = credType === 'qa'
-            ? (schedulerAppContext.required_qa_credentials || [])
-            : (schedulerAppContext.required_credentials || []);
-          console.warn(`[DISPATCH] No agent has required credentials for app "${schedulerAppContext.name}": missing ${required.join(', ')}. Capable agents without creds: ${capableButMissingCreds.map(a => a.name).join(', ')}`);
+        if (!hasAppCredentials && schedulerAppContext) {
+          // Block the task due to missing app credentials
+          const credType = task.type || 'coding';
+          const credentialResolution = await resolveAppCredentials(task.app_id, credType);
+          const required = credentialResolution.missing || [];
+          
+          console.warn(`[SCHEDULER] Blocking task ${task.id} - app "${schedulerAppContext.name}" missing credentials: ${required.join(', ')}`);
+          await supabase.from('agent_tasks').update({ 
+            status: 'blocked',
+            blocked_reason: `App missing required credentials: ${required.join(', ')}`,
+            error: `Configure credentials for app "${schedulerAppContext.name}": ${required.join(', ')}`
+          }).eq('id', task.id);
+          await logTransientError(task.id, `App credential configuration required: ${required.join(', ')}`);
         } else {
           console.log(`[SCHEDULER] No candidate for task ${task.id} ("${task.title.substring(0,30)}") type=${task.type} required=${requiredCapability} last_failed=${task.last_failed_agent} agents=${freeAgents.map(a=>a.name+":"+a.capabilities.join(",")).join("|")}`);
         }
