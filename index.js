@@ -1558,6 +1558,20 @@ EXECUTING MIGRATIONS (MANDATORY — DO NOT SKIP):
 
 Do NOT skip this step. The task board at tasks.dante.id must reflect your work.`;
 
+  // Prepare hook payload with app credentials if available
+  const hookPayload = {
+    message,
+    name: "Task Dispatcher",
+    sessionKey: `hook:task:${task.id}`,
+    wakeMode: "now",
+  };
+
+  // Add app-level credentials to hook payload if resolved
+  if (Object.keys(appCredentials).length > 0) {
+    hookPayload.appCredentials = appCredentials;
+    console.log(`[DISPATCH] Including app credentials for ${appContext?.name}: ${Object.keys(appCredentials).join(', ')}`);
+  }
+
   try {
     const resp = await fetch(agent.url, {
       method: "POST",
@@ -1565,12 +1579,7 @@ Do NOT skip this step. The task board at tasks.dante.id must reflect your work.`
         Authorization: `Bearer ${agent.token}`,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({
-        message,
-        name: "Task Dispatcher",
-        sessionKey: `hook:task:${task.id}`,
-        wakeMode: "now",
-      }),
+      body: JSON.stringify(hookPayload),
     });
 
     if (resp.ok) {
