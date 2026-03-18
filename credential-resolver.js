@@ -132,6 +132,39 @@ export function formatCredentialsForAgent(k8sSecrets) {
 }
 
 /**
+ * Fetch actual credential values from K8s secrets (for direct injection)
+ * @param {object} k8sSecrets - K8s secret references from resolveAppCredentials
+ * @returns {Promise<object>} Object with credential names and actual values
+ */
+export async function fetchCredentialValues(k8sSecrets) {
+  const { execSync } = await import('child_process');
+  const credentials = {};
+
+  for (const [credName, secretRef] of Object.entries(k8sSecrets)) {
+    try {
+      console.log(`[CREDENTIAL-RESOLVER] Fetching ${credName} from ${secretRef.secretName}/${secretRef.secretKey}`);
+      
+      // Fetch the actual secret value using kubectl
+      const secretValue = execSync(
+        `kubectl get secret ${secretRef.secretName} -n agents -o jsonpath='{.data.${secretRef.secretKey}}' | base64 -d`,
+        { encoding: 'utf8', timeout: 10000 }
+      ).trim();
+
+      if (secretValue) {
+        credentials[credName] = secretValue;
+        console.log(`[CREDENTIAL-RESOLVER] ✅ Fetched ${credName} (${secretValue.length} chars)`);
+      } else {
+        console.warn(`[CREDENTIAL-RESOLVER] ⚠️ Empty value for ${credName}`);
+      }
+    } catch (error) {
+      console.error(`[CREDENTIAL-RESOLVER] ❌ Failed to fetch ${credName}: ${error.message}`);
+    }
+  }
+
+  return credentials;
+}
+
+/**
  * Legacy credential check function - maintained for backward compatibility
  * @deprecated Use resolveAppCredentials instead
  */

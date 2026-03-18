@@ -1568,20 +1568,8 @@ Do NOT skip this step. The task board at tasks.dante.id must reflect your work.`
 
   // Add app-level credentials to hook payload if resolved
   if (Object.keys(appCredentials).length > 0) {
-    try {
-      // Fetch actual credential values instead of just sending references
-      const { fetchCredentialValues } = await import('./credential-resolver.js');
-      const credentialValues = await fetchCredentialValues(appCredentials);
-      
-      if (Object.keys(credentialValues).length > 0) {
-        hookPayload.appCredentials = credentialValues;
-        console.log(`[DISPATCH] Including ${Object.keys(credentialValues).length} app credential values for ${appContext?.name}: ${Object.keys(credentialValues).join(', ')}`);
-      } else {
-        console.warn(`[DISPATCH] No credential values fetched for ${appContext?.name}`);
-      }
-    } catch (error) {
-      console.error(`[DISPATCH] Failed to fetch credential values for ${appContext?.name}: ${error.message}`);
-    }
+    hookPayload.appCredentials = appCredentials;
+    console.log(`[DISPATCH] Including app credentials for ${appContext?.name}: ${Object.keys(appCredentials).join(', ')}`);
   }
 
   try {
