@@ -2788,6 +2788,67 @@ initLangfuse();
             }
           }
         }
+        // 📎 ARTIFACT RESOLVER: when a task completes with workspace/ file paths in artifacts,
+        // fetch the actual file content from the agent's pod and store it in the task result.
+        // This prevents research deliverables from being lost when ephemeral pods die.
+        if (eventType === 'UPDATE' && task?.result && !prev?.result) {
+          const result = typeof task.result === 'object' ? task.result : (() => { try { return JSON.parse(task.result); } catch { return null; } })();
+          if (result?.artifacts?.length) {
+            const workspaceArtifacts = result.artifacts.filter(a => 
+              (a?.url?.startsWith('workspace/') || a?.url?.startsWith('/root/.openclaw/workspace/')) && !a?.content
+            );
+            if (workspaceArtifacts.length > 0) {
+              const agentName = task.assigned_agent || prev?.assigned_agent;
+              const agent = agentName ? AGENTS[agentName] : null;
+              if (agent) {
+                console.log(`[ARTIFACT-RESOLVER] Task ${task.id} has ${workspaceArtifacts.length} workspace artifacts — fetching from ${agentName}`);
+                // Find agent pod IP
+                try {
+                  const k8s = await import('@kubernetes/client-node');
+                  const kc = new k8s.KubeConfig();
+                  kc.loadFromDefault();
+                  const k8sApi = kc.makeApiClient(k8s.CoreV1Api);
+                  const pods = await k8sApi.listNamespacedPod({ namespace: 'agents', labelSelector: `app=${agentName}`, fieldSelector: 'status.phase=Running' });
+                  const podIp = pods?.items?.[0]?.status?.podIP;
+                  if (podIp) {
+                    let updated = false;
+                    for (const artifact of workspaceArtifacts) {
+                      try {
+                        const filePath = artifact.url.startsWith('/') ? artifact.url : `/root/.openclaw/workspace/${artifact.url.replace(/^workspace\//, '')}`;
+                        const readResp = await fetch(`http://${podIp}:18789/tools/invoke`, {
+                          method: 'POST',
+                          headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${agent.gatewayToken || agent.token}` },
+                          body: JSON.stringify({ tool: 'read', args: { path: filePath } }),
+                          signal: AbortSignal.timeout(10000),
+                        });
+                        if (readResp.ok) {
+                          const readResult = await readResp.json();
+                          const content = readResult?.result?.output || readResult?.output || readResult?.result || '';
+                          if (content && typeof content === 'string' && content.length > 10) {
+                            artifact.content = content;
+                            artifact.type = 'markdown';
+                            artifact.filename = artifact.url.split('/').pop();
+                            console.log(`[ARTIFACT-RESOLVER] ✅ Fetched ${artifact.filename} (${content.length} chars)`);
+                            updated = true;
+                          }
+                        }
+                      } catch (e) {
+                        console.warn(`[ARTIFACT-RESOLVER] Failed to fetch ${artifact.url}: ${e.message}`);
+                      }
+                    }
+                    if (updated) {
+                      await supabase.from('agent_tasks').update({ result }).eq('id', task.id);
+                      console.log(`[ARTIFACT-RESOLVER] Updated task ${task.id} with resolved artifacts`);
+                    }
+                  }
+                } catch (e) {
+                  console.warn(`[ARTIFACT-RESOLVER] K8s lookup failed: ${e.message}`);
+                }
+              }
+            }
+          }
+        }
+
         // Auto-comment: when an agent writes a result, post it as a comment in the task thread
         if (eventType === 'UPDATE' && task?.result && !prev?.result) {
           try {
