@@ -1439,7 +1439,10 @@ ${!rebaseSection ? codingTaskSection : ""}${deployTaskSection}
 **Task ID:** ${task.id}
 **Type:** ${task.type}
 **Priority:** ${task.priority}
-**Dispatched by:** ${task.dispatched_by}${task.parent_task_id ? `\n\n**Parent Task:** ${task.parent_task_id}\n**Sub-task:** This is a sub-task of a larger task. Complete your portion and update status.` : ""}
+**Dispatched by:** ${task.dispatched_by}
+**Owner (created_by):** ${task.created_by || "unset — use f4ed0467-d5d8-481c-99e7-dc7b4e0b7123 as default"}${task.parent_task_id ? `\n\n**Parent Task:** ${task.parent_task_id}\n**Sub-task:** This is a sub-task of a larger task. Complete your portion and update status.` : ""}
+
+**IMPORTANT:** When creating sub-tasks or child tasks, ALWAYS set \`created_by\` to \`${task.created_by || "f4ed0467-d5d8-481c-99e7-dc7b4e0b7123"}\` so they appear on the correct user's dashboard.
 ${commentsBlock ? `\n${commentsBlock}` : ""}
 ${contextBlock}---
 ## 🚫 BLOCKED: When you CANNOT fully complete a task
