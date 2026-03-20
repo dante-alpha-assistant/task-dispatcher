@@ -2476,8 +2476,11 @@ initLangfuse();
 
         // Dispatch when:
         // 1. Task has assigned_agent set and status is todo (scheduler assigned it)
-        // Dispatch condition: assigned_agent just set (was null → agent name)
-        const agentJustAssigned = task?.assigned_agent && eventType === "UPDATE" && !prev?.assigned_agent;
+        // Dispatch condition: assigned_agent just set (was null → agent name) OR inserted pre-assigned
+        const agentJustAssigned = task?.assigned_agent && (
+          (eventType === "UPDATE" && !prev?.assigned_agent) ||
+          (eventType === "INSERT" && task?.status === "todo")
+        );
         // Skip qa_testing tasks here — they're handled by the QA dispatch block below
         if (agentJustAssigned && task?.assigned_agent && task?.status !== "qa_testing") {
           // Concurrency guard: check if this agent already has an in-progress task
