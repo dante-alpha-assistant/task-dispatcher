@@ -3914,6 +3914,29 @@ async function areDependenciesMet(taskId, { detailed = false } = {}) {
 async function scheduler() {
   try {
     console.log("[SCHEDULER] Cycle starting...");
+    // Load per-user concurrency limits from dispatcher_config
+    let globalUserConcurrencyLimit = null;
+    let agentUserConcurrencyLimits = {};
+    try {
+      const { data: configRows } = await supabase
+        .from('dispatcher_config')
+        .select('key, value');
+      if (configRows) {
+        for (const row of configRows) {
+          if (row.key === 'global_user_concurrency_limit') {
+            const v = row.value;
+            globalUserConcurrencyLimit = typeof v === 'number' ? v : (typeof v === 'string' ? parseInt(v, 10) : null);
+          } else if (row.key === 'agent_user_concurrency_limits') {
+            agentUserConcurrencyLimits = (typeof row.value === 'object' && !Array.isArray(row.value) && row.value !== null) ? row.value : {};
+          }
+        }
+      }
+      if (globalUserConcurrencyLimit != null || Object.keys(agentUserConcurrencyLimits).length > 0) {
+        console.log(`[SCHEDULER] Loaded concurrency limits: global=${globalUserConcurrencyLimit}, agents=${JSON.stringify(agentUserConcurrencyLimits)}`);
+      }
+    } catch (e) {
+      console.warn('[SCHEDULER] Failed to load dispatcher_config (limits disabled):', e.message);
+    }
     const cards = await getAgentCards();
     console.log(`[SCHEDULER] Got ${cards.length} agent cards`);
     if (!cards.length) {
@@ -3924,7 +3947,7 @@ async function scheduler() {
     // Only count tasks in active statuses as load (not deployed/failed/completed/deprecated)
     const { data: activeTasks_db, error: activeErr } = await supabase
       .from("agent_tasks")
-      .select("assigned_agent")
+      .select("assigned_agent, created_by")
       .not("assigned_agent", "is", null)
       .in("status", ["in_progress", "qa_testing"]);
 
@@ -3939,6 +3962,19 @@ async function scheduler() {
     for (const t of activeTasks_db || []) {
       const agent = t.assigned_agent?.toLowerCase();
       if (agent && agentLoad[agent] !== undefined) agentLoad[agent]++;
+    }
+
+    // Build per-user load maps for fair scheduling
+    const userAgentLoad = {};  // { userId: { agentName: count } }
+    const userTotalLoad = {};  // { userId: totalCount }
+    for (const t of (activeTasks_db || [])) {
+      if (!t.created_by) continue;
+      const uid = t.created_by;
+      const agent = t.assigned_agent?.toLowerCase();
+      if (!userAgentLoad[uid]) userAgentLoad[uid] = {};
+      if (!userTotalLoad[uid]) userTotalLoad[uid] = 0;
+      if (agent) userAgentLoad[uid][agent] = (userAgentLoad[uid][agent] || 0) + 1;
+      userTotalLoad[uid]++;
     }
 
     // Build available agents with remaining capacity
@@ -4031,6 +4067,30 @@ async function scheduler() {
       return ((PRIORITY_ORDER[a.priority] ?? 2) + aBoost) - ((PRIORITY_ORDER[b.priority] ?? 2) + bBoost);
     });
 
+    // Fair scheduling: interleave tasks across users (round-robin) when limits are configured
+    if (globalUserConcurrencyLimit != null || Object.keys(agentUserConcurrencyLimits).length > 0) {
+      const tasksByUser = {};
+      const taskOrder = [];
+      for (const t of allSchedulable) {
+        const uid = t.created_by || '__no_user__';
+        if (!tasksByUser[uid]) { tasksByUser[uid] = []; taskOrder.push(uid); }
+        tasksByUser[uid].push(t);
+      }
+      const interleaved = [];
+      let hasMore = true;
+      while (hasMore) {
+        hasMore = false;
+        for (const uid of taskOrder) {
+          if (tasksByUser[uid] && tasksByUser[uid].length > 0) {
+            interleaved.push(tasksByUser[uid].shift());
+            hasMore = true;
+          }
+        }
+      }
+      allSchedulable.splice(0, allSchedulable.length, ...interleaved);
+      if (taskOrder.length > 1) console.log(`[SCHEDULER] Fair-queue ordering applied across ${taskOrder.length} users`);
+    }
+
     let assigned = 0;
 
     for (const task of allSchedulable) {
@@ -4116,6 +4176,30 @@ async function scheduler() {
         .sort((a, b) => b.score - a.score);
 
       const bestCandidate = candidates[0];
+
+      // Per-user concurrency check
+      if (bestCandidate && task.created_by) {
+        const uid = task.created_by;
+        const agentName = bestCandidate.name;
+        // Check global user limit
+        if (globalUserConcurrencyLimit != null) {
+          const userTotal = userTotalLoad[uid] || 0;
+          if (userTotal >= globalUserConcurrencyLimit) {
+            console.log(`[SCHEDULER] User ${uid.slice(0,8)} at global limit (${userTotal}/${globalUserConcurrencyLimit}) — skipping task ${task.id.slice(0,8)}`);
+            continue;
+          }
+        }
+        // Check per-agent user limit
+        const agentLimit = agentUserConcurrencyLimits[agentName];
+        if (agentLimit != null) {
+          const userAgentCount = (userAgentLoad[uid] || {})[agentName] || 0;
+          if (userAgentCount >= agentLimit) {
+            console.log(`[SCHEDULER] User ${uid.slice(0,8)} at per-agent limit for ${agentName} (${userAgentCount}/${agentLimit}) — skipping task ${task.id.slice(0,8)}`);
+            continue;
+          }
+        }
+      }
+
       if (!bestCandidate && !isQaTask) {
         if (!hasAppCredentials && schedulerAppContext) {
           // Block the task due to missing app credentials
@@ -4170,6 +4254,14 @@ async function scheduler() {
             .eq("id", task.id);
         }
         originalAgent.remaining--;
+        // Update user load counters
+        if (task.created_by) {
+          const uid = task.created_by;
+          userTotalLoad[uid] = (userTotalLoad[uid] || 0) + 1;
+          if (!userAgentLoad[uid]) userAgentLoad[uid] = {};
+          const an = (isQaTask ? bestCandidate.name : bestCandidate.name);
+          userAgentLoad[uid][an] = (userAgentLoad[uid][an] || 0) + 1;
+        }
         assigned++;
       } else {
         const availableTypes = freeAgents.filter(a => a.remaining > 0).map(a => `${a.name}[${a.capabilities.join(',')}]`).join(', ') || 'none';
