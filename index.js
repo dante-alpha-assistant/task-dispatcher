@@ -1416,11 +1416,12 @@ This is a batch deploy task. You must:
 ` : "";
 
   const codingTaskSection = task.type === "coding" ? `
+
 ## Coding Task
 
 **Use the coding-task skill for this work.** Read \`skills/coding-task/SKILL.md\` and follow it step by step.
 
-- **Repo:** ${task.repo || "See task description for target repo(s)"}
+- **Repo:** ${task.repo ? `\`${task.repo}\`` : "See task description for target repo(s)"}
 - **Branch convention:** \`feat/<short-description>\` or \`fix/<short-description>\`
 - **PR template:** Include task ID, summary of changes, and testing notes
 - **Known repos:** queue-dashboard, task-dispatcher, dante-gitops (all under dante-alpha-assistant)
