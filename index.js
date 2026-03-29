@@ -530,6 +530,14 @@ function isFinalStage(stage) {
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
+// --- Realtime reconnection state ---
+let _realtimeChannel = null;
+let _realtimeCommentsChannel = null;
+let _realtimeReconnectTimer = null;
+let _realtimeReconnectAttempts = 0;
+const REALTIME_MAX_BACKOFF_MS = 60000; // 60s max backoff
+const REALTIME_BASE_BACKOFF_MS = 2000;  // 2s initial backoff
+
 // Log an event to the task's activity log (visible in dashboard Activity tab)
 async function logTaskActivity(taskId, field, oldValue, newValue, changedBy = 'dispatcher') {
   try {
@@ -2095,6 +2103,78 @@ Generate realistic Gherkin scenarios, then PATCH the task with acceptance_criter
   }
 }
 
+// --- Recovery sweep: dispatch orphaned tasks after realtime reconnect ---
+async function recoverOrphanedTasks() {
+  console.log('[REALTIME-RECOVERY] Running recovery sweep for orphaned assigned+todo tasks...');
+  try {
+    const { data: orphaned, error } = await supabase
+      .from('agent_tasks')
+      .select('id, title, assigned_agent, status, type, priority')
+      .eq('status', 'todo')
+      .not('assigned_agent', 'is', null);
+
+    if (error) {
+      console.error('[REALTIME-RECOVERY] Error fetching orphaned tasks:', error.message);
+      return;
+    }
+
+    if (!orphaned || orphaned.length === 0) {
+      console.log('[REALTIME-RECOVERY] No orphaned tasks found.');
+      return;
+    }
+
+    console.log(`[REALTIME-RECOVERY] Found ${orphaned.length} orphaned task(s) — triggering scheduler to dispatch them...`);
+    for (const task of orphaned) {
+      console.log(`[REALTIME-RECOVERY]   → Task ${task.id.slice(0,8)} ("${task.title?.slice(0,40)}") assigned_agent=${task.assigned_agent}`);
+    }
+
+    await scheduler();
+    console.log('[REALTIME-RECOVERY] Recovery sweep complete.');
+  } catch (e) {
+    console.error('[REALTIME-RECOVERY] Recovery sweep error:', e.message);
+  }
+}
+
+// --- Realtime reconnect helpers ---
+function _clearReconnectTimer() {
+  if (_realtimeReconnectTimer) {
+    clearTimeout(_realtimeReconnectTimer);
+    _realtimeReconnectTimer = null;
+  }
+}
+
+function _scheduleReconnect() {
+  _clearReconnectTimer();
+  const backoff = Math.min(
+    REALTIME_BASE_BACKOFF_MS * Math.pow(2, _realtimeReconnectAttempts),
+    REALTIME_MAX_BACKOFF_MS
+  );
+  _realtimeReconnectAttempts++;
+  console.log(`[REALTIME-RECONNECT] Attempt #${_realtimeReconnectAttempts} scheduled in ${backoff}ms (backoff)`);
+  _realtimeReconnectTimer = setTimeout(async () => {
+    console.log(`[REALTIME-RECONNECT] Reconnecting now (attempt #${_realtimeReconnectAttempts})...`);
+    try {
+      if (_realtimeChannel) {
+        await supabase.removeChannel(_realtimeChannel).catch(e =>
+          console.warn('[REALTIME-RECONNECT] Error removing old main channel:', e.message)
+        );
+        _realtimeChannel = null;
+      }
+      if (_realtimeCommentsChannel) {
+        await supabase.removeChannel(_realtimeCommentsChannel).catch(e =>
+          console.warn('[REALTIME-RECONNECT] Error removing old comments channel:', e.message)
+        );
+        _realtimeCommentsChannel = null;
+      }
+      subscribe();
+      console.log('[REALTIME-RECONNECT] Re-subscribed. Recovery sweep will run after SUBSCRIBED confirmation.');
+    } catch (e) {
+      console.error(`[REALTIME-RECONNECT] Reconnect attempt failed: ${e.message}`);
+      _scheduleReconnect();
+    }
+  }, backoff);
+}
+
 // --- Subscribe to Realtime changes ---
 function subscribe() {
   console.log("[BOOT] Task Dispatcher starting...");
@@ -3173,6 +3253,15 @@ curl -s -X PATCH "https://lessxkxujvcmublgwdaa.supabase.co/rest/v1/agent_tasks?i
     )
     .subscribe((status) => {
       console.log(`[REALTIME] Subscription status: ${status}`);
+      if (status === 'SUBSCRIBED') {
+        console.log('[REALTIME] ✅ Main channel subscribed successfully');
+        _realtimeReconnectAttempts = 0;
+        _clearReconnectTimer();
+        setTimeout(recoverOrphanedTasks, 1000);
+      } else if (status === 'CLOSED' || status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
+        console.warn(`[REALTIME] ⚠️ Main channel dropped (status=${status}) — scheduling reconnect`);
+        _scheduleReconnect();
+      }
     });
 
   // --- Subscribe to task_comments for @mention routing ---
@@ -3317,7 +3406,14 @@ Do NOT skip this step — the user is waiting for your reply in the task comment
     )
     .subscribe((status) => {
       console.log(`[REALTIME-COMMENTS] Comment mention subscription status: ${status}`);
+      if (status === 'CLOSED' || status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
+        console.warn(`[REALTIME-COMMENTS] ⚠️ Comments channel dropped (status=${status}) — reconnect triggered by main channel handler`);
+        _scheduleReconnect();
+      }
     });
+
+  _realtimeChannel = channel;
+  _realtimeCommentsChannel = commentsChannel;
 
   return channel;
 }
@@ -4607,6 +4703,19 @@ async function autoDeployDetector() {
 
 // --- Start ---
 subscribe();
+
+// --- Realtime watchdog: periodically checks channel health and reconnects if dead ---
+const REALTIME_WATCHDOG_INTERVAL = 60000; // 60s
+setInterval(() => {
+  const channelState = _realtimeChannel?.state;
+  if (channelState !== 'joined') {
+    console.warn(`[REALTIME-WATCHDOG] ⚠️ Channel state is "${channelState || 'null'}" (expected "joined") — forcing reconnect`);
+    _scheduleReconnect();
+  } else {
+    console.log(`[REALTIME-WATCHDOG] Channel healthy (state=${channelState})`);
+  }
+}, REALTIME_WATCHDOG_INTERVAL);
+console.log('[BOOT] Realtime watchdog running every 60s');
 
 // Auto-scheduler
 setInterval(scheduler, SCHEDULER_INTERVAL);
