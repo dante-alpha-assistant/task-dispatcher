@@ -356,14 +356,19 @@ async function notifyBlockedTask(task) {
     return;
   }
   const reason = task.blocked_reason || task.error || "No reason provided";
+  const blocker = task.blocker;
   const taskUrl = `https://tasks.dante.id/task/${task.id}`;
   const agent = task.assigned_agent || "unknown";
+  const blockerSection = blocker ? `
+**Blocker Type:** \`${blocker.type || "unknown"}\`
+**Blocker:** ${blocker.title || reason}
+**Details:** ${blocker.description || "No details"}${blocker.required_inputs?.length ? `\n**Required Inputs:** ${blocker.required_inputs.map(i => `\`${i.key}\` (${i.label})`).join(", ")}` : ""}${blocker.suggested_action ? `\n**Suggested Action:** ${blocker.suggested_action}` : ""}` : `
+**Blocked Reason:** ${reason}`;
   const content = `🚫 **Task Blocked — Manual Intervention Required** <@${DANTE_DISCORD_ID}>
 
 **Task:** [${task.title}](${taskUrl})
 **Agent:** ${agent}
-**Priority:** ${task.priority || "normal"}
-**Blocked Reason:** ${reason}
+**Priority:** ${task.priority || "normal"}${blockerSection}
 
 _Task ID: \`${task.id}\`_`;
 
@@ -1535,6 +1540,14 @@ BLOCKED DETECTION RULES:
 - NEVER ship incomplete work as complete
 - Use curl, kubectl, gh CLI FIRST before deciding to block
 - Only block if you genuinely CANNOT do it after trying.
+
+BLOCKER DETECTION PATTERNS — check these BEFORE marking a task as failed:
+1. Missing env var / empty secret → type: "missing_credential" or "missing_config"
+2. 401/403 from an API → type: "permission_denied" or "missing_credential"
+3. Task description says "choose between X and Y" → type: "human_decision"
+4. Unclear acceptance criteria → type: "ambiguous_requirement"
+5. External service down or unreachable → type: "infrastructure"
+6. Waiting on another team or approval → type: "external_dependency"
 
 DATABASE MIGRATION RULES (MANDATORY):
 - If your code references NEW database columns, tables, or indexes: you MUST create a migration file
@@ -4986,11 +4999,32 @@ This skill applies to EVERY message from "Task Dispatcher" that contains a JSON 
 ## GitHub Auth
 Use GH_TOKEN env var: git clone https://x-access-token:\\\${GH_TOKEN}@github.com/<owner>/<repo>.git
 
-## MANDATORY: Blocked Detection
+## MANDATORY: Blocked Detection & Self-Blocking
 - NEVER mark done if manual steps remain
 - NEVER write "apply this manually" — block the task instead
 - Use curl, kubectl, gh CLI FIRST before blocking
-\`);
+
+### Blocker Types (use in blocker.type field):
+- **missing_credential** — API key/token/secret not configured or expired
+- **missing_config** — env var, URL, or setting missing
+- **ambiguous_requirement** — task unclear, needs human clarification
+- **permission_denied** — lacking access to a resource
+- **external_dependency** — waiting on third-party/approval
+- **infrastructure** — resource unavailable (DB down, service unreachable)
+- **human_decision** — multiple valid approaches, human must choose
+
+### Detection Patterns:
+1. Empty/undefined env var needed for the task → missing_credential or missing_config
+2. HTTP 401/403 from any API → permission_denied or missing_credential
+3. Cannot connect to a service after retries → infrastructure
+4. Task description is ambiguous or contradictory → ambiguous_requirement
+5. Multiple valid solutions, no clear winner → human_decision
+
+### When blocking, ALWAYS include structured metadata:
+\`\`\`json
+{"status":"blocked","blocked_reason":"short description","blocker":{"type":"<type>","title":"Short title","description":"Detailed explanation","required_inputs":[{"key":"VAR_NAME","label":"Human Label","type":"text"}],"suggested_action":"What to do"}}
+\`\`\`
+`);
 
 // Write deploy-batch skill (read from bundled file or write inline)
 try {
@@ -5025,6 +5059,17 @@ If the task payload contains an app_id and allowed repos, you MUST:
 - Commit to main directly
 - Push to repos not listed in the app's allowed repos
 - Mark done if manual steps remain — set status to blocked instead
+
+## Blocker Self-Detection
+Before failing a task, check if it matches a blocker pattern:
+- Missing env var / empty secret → block with type "missing_credential" or "missing_config"
+- HTTP 401/403 → block with type "permission_denied" or "missing_credential"
+- Ambiguous requirements → block with type "ambiguous_requirement"
+- Service unreachable → block with type "infrastructure"
+- Need human to choose approach → block with type "human_decision"
+- Waiting on external approval → block with type "external_dependency"
+
+Include structured blocker metadata: {"blocker":{"type":"...","title":"...","description":"...","required_inputs":[{"key":"...","label":"...","type":"text|password|select|boolean"}],"suggested_action":"..."}}
 \`);
 
 // Write AGENTS.md
